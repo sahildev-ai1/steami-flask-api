@@ -23,6 +23,7 @@ from article_fetcher import (
     fetch_articles_from_url,
     get_rss_sources,
 )
+from chat import chat_bp
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +34,7 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+app.register_blueprint(chat_bp)
 
 
 def _now() -> str:
@@ -232,51 +234,14 @@ def create_article():
 # AI INSIGHTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.route("/api/articles/<article_id>/insight", methods=["DELETE"])
-def delete_insight(article_id):
-    """
-    DELETE /api/articles/<article_id>/insight
-    Clears the cached insight so the next POST regenerates fresh from Gemini.
-
-    curl -X DELETE http://127.0.0.1:5000/api/articles/<article_id>/insight
-    """
-    doc_ref = db.collection("articles").document(article_id)
-    doc     = doc_ref.get()
-    if not doc.exists:
-        return jsonify({"error": "Article not found"}), 404
-
-    # Clear ai_insight fields on the article document
-    try:
-        doc_ref.update({
-            "ai_insight":  None,
-            "has_insight": False,
-            "insight_generated_at": None,
-        })
-    except Exception as e:
-        log.warning("Could not clear article insight fields: %s", e)
-
-    # Delete from ai_insights collection
-    try:
-        db.collection("ai_insights").document(article_id).delete()
-    except Exception as e:
-        log.warning("Could not delete ai_insights doc: %s", e)
-
-    log.info("Insight cache cleared for %s", article_id)
-    return jsonify({"deleted": True, "article_id": article_id}), 200
-
-
 @app.route("/api/articles/<article_id>/insight", methods=["POST"])
 def generate_insight(article_id):
     """
-    POST /api/articles/<article_id>/insight
-    Generate AI insight (summary + SVG) via Gemini — one article at a time.
+    Generate AI insight (summary + SVG) for an article via Gemini.
     Returns cached result if insight already exists.
-    Pass ?force=1 to skip cache and regenerate fresh.
 
-    curl -X POST http://127.0.0.1:5000/api/articles/<article_id>/insight
-    curl -X POST http://127.0.0.1:5000/api/articles/<article_id>/insight?force=1
+    curl -X POST http://localhost:5000/api/articles/<article_id>/insight
     """
-    force   = request.args.get("force", "0") in ("1", "true", "yes")
     doc_ref = db.collection("articles").document(article_id)
     doc     = doc_ref.get()
 
@@ -285,56 +250,34 @@ def generate_insight(article_id):
 
     article = doc.to_dict()
 
-    # ── Cache check (skip if force=1) ──────────────────────────────────────
-    if not force:
-        cached_insight = article.get("ai_insight")
-        # Only use cache if it has a proper summary (not the old broken raw field)
-        if (
-            cached_insight
-            and isinstance(cached_insight, dict)
-            and cached_insight.get("summary")
-            and not cached_insight.get("raw")          # reject old broken entries
-            and len(cached_insight.get("summary", "")) > 50
-        ):
-            log.info("Returning cached article-level insight for %s", article_id)
-            return jsonify({
-                "article_id": article_id,
-                "ai_insight": cached_insight,
-                "cached":     True,
-            }), 200
+    # Check article-level cache
+    if article.get("ai_insight"):
+        log.info("Returning cached insight for %s", article_id)
+        return jsonify({
+            "article_id": article_id,
+            "ai_insight": article["ai_insight"],
+            "cached":     True,
+        }), 200
 
-        insight_doc = db.collection("ai_insights").document(article_id).get()
-        if insight_doc.exists:
-            insight_data = insight_doc.to_dict()
-            stored = insight_data.get("ai_insight", {})
-            if (
-                isinstance(stored, dict)
-                and stored.get("summary")
-                and not stored.get("raw")
-                and len(stored.get("summary", "")) > 50
-            ):
-                log.info("Returning cached ai_insights collection insight for %s", article_id)
-                return jsonify({
-                    "article_id": article_id,
-                    "ai_insight": stored,
-                    "cached":     True,
-                }), 200
-            else:
-                # Cached entry is broken — delete it so we regenerate
-                log.info("Cached insight for %s is broken (has raw/short summary) — regenerating", article_id)
-                try:
-                    db.collection("ai_insights").document(article_id).delete()
-                except Exception:
-                    pass
+    # Check dedicated insights collection
+    insight_doc = db.collection("ai_insights").document(article_id).get()
+    if insight_doc.exists:
+        insight_data = insight_doc.to_dict()
+        log.info("Returning insight from ai_insights collection for %s", article_id)
+        return jsonify({
+            "article_id": article_id,
+            "ai_insight": insight_data.get("ai_insight", insight_data),
+            "cached":     True,
+        }), 200
 
-    # ── Generate fresh insight via Gemini ─────────────────────────────────
+    # Generate fresh insight
     try:
         insight = generate_ai_insight(article)
     except Exception as e:
         log.error("Gemini error for %s: %s", article_id, e)
         return jsonify({"error": str(e)}), 502
 
-    # ── Persist to article document ───────────────────────────────────────
+    # Save back to article
     try:
         doc_ref.update({
             "ai_insight":           insight,
@@ -344,28 +287,20 @@ def generate_insight(article_id):
     except Exception as e:
         log.error("Failed to update article with insight: %s", e)
 
-    # ── Persist to ai_insights collection ────────────────────────────────
+    # Save to dedicated insights collection
     try:
         db.collection("ai_insights").document(article_id).set({
-            "article_id":      article_id,
-            "title":           article.get("title", ""),
-            "topic":           article.get("topic", ""),
-            "source":          article.get("source", ""),
-            "matched_domains": article.get("matched_domains", []),
-            "article_url":     article.get("article_url") or article.get("url", ""),
-            "ai_insight":      insight,
-            "created_at":      _now(),
+            "article_id": article_id,
+            "title":      article.get("title", ""),
+            "topic":      article.get("topic", ""),
+            "source":     article.get("source", ""),
+            "ai_insight": insight,
+            "created_at": _now(),
         })
     except Exception as e:
         log.error("Failed to save ai_insights doc: %s", e)
 
-    log.info(
-        "Insight generated for %s — domain=%s summary_words=%d svg_chars=%d",
-        article_id,
-        insight.get("domain", "?"),
-        len(insight.get("summary", "").split()),
-        len(str(insight.get("svg", ""))),
-    )
+    log.info("Insight generated and saved for %s", article_id)
     return jsonify({
         "article_id": article_id,
         "ai_insight": insight,
