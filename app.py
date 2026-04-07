@@ -23,7 +23,7 @@ from article_fetcher import (
     fetch_articles_from_url,
     get_rss_sources,
 )
-from feed import feed_bp
+from static_content import content_bp
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,7 +34,7 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
-app.register_blueprint(feed_bp)
+app.register_blueprint(content_bp)
 
 
 def _now() -> str:
@@ -237,81 +237,47 @@ def create_article():
 @app.route("/api/articles/<article_id>/insight", methods=["POST"])
 def generate_insight(article_id):
     """
-    POST /api/articles/<article_id>/insight
-    Generate AI insight via Gemini. Searches BOTH `articles` and `feed_articles`
-    collections so no article is ever missed.
-    Pass ?force=1 to skip cache and regenerate.
+    Generate AI insight (summary + SVG) for an article via Gemini.
+    Returns cached result if insight already exists.
 
-    curl -X POST http://127.0.0.1:5000/api/articles/<article_id>/insight
-    curl -X POST "http://127.0.0.1:5000/api/articles/<article_id>/insight?force=1"
+    curl -X POST http://localhost:5000/api/articles/<article_id>/insight
     """
-    force = request.args.get("force", "0") in ("1", "true", "yes")
-
-    # ── Find article in either collection ─────────────────────────────────
-    source_table = "articles"
-    doc_ref      = db.collection("articles").document(article_id)
-    doc          = doc_ref.get()
+    doc_ref = db.collection("articles").document(article_id)
+    doc     = doc_ref.get()
 
     if not doc.exists:
-        # Try feed_articles
-        doc_ref      = db.collection("feed_articles").document(article_id)
-        doc          = doc_ref.get()
-        source_table = "feed_articles"
-
-    if not doc.exists:
-        return jsonify({"error": "Article not found in articles or feed_articles"}), 404
+        return jsonify({"error": "Article not found"}), 404
 
     article = doc.to_dict()
 
-    # ── Cache check (skip if force=1) ──────────────────────────────────────
-    if not force:
-        cached_insight = article.get("ai_insight")
-        if (
-            cached_insight
-            and isinstance(cached_insight, dict)
-            and cached_insight.get("summary")
-            and not cached_insight.get("raw")
-            and len(cached_insight.get("summary", "")) > 50
-        ):
-            log.info("Returning cached insight for %s (table=%s)", article_id, source_table)
-            return jsonify({
-                "article_id":   article_id,
-                "source_table": source_table,
-                "ai_insight":   cached_insight,
-                "cached":       True,
-            }), 200
+    # Check article-level cache
+    if article.get("ai_insight"):
+        log.info("Returning cached insight for %s", article_id)
+        return jsonify({
+            "article_id": article_id,
+            "ai_insight": article["ai_insight"],
+            "cached":     True,
+        }), 200
 
-        insight_doc = db.collection("ai_insights").document(article_id).get()
-        if insight_doc.exists:
-            stored = insight_doc.to_dict().get("ai_insight", {})
-            if (
-                isinstance(stored, dict)
-                and stored.get("summary")
-                and not stored.get("raw")
-                and len(stored.get("summary", "")) > 50
-            ):
-                log.info("Returning cached ai_insights doc for %s", article_id)
-                return jsonify({
-                    "article_id":   article_id,
-                    "source_table": insight_doc.to_dict().get("source_table", source_table),
-                    "ai_insight":   stored,
-                    "cached":       True,
-                }), 200
-            else:
-                # Broken cache — delete and regenerate
-                try:
-                    db.collection("ai_insights").document(article_id).delete()
-                except Exception:
-                    pass
+    # Check dedicated insights collection
+    insight_doc = db.collection("ai_insights").document(article_id).get()
+    if insight_doc.exists:
+        insight_data = insight_doc.to_dict()
+        log.info("Returning insight from ai_insights collection for %s", article_id)
+        return jsonify({
+            "article_id": article_id,
+            "ai_insight": insight_data.get("ai_insight", insight_data),
+            "cached":     True,
+        }), 200
 
-    # ── Generate fresh insight ─────────────────────────────────────────────
+    # Generate fresh insight
     try:
         insight = generate_ai_insight(article)
     except Exception as e:
         log.error("Gemini error for %s: %s", article_id, e)
         return jsonify({"error": str(e)}), 502
 
-    # ── Persist to whichever collection this article lives in ─────────────
+    # Save back to article
     try:
         doc_ref.update({
             "ai_insight":           insight,
@@ -319,56 +285,39 @@ def generate_insight(article_id):
             "insight_generated_at": _now(),
         })
     except Exception as e:
-        log.error("Failed to update %s/%s: %s", source_table, article_id, e)
+        log.error("Failed to update article with insight: %s", e)
 
-    # ── Persist to shared ai_insights collection ──────────────────────────
+    # Save to dedicated insights collection
     try:
         db.collection("ai_insights").document(article_id).set({
-            "article_id":      article_id,
-            "source_table":    source_table,
-            "title":           article.get("title", ""),
-            "topic":           article.get("topic", ""),
-            "source":          article.get("source", ""),
-            "matched_domains": article.get("matched_domains", []),
-            "article_url":     article.get("article_url") or article.get("url", ""),
-            "keywords":        article.get("keywords", []),
-            "ai_insight":      insight,
-            "created_at":      _now(),
+            "article_id": article_id,
+            "title":      article.get("title", ""),
+            "topic":      article.get("topic", ""),
+            "source":     article.get("source", ""),
+            "ai_insight": insight,
+            "created_at": _now(),
         })
     except Exception as e:
         log.error("Failed to save ai_insights doc: %s", e)
 
-    log.info(
-        "Insight generated: %s  table=%s  domain=%s  words=%d  svg_chars=%d",
-        article_id, source_table,
-        insight.get("domain", "?"),
-        len(insight.get("summary", "").split()),
-        len(str(insight.get("svg", ""))),
-    )
+    log.info("Insight generated and saved for %s", article_id)
     return jsonify({
-        "article_id":   article_id,
-        "source_table": source_table,
-        "ai_insight":   insight,
-        "cached":       False,
+        "article_id": article_id,
+        "ai_insight": insight,
+        "cached":     False,
     }), 200
 
 
 @app.route("/api/insights", methods=["GET"])
 def list_insights():
     """
-    GET /api/insights?limit=50
-    Lists ALL insights from the shared ai_insights collection.
-    Each entry has source_table: "articles" | "feed_articles"
-    so the frontend knows which table the article lives in.
-
-    curl http://127.0.0.1:5000/api/insights?limit=20
+    curl http://localhost:5000/api/insights
     """
-    limit = int(request.args.get("limit", 50))
     try:
         docs = (
             db.collection("ai_insights")
               .order_by("created_at", direction="DESCENDING")
-              .limit(limit)
+              .limit(50)
               .stream()
         )
         return jsonify({"insights": [d.to_dict() for d in docs]}), 200
@@ -379,11 +328,7 @@ def list_insights():
 @app.route("/api/insights/<article_id>", methods=["GET"])
 def get_insight(article_id):
     """
-    GET /api/insights/<article_id>
-    Fetches from ai_insights collection. Response includes source_table
-    so frontend knows whether to route to /api/articles/<id> or /api/feed/items/<id>.
-
-    curl http://127.0.0.1:5000/api/insights/<article_id>
+    curl http://localhost:5000/api/insights/<article_id>
     """
     doc = db.collection("ai_insights").document(article_id).get()
     if not doc.exists:

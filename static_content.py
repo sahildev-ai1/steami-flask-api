@@ -1,0 +1,921 @@
+"""
+STEAMI Static Content API  — static_content.py
+Blueprint: /api/...
+
+Manages explainers and research articles stored in Firestore.
+The GET responses mirror the exact TypeScript shape in explainers.ts
+and research-articles.ts so the frontend can swap the hardcoded import
+for a fetch call with zero other changes.
+
+COLLECTIONS
+────────────────────────────────────
+  explainers        — Explainer[]
+  research_articles — Article[]
+  research_fields   — { fields[], field_icons{}, field_colors{} }
+
+ENDPOINTS
+────────────────────────────────────────────────────────────────────
+  Explainers
+  POST   /api/explainers/seed           — bulk-seed all explainers from TS data
+  POST   /api/explainers                — create single explainer
+  GET    /api/explainers                — list all  → { explainers: Explainer[] }
+  GET    /api/explainers/<id>           — single    → Explainer
+  PUT    /api/explainers/<id>           — update
+  DELETE /api/explainers/<id>           — delete
+
+  Research Articles
+  POST   /api/research/seed             — bulk-seed all articles
+  POST   /api/research/articles         — create single article
+  GET    /api/research/articles         — list all  → { articles: Article[], fields, field_icons, field_colors }
+  GET    /api/research/articles/<id>    — single    → Article
+  GET    /api/research/articles?field=  — filter by field
+  PUT    /api/research/articles/<id>    — update
+  DELETE /api/research/articles/<id>    — delete
+
+  Meta
+  GET    /api/research/fields           — { fields[], field_icons{}, field_colors{} }
+────────────────────────────────────────────────────────────────────
+"""
+
+import logging
+from datetime import datetime, timezone
+
+from flask import Blueprint, request, jsonify
+from firestore_client import db
+
+log = logging.getLogger(__name__)
+
+content_bp = Blueprint("content", __name__)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SEED DATA  — mirrors explainers.ts and research-articles.ts exactly
+# ─────────────────────────────────────────────────────────────────────────────
+
+EXPLAINERS_SEED = [
+    {
+        "id": "quantum-dog",
+        "title": "The Quantum Dog: Schrödinger's Pet Paradox",
+        "subtitle": "How quantum superposition works — explained through a thought experiment about a very confused dog.",
+        "field": "QUANTUM PHYSICS",
+        "badgeColor": "cyan",
+        "readTime": "8 MIN READ",
+        "content": [
+            "Imagine a dog inside a sealed kennel. According to quantum mechanics, until you open the door and observe the dog, it exists in a superposition of all possible states — sleeping, playing, barking, and eating simultaneously.",
+            "This thought experiment, inspired by Schrödinger's famous cat paradox, illustrates one of the most counterintuitive aspects of quantum mechanics: superposition. In the quantum world, particles don't have definite properties until they're measured.",
+            "The act of measurement \"collapses\" the wave function, forcing the system to choose one definite state. Before measurement, all possibilities coexist in a mathematical framework called the wave function.",
+            "Quantum decoherence explains why we don't see dogs in superposition in real life. The environment constantly \"measures\" macroscopic objects, collapsing their quantum states almost instantaneously.",
+            "Modern quantum computers exploit superposition by using qubits that can be 0 and 1 simultaneously, enabling parallel computation on an exponential scale.",
+            "The implications extend beyond computing: quantum sensing, quantum cryptography, and quantum networks all leverage these strange properties of nature.",
+        ],
+        "keyInsights": [
+            "Superposition allows particles to exist in multiple states simultaneously",
+            "Measurement collapses the wave function to a definite state",
+            "Quantum decoherence prevents macroscopic superposition",
+            "Quantum computers leverage superposition for exponential speedup",
+        ],
+    },
+    {
+        "id": "crispr-scissors",
+        "title": "CRISPR: The Molecular Scissors Rewriting Life",
+        "subtitle": "Gene editing technology that could cure diseases, enhance crops, and reshape evolution itself.",
+        "field": "BIOLOGY",
+        "badgeColor": "green",
+        "readTime": "7 MIN READ",
+        "content": [
+            "CRISPR-Cas9 is a revolutionary gene-editing tool that allows scientists to cut, delete, and replace DNA sequences with unprecedented precision. Think of it as molecular scissors guided by a GPS.",
+            "The technology was adapted from a natural defense system that bacteria use to fight viruses. When a virus attacks, bacteria capture snippets of viral DNA and store them as \"memory\" to recognize future threats.",
+            "Scientists Jennifer Doudna and Emmanuelle Charpentier realized this system could be reprogrammed to target any DNA sequence, earning them the 2020 Nobel Prize in Chemistry.",
+            "CRISPR has already shown promise in treating sickle cell disease, certain cancers, and inherited blindness. Clinical trials are advancing rapidly across dozens of conditions.",
+            "The technology also raises profound ethical questions: should we edit human embryos? Could gene drives eliminate entire species of mosquitoes? Where do we draw the line?",
+            "Next-generation tools like base editing and prime editing offer even more precise modifications, potentially correcting single-letter mutations without cutting the DNA double strand.",
+        ],
+        "keyInsights": [
+            "CRISPR-Cas9 acts as programmable molecular scissors for DNA",
+            "Adapted from bacterial immune defense systems",
+            "Already treating sickle cell disease in clinical trials",
+            "Raises critical ethical questions about human germline editing",
+        ],
+    },
+    {
+        "id": "neural-networks",
+        "title": "Neural Networks: How Machines Learn to Think",
+        "subtitle": "From perceptrons to transformers — the architecture of artificial intelligence.",
+        "field": "AI",
+        "badgeColor": "violet",
+        "readTime": "10 MIN READ",
+        "content": [
+            "Artificial neural networks are computing systems inspired by the biological neural networks in animal brains. They learn by adjusting the strength of connections between artificial neurons.",
+            "The simplest neural network, the perceptron, was invented in 1958. It could only solve linearly separable problems — a limitation that almost killed the field for decades.",
+            "The breakthrough came with backpropagation and deep learning: stacking many layers of neurons allows networks to learn hierarchical representations of increasingly abstract features.",
+            "Convolutional Neural Networks (CNNs) revolutionized computer vision by learning spatial hierarchies of features. Recurrent Neural Networks (RNNs) tackled sequences like text and speech.",
+            "The transformer architecture, introduced in 2017's \"Attention Is All You Need\" paper, replaced recurrence with self-attention mechanisms, enabling massive parallelization and leading to models like GPT and BERT.",
+            "Today's frontier models contain hundreds of billions of parameters and can write code, compose music, analyze medical images, and engage in complex reasoning — capabilities that seemed impossible just a decade ago.",
+        ],
+        "keyInsights": [
+            "Neural networks learn by adjusting connection weights through backpropagation",
+            "Deep learning enables hierarchical feature representation",
+            "Transformers replaced recurrence with attention for massive parallelism",
+            "Modern models demonstrate emergent capabilities at scale",
+        ],
+    },
+    {
+        "id": "dark-energy",
+        "title": "Dark Energy: The Force Tearing the Universe Apart",
+        "subtitle": "The mysterious energy that makes up 68% of the universe and accelerates cosmic expansion.",
+        "field": "EARTH & SPACE",
+        "badgeColor": "orange",
+        "readTime": "6 MIN READ",
+        "content": [
+            "In 1998, two teams of astronomers made a shocking discovery: the universe is not just expanding — it's accelerating. Something was pushing galaxies apart faster and faster.",
+            "This mysterious force was named \"dark energy.\" Despite constituting about 68% of the total energy of the universe, we know almost nothing about what it actually is.",
+            "The leading hypothesis is the cosmological constant — a uniform energy density filling space homogeneously. Einstein first introduced this concept in 1917, then called it his \"biggest blunder.\"",
+            "Alternative theories include quintessence (a dynamic field that varies in space and time), modifications to general relativity at cosmic scales, and effects of extra dimensions.",
+            "Dark energy has profound implications for the fate of the universe. If it remains constant, the universe will expand forever, eventually reaching \"heat death.\" If it strengthens, a \"Big Rip\" could tear apart even atoms.",
+            "Current experiments like the Dark Energy Survey and future missions like ESA's Euclid satellite aim to map the history of cosmic expansion with unprecedented precision.",
+        ],
+        "keyInsights": [
+            "The universe's expansion is accelerating, driven by dark energy",
+            "Dark energy constitutes ~68% of the universe's total energy",
+            "The cosmological constant is the leading theoretical explanation",
+            "The fate of the universe depends on dark energy's behavior over time",
+        ],
+    },
+    {
+        "id": "fusion-energy",
+        "title": "Fusion Energy: Bottling a Star on Earth",
+        "subtitle": "The quest to harness the power source of the sun for unlimited clean energy.",
+        "field": "CLIMATE & ENERGY",
+        "badgeColor": "orange",
+        "readTime": "9 MIN READ",
+        "content": [
+            "Stars shine by fusing hydrogen atoms into helium, releasing enormous amounts of energy. The sun converts 600 million tons of hydrogen into helium every second, with a tiny fraction of mass converted to energy via E=mc².",
+            "Recreating this process on Earth requires heating hydrogen plasma to over 100 million degrees Celsius — ten times hotter than the core of the sun. No material can contain such plasma.",
+            "Two main approaches exist: magnetic confinement (tokamaks like ITER) uses powerful magnetic fields to contain plasma in a donut shape, while inertial confinement (NIF) uses powerful lasers to compress fuel pellets.",
+            "In December 2022, the National Ignition Facility achieved scientific breakeven for the first time — the fusion reaction produced more energy than the lasers delivered to the fuel.",
+            "Private fusion companies like Commonwealth Fusion Systems, TAE Technologies, and Helion Energy are pursuing novel approaches, with some promising commercial power by the early 2030s.",
+            "If achieved, fusion would provide virtually unlimited, clean energy with no greenhouse gas emissions, no long-lived radioactive waste, and fuel (deuterium) available from seawater.",
+        ],
+        "keyInsights": [
+            "Fusion requires temperatures 10x hotter than the sun's core",
+            "NIF achieved scientific breakeven in December 2022",
+            "Multiple private companies target commercial fusion by the 2030s",
+            "Fusion fuel (deuterium) is essentially unlimited from seawater",
+        ],
+    },
+    {
+        "id": "blockchain-consensus",
+        "title": "Blockchain Consensus: Trust Without Authority",
+        "subtitle": "How distributed networks agree on truth without a central authority.",
+        "field": "COMPUTER SCIENCE",
+        "badgeColor": "red",
+        "readTime": "7 MIN READ",
+        "content": [
+            "The fundamental challenge of distributed systems is the Byzantine Generals Problem: how can multiple parties agree on a course of action when some may be unreliable or malicious?",
+            "Blockchain solves this through consensus mechanisms — protocols that allow a network of computers to agree on the state of a shared ledger without trusting any single participant.",
+            "Proof of Work (PoW), used by Bitcoin, requires miners to solve computationally expensive puzzles. The first to solve gets to add the next block. This is secure but energy-intensive.",
+            "Proof of Stake (PoS), adopted by Ethereum in 2022, selects validators based on their staked cryptocurrency. It's ~99.95% more energy-efficient than PoW while maintaining security.",
+            "Novel consensus mechanisms continue to emerge: Proof of History (Solana), Directed Acyclic Graphs (IOTA), and Byzantine Fault Tolerant protocols (Cosmos) each offer different tradeoffs.",
+            "Beyond cryptocurrency, consensus mechanisms enable decentralized identity, supply chain tracking, voting systems, and any application requiring trustless coordination between strangers.",
+        ],
+        "keyInsights": [
+            "Consensus mechanisms solve the Byzantine Generals Problem",
+            "Proof of Stake is ~99.95% more energy-efficient than Proof of Work",
+            "Multiple novel mechanisms offer different performance tradeoffs",
+            "Applications extend far beyond cryptocurrency",
+        ],
+    },
+    {
+        "id": "epigenetics",
+        "title": "Epigenetics: The Code Above the Code",
+        "subtitle": "How your environment rewrites gene expression without changing DNA itself.",
+        "field": "BIOLOGY",
+        "badgeColor": "green",
+        "readTime": "8 MIN READ",
+        "content": [
+            "Your DNA sequence is fixed at birth, but how your genes are read is surprisingly flexible. Epigenetics studies chemical modifications that turn genes on and off without altering the underlying code.",
+            "DNA methylation — attaching small methyl groups to DNA — is one of the most studied mechanisms. Heavy methylation silences a gene, while demethylation can reactivate it.",
+            "Histone modifications wrap and unwrap DNA around protein spools, controlling which stretches of the genome are accessible to the cell's reading machinery.",
+            "Diet, stress, toxins, and even social interactions can trigger epigenetic changes. Some of these changes are heritable, passed from parent to offspring across generations.",
+            "Epigenetic therapies are emerging in cancer treatment — drugs that reverse abnormal methylation patterns can reactivate tumor-suppressor genes that cancer cells had silenced.",
+            "The field challenges the old nature-vs-nurture debate: your lived experience literally shapes which parts of your genetic blueprint are active.",
+        ],
+        "keyInsights": [
+            "Epigenetic marks control gene expression without changing DNA sequence",
+            "Environmental factors like diet and stress can alter your epigenome",
+            "Some epigenetic changes pass across generations",
+            "Epigenetic drugs are showing promise in cancer therapy",
+        ],
+    },
+    {
+        "id": "quantum-entanglement",
+        "title": "Quantum Entanglement: Spooky Action at a Distance",
+        "subtitle": "Two particles linked across the universe — measuring one instantly affects the other.",
+        "field": "QUANTUM PHYSICS",
+        "badgeColor": "cyan",
+        "readTime": "9 MIN READ",
+        "content": [
+            "When two particles become entangled, measuring one instantly determines the state of the other — no matter how far apart they are. Einstein famously called this \"spooky action at a distance.\"",
+            "Entanglement is created when particles interact in specific ways — for example, splitting a photon into two via a nonlinear crystal produces a pair with correlated polarizations.",
+            "Bell's theorem (1964) and subsequent experiments proved that entanglement is real and not explained by hidden local variables. Nature is genuinely nonlocal at the quantum level.",
+            "Quantum teleportation uses entanglement to transfer quantum states between distant particles. It doesn't move matter or information faster than light, but it enables fundamentally secure communication.",
+            "Quantum key distribution (QKD) harnesses entanglement for cryptography: any eavesdropping attempt disturbs the entangled state, alerting both parties immediately.",
+            "Researchers have demonstrated entanglement over 1,200 km using the Micius satellite, paving the way for a future quantum internet.",
+        ],
+        "keyInsights": [
+            "Entangled particles share correlated states regardless of distance",
+            "Bell experiments ruled out classical explanations for entanglement",
+            "Quantum teleportation transfers states, not matter or energy",
+            "Satellite-based entanglement spans over 1,200 km",
+        ],
+    },
+    {
+        "id": "neuroplasticity",
+        "title": "Neuroplasticity: The Brain That Rewires Itself",
+        "subtitle": "How your brain physically changes structure in response to learning and experience.",
+        "field": "BIOLOGY",
+        "badgeColor": "green",
+        "readTime": "7 MIN READ",
+        "content": [
+            "For most of the 20th century, scientists believed the adult brain was fixed. We now know it continually rewires itself — forming new connections, pruning unused ones, and even generating new neurons.",
+            "Every time you learn a skill, synapses strengthen through a process called long-term potentiation (LTP). Repeated practice physically thickens the neural pathways involved.",
+            "London taxi drivers famously have enlarged hippocampi — the brain region responsible for spatial memory — compared to bus drivers who follow fixed routes.",
+            "After a stroke, undamaged brain regions can take over functions from damaged areas through intensive rehabilitation, demonstrating remarkable structural flexibility.",
+            "Negative plasticity exists too: chronic stress shrinks the prefrontal cortex (decision-making) while enlarging the amygdala (fear response), explaining anxiety disorders.",
+            "Mindfulness meditation has been shown to increase cortical thickness in attention-related areas after just eight weeks of practice.",
+        ],
+        "keyInsights": [
+            "The adult brain continuously forms and prunes neural connections",
+            "Repeated practice physically strengthens synaptic pathways",
+            "Brain regions can compensate for damage through reorganization",
+            "Both positive and negative experiences reshape brain structure",
+        ],
+    },
+]
+
+FIELDS_SEED = [
+    "PHYSICS", "CHEMISTRY", "BIOLOGY", "MEDICINE", "EARTH & SPACE",
+    "COMPUTER SCIENCE", "AI", "ROBOTICS", "ENGINEERING",
+    "MATHEMATICS & DATA", "CLIMATE & ENERGY",
+]
+
+FIELD_ICONS_SEED = {
+    "PHYSICS": "⚛️", "CHEMISTRY": "🧪", "BIOLOGY": "🧬",
+    "MEDICINE": "💊", "EARTH & SPACE": "🌍", "COMPUTER SCIENCE": "💻",
+    "AI": "🤖", "ROBOTICS": "🦾", "ENGINEERING": "⚙️",
+    "MATHEMATICS & DATA": "📐", "CLIMATE & ENERGY": "🌱",
+}
+
+FIELD_COLORS_SEED = {
+    "PHYSICS": "cyan", "CHEMISTRY": "orange", "BIOLOGY": "green",
+    "MEDICINE": "red", "EARTH & SPACE": "violet", "COMPUTER SCIENCE": "cyan",
+    "AI": "violet", "ROBOTICS": "orange", "ENGINEERING": "gold",
+    "MATHEMATICS & DATA": "cyan", "CLIMATE & ENERGY": "green",
+}
+
+RESEARCH_ARTICLES_SEED = [
+    {
+        "id": "a1",
+        "title": "Topological Qubits Achieve 99.9% Fidelity",
+        "abstract": "Microsoft Research demonstrates record-breaking qubit stability using Majorana fermions in topological superconductors, opening a new chapter for fault-tolerant quantum computing.",
+        "field": "PHYSICS",
+        "author": "Dr. Sarah Chen",
+        "date": "2025-03-15",
+        "readTime": "12 min",
+        "content": [
+            "Topological quantum computing has long been considered the holy grail of quantum information science. Unlike conventional qubits that are fragile and error-prone, topological qubits encode information in the global properties of a quantum system, making them inherently resistant to local noise and perturbation.",
+            "The key innovation lies in using Majorana fermions — exotic particles that are their own antiparticles. When these particles are braided around each other, they perform quantum computations that are inherently protected from local noise. This braiding operation is topologically protected, meaning small perturbations cannot corrupt the computation.",
+            "Microsoft's latest breakthrough achieved 99.9% gate fidelity, surpassing the threshold needed for practical quantum error correction. This means that topological quantum computers could require orders of magnitude fewer physical qubits than surface-code approaches.",
+            "The implications are staggering: drug discovery simulations that would take classical computers millions of years could be completed in hours. Materials science, cryptography, and optimization problems all stand to benefit from this revolutionary advance in quantum hardware.",
+        ],
+        "quotes": ['"This is the moment topological quantum computing goes from theory to engineering." — Dr. Chetan Nayak, Microsoft'],
+        "keyFindings": [
+            "99.9% gate fidelity achieved with topological qubits",
+            "Majorana fermion braiding demonstrated at scale",
+            "1000x fewer physical qubits needed vs. conventional approaches",
+            "Path to fault-tolerant quantum computing now clear",
+        ],
+        "relatedTopics": ["Quantum Error Correction", "Majorana Fermions", "Topological Insulators"],
+    },
+    {
+        "id": "a6",
+        "title": "Room-Temperature Superconductor Confirmed by Three Independent Labs",
+        "abstract": "LK-99 successor material shows zero resistance at 15°C and ambient pressure, verified across MIT, Max Planck, and RIKEN.",
+        "field": "PHYSICS",
+        "author": "Dr. Elena Volkov",
+        "date": "2025-02-28",
+        "readTime": "11 min",
+        "content": [
+            "Three independent laboratories — MIT, Max Planck Institute, and RIKEN — have confirmed that a new copper-doped lead apatite derivative exhibits true superconductivity at room temperature and ambient pressure.",
+            "The material, developed by a team at Seoul National University, builds on the controversial LK-99 announcement of 2023. Years of refinement to the synthesis process eliminated the impurities that caused earlier samples to fail.",
+            "Room-temperature superconductivity represents one of the most sought-after materials science breakthroughs of the century. Current superconductors require cooling to near absolute zero, limiting practical applications to specialized industrial uses.",
+            "Commercial implications are transformative: lossless power transmission grids, ultra-high-speed maglev trains, compact MRI machines, and quantum computers operating at room temperature all become feasible.",
+        ],
+        "quotes": ['"After 30 years, I can finally say it without hesitation: room-temperature superconductivity is real." — Prof. Jun Nagamatsu, Aoyama Gakuin University'],
+        "keyFindings": [
+            "Zero resistance confirmed at 15°C and 1 atm pressure",
+            "Verified by three independent international laboratories",
+            "Based on copper-doped lead apatite synthesis",
+            "Enables lossless power transmission and compact MRI",
+        ],
+        "relatedTopics": ["Superconductivity", "BCS Theory", "Cooper Pairs", "Meissner Effect"],
+    },
+    {
+        "id": "a2",
+        "title": "AI Discovers New Antibiotic Class After 60-Year Gap",
+        "abstract": "Deep learning model screens 1.2 billion molecular candidates to identify halicin derivatives effective against drug-resistant bacteria.",
+        "field": "MEDICINE",
+        "author": "Dr. James Liu",
+        "date": "2025-03-10",
+        "readTime": "9 min",
+        "content": [
+            "For the first time in over 60 years, scientists have discovered an entirely new class of antibiotics — and artificial intelligence made it possible.",
+            "A deep learning model trained on molecular structures and antibiotic activity screened over 1.2 billion candidate molecules in three days — a task that would have taken centuries using traditional methods.",
+            "The model identified halicin derivatives that kill bacteria through a novel mechanism: disrupting the electrochemical gradient across bacterial membranes. This mechanism is fundamentally different from all existing antibiotics, meaning resistance is far harder to develop.",
+            "The discovery is urgent: antimicrobial resistance kills 1.3 million people annually and is projected to become the leading cause of death globally by 2050 without new antibiotics.",
+        ],
+        "quotes": ['"AI didn\'t just accelerate drug discovery — it found something we never would have found with traditional methods." — Prof. Regina Barzilay, MIT'],
+        "keyFindings": [
+            "New antibiotic class discovered for first time since 1987",
+            "Novel membrane-disruption mechanism resists resistance development",
+            "1.2 billion molecules screened in 72 hours",
+            "Effective against MRSA, C. diff, and pan-resistant Acinetobacter",
+        ],
+        "relatedTopics": ["Antimicrobial Resistance", "Drug Discovery", "Deep Learning in Medicine"],
+    },
+    {
+        "id": "a3",
+        "title": "Humanoid Robots Begin Autonomous Construction Work",
+        "abstract": "Boston Dynamics' Atlas units complete 4-hour unsupervised structural tasks at real construction sites.",
+        "field": "ROBOTICS",
+        "author": "Dr. Priya Nair",
+        "date": "2025-03-05",
+        "readTime": "8 min",
+        "content": [
+            "Boston Dynamics' Atlas robots have achieved a landmark milestone: completing four-hour autonomous construction tasks at real job sites with no human supervision.",
+            "The robots performed structural framing, drywall installation, and material transport — tasks requiring dynamic balance, tool manipulation, and adaptive decision-making in unpredictable environments.",
+            "The breakthrough combines reinforcement learning for physical control with large language model planning for task decomposition. The LLM interprets high-level instructions and breaks them into physical actions the robot can execute.",
+            "Construction sites present extreme challenges: irregular surfaces, variable lighting, unexpected obstacles, and the need to handle materials of different weights and textures.",
+        ],
+        "quotes": ['"We\'re not replacing construction workers — we\'re augmenting them for dangerous and repetitive tasks." — Robert Playter, CEO, Boston Dynamics'],
+        "keyFindings": [
+            "4-hour autonomous wall framing completed",
+            "Adaptive manipulation with irregular materials",
+            "Integration of LLM planning with physical control",
+            "Addresses 500,000 unfilled construction jobs in US",
+        ],
+        "relatedTopics": ["Humanoid Robots", "Construction Technology", "Reinforcement Learning"],
+    },
+    {
+        "id": "a7",
+        "title": "DeepMind Solves Protein-Protein Interaction Prediction",
+        "abstract": "AlphaFold 4 predicts multi-protein complex formations with 95% accuracy, unlocking drug target discovery.",
+        "field": "BIOLOGY",
+        "author": "Dr. Ana Torres",
+        "date": "2025-03-01",
+        "readTime": "10 min",
+        "content": [
+            "DeepMind's AlphaFold 4 has solved one of biology's grand challenges: predicting how multiple proteins interact and assemble into functional complexes with near-experimental accuracy.",
+            "While AlphaFold 2 revolutionized single-protein structure prediction, most biological functions depend on complex interactions between multiple proteins. AlphaFold 4 predicts these assemblies with 95% accuracy.",
+            "The model was trained on cryo-electron microscopy data of over 100,000 protein complexes, learning the subtle thermodynamic and geometric rules that govern protein-protein recognition and binding.",
+            "This capability is transformative for drug discovery. Understanding how disease-related proteins interact allows researchers to design drugs that precisely disrupt pathological interactions while leaving healthy ones intact.",
+        ],
+        "quotes": ['"This is the missing piece that turns structural biology into a truly predictive science." — Demis Hassabis, CEO, DeepMind'],
+        "keyFindings": [
+            "95% accuracy for multi-protein complex prediction",
+            "Trained on 100,000+ cryo-EM structures",
+            "Already identified 12 novel drug targets",
+            "Revolutionizes structure-based drug design",
+        ],
+        "relatedTopics": ["Protein Folding", "Drug Discovery", "Structural Biology"],
+    },
+    {
+        "id": "a16",
+        "title": "Synthetic Biology Creates First Self-Replicating Artificial Cell",
+        "abstract": "Craig Venter Institute achieves minimal artificial cell that grows, divides, and evolves with only 473 genes.",
+        "field": "BIOLOGY",
+        "author": "Dr. Kim Novak",
+        "date": "2025-02-05",
+        "readTime": "12 min",
+        "content": [
+            "Scientists at the Craig Venter Institute have created the first truly self-replicating artificial cell — a synthetic organism built from scratch that can grow, divide, and even evolve over multiple generations.",
+            "The organism, JCVI-syn3.1, contains only 473 genes — the minimal set needed for independent life. Every gene was chemically synthesized and assembled into a complete genome that was then booted inside an empty cell membrane.",
+            "Unlike previous synthetic biology achievements that modified existing organisms, this cell was designed from a blank slate, giving researchers complete control over every aspect of its biology and behavior.",
+            "The breakthrough has profound implications for biotechnology: synthetic cells could be programmed to produce medicines, biofuels, or materials on demand, serving as living factories with capabilities designed entirely by humans.",
+        ],
+        "quotes": ['"We have crossed the threshold from reading the genetic code to writing it from scratch." — Dr. Craig Venter'],
+        "keyFindings": [
+            "Self-replicating artificial cell created with 473 genes",
+            "Complete genome chemically synthesized",
+            "Cell grows, divides, and evolves independently",
+            "Foundation for programmable living factories",
+        ],
+        "relatedTopics": ["Synthetic Biology", "Minimal Genome", "Bioengineering", "Origin of Life"],
+    },
+    {
+        "id": "a8",
+        "title": "Solid-State Batteries Enter Mass Production",
+        "abstract": "Toyota begins commercial production of solid-state batteries with 1,200km range and 10-minute charging.",
+        "field": "ENGINEERING",
+        "author": "Dr. Yuki Tanaka",
+        "date": "2025-03-18",
+        "readTime": "7 min",
+        "content": [
+            "Toyota has begun mass production of solid-state batteries at its Himeji facility, marking the beginning of a new era for electric vehicles and energy storage technology worldwide.",
+            "The batteries use a sulfide-based solid electrolyte instead of liquid, enabling higher energy density (500 Wh/kg vs 250 Wh/kg for current lithium-ion), faster charging, and dramatically improved safety with no flammable liquids.",
+            "Initial production will supply Toyota's new flagship EV, offering 1,200km range and 10% to 80% charging in just 10 minutes — eliminating the two biggest barriers to widespread EV adoption.",
+            "The technology also enables new form factors: batteries can be made thinner, lighter, and in arbitrary shapes, opening possibilities for wearable electronics, aerospace applications, and grid-scale storage.",
+        ],
+        "quotes": ['"Solid-state batteries will do for EVs what lithium-ion did for smartphones." — Akio Toyoda, Toyota Chairman'],
+        "keyFindings": [
+            "500 Wh/kg energy density (2x current Li-ion)",
+            "10-minute fast charging to 80% capacity",
+            "Mass production at commercial scale achieved",
+            "Eliminates flammability risks of liquid electrolytes",
+        ],
+        "relatedTopics": ["Battery Technology", "Electric Vehicles", "Energy Storage"],
+    },
+    {
+        "id": "a9",
+        "title": "Riemann Hypothesis Proof Verified by Mathematical Community",
+        "abstract": "After 3 years of scrutiny, the proof by Dr. Yitang Zhang is accepted, solving the 165-year-old problem.",
+        "field": "MATHEMATICS & DATA",
+        "author": "Dr. Michael Torres",
+        "date": "2025-02-20",
+        "readTime": "13 min",
+        "content": [
+            "The mathematical community has formally accepted a proof of the Riemann Hypothesis, one of the seven Millennium Prize Problems and arguably the most important unsolved problem in mathematics for over a century.",
+            "Dr. Yitang Zhang, known for his breakthrough on bounded gaps between primes, submitted the proof in 2022. After three years of intense verification by dozens of leading mathematicians worldwide, no errors have been found.",
+            "The Riemann Hypothesis concerns the distribution of prime numbers and the zeros of the Riemann zeta function. Its proof has immediate implications across mathematics, theoretical physics, and modern cryptography.",
+            "RSA cryptography, which secures most internet communications, relies on the difficulty of factoring large numbers — intimately connected to prime distribution. The proof's implications for cybersecurity are still being assessed by intelligence agencies.",
+        ],
+        "quotes": ['"This is the Mount Everest of mathematics. Zhang has reached the summit." — Prof. Terence Tao, UCLA'],
+        "keyFindings": [
+            "Proof verified by 40+ independent mathematicians",
+            "Implications for prime number distribution fully characterized",
+            "Potential impact on RSA cryptography security assessment",
+            "$1 million Millennium Prize awarded",
+        ],
+        "relatedTopics": ["Number Theory", "Zeta Function", "Prime Distribution"],
+    },
+    {
+        "id": "a10",
+        "title": "Mars Sample Return: First Martian Soil Arrives on Earth",
+        "abstract": "ESA-NASA joint mission successfully delivers 350g of Perseverance-collected Mars samples to Utah facility.",
+        "field": "EARTH & SPACE",
+        "author": "Dr. Clara Novak",
+        "date": "2025-03-20",
+        "readTime": "8 min",
+        "content": [
+            "In a historic achievement for space exploration, the first samples of Martian soil have safely landed on Earth, completing a mission that took over a decade of planning and flawless execution.",
+            "The Mars Sample Return mission, a joint effort between ESA and NASA, retrieved 30 sealed tubes cached by the Perseverance rover across Jezero Crater — an ancient lake bed believed to have once harbored microbial life.",
+            "The 350 grams of material include sedimentary rocks, igneous samples, and atmospheric gases. Preliminary analysis suggests the presence of complex organic molecules, though biological origin has not yet been confirmed.",
+            "Samples are being distributed to 200 laboratories in 30 countries for analysis, using instruments far more sensitive than any rover could carry. Results are expected to transform our understanding of Mars's past habitability.",
+        ],
+        "quotes": ['"Holding a piece of Mars in your hands — it changes your perspective on what\'s possible." — Dr. Laurie Leshin, JPL Director'],
+        "keyFindings": [
+            "350g of Martian material safely returned to Earth",
+            "Complex organic molecules detected in preliminary analysis",
+            "200 labs in 30 countries conducting detailed analysis",
+            "Samples from ancient lake bed with habitability potential",
+        ],
+        "relatedTopics": ["Mars Exploration", "Astrobiology", "Sample Return Missions"],
+    },
+    {
+        "id": "a11",
+        "title": "Catalytic CO2 Conversion Achieves Industrial Scale",
+        "abstract": "Carbon Engineering's new catalyst converts atmospheric CO2 to jet fuel at $80/barrel, competitive with fossil fuels.",
+        "field": "CHEMISTRY",
+        "author": "Dr. Amara Osei",
+        "date": "2025-03-14",
+        "readTime": "9 min",
+        "content": [
+            "Carbon Engineering has achieved a breakthrough that could transform the fight against climate change: converting atmospheric CO2 into synthetic jet fuel at costs competitive with fossil fuel extraction.",
+            "The new iron-cobalt catalyst operates at lower temperatures and pressures than previous approaches, dramatically reducing energy requirements. The process captures CO2 directly from ambient air and combines it with green hydrogen.",
+            "At $80 per barrel equivalent, synthetic aviation fuel is now within the price range of conventional jet fuel, removing the economic barrier to decarbonizing the aviation industry — one of the hardest sectors to electrify.",
+            "The company has broken ground on a facility in Texas that will produce 100 million liters of synthetic fuel annually, enough to power 10,000 transatlantic flights per year with net-zero carbon emissions.",
+        ],
+        "quotes": ['"We\'re turning air pollution into aviation fuel. The circular carbon economy is here." — Steve Oldham, CEO, Carbon Engineering'],
+        "keyFindings": [
+            "$80/barrel synthetic fuel from atmospheric CO2",
+            "New catalyst reduces energy requirements by 60%",
+            "100 million liter/year facility under construction",
+            "Net-zero aviation fuel at fossil-fuel-competitive prices",
+        ],
+        "relatedTopics": ["Carbon Capture", "Catalysis", "Sustainable Aviation"],
+    },
+    {
+        "id": "a17",
+        "title": "Post-Quantum Cryptography Standard Deployed Across Major Browsers",
+        "abstract": "NIST's ML-KEM algorithm now protects 80% of web traffic against future quantum computer attacks.",
+        "field": "COMPUTER SCIENCE",
+        "author": "Dr. Anil Gupta",
+        "date": "2025-03-28",
+        "readTime": "8 min",
+        "content": [
+            "All major web browsers have completed the rollout of post-quantum cryptographic algorithms, protecting an estimated 80% of global internet traffic against attacks from future quantum computers.",
+            "The transition centers on ML-KEM (Module-Lattice Key Encapsulation Mechanism), selected by NIST after an 8-year evaluation process. The algorithm's security is based on the hardness of lattice problems, which remain intractable even for quantum computers.",
+            "The deployment uses a hybrid approach, combining traditional elliptic curve cryptography with ML-KEM to ensure security against both classical and quantum attacks during the transition period.",
+            "The urgency of the transition is driven by \"harvest now, decrypt later\" attacks, where adversaries capture encrypted traffic today intending to decrypt it once quantum computers become powerful enough.",
+        ],
+        "quotes": ['"We\'re not just protecting today\'s data — we\'re protecting today\'s secrets from tomorrow\'s computers." — Dr. Dustin Moody, NIST'],
+        "keyFindings": [
+            "80% of web traffic now quantum-resistant",
+            "ML-KEM deployed in hybrid mode across all major browsers",
+            "Protects against \"harvest now, decrypt later\" attacks",
+            "Lattice-based security intractable for quantum computers",
+        ],
+        "relatedTopics": ["Post-Quantum Cryptography", "Lattice Problems", "TLS Protocol", "NIST Standards"],
+    },
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPLAINERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@content_bp.route("/api/explainers/seed", methods=["POST"])
+def seed_explainers():
+    """
+    POST /api/explainers/seed
+    Bulk-insert all 9 explainers from explainers.ts into Firestore.
+    Safe to re-run — uses merge=True so existing docs are updated not duplicated.
+
+    Response:
+    { "seeded": 9, "ids": ["quantum-dog", "crispr-scissors", ...] }
+
+    curl -X POST http://127.0.0.1:5000/api/explainers/seed
+    """
+    seeded = []
+    for ex in EXPLAINERS_SEED:
+        doc = {**ex, "created_at": _now(), "updated_at": _now()}
+        try:
+            db.collection("explainers").document(ex["id"]).set(doc, merge=True)
+            seeded.append(ex["id"])
+        except Exception as e:
+            log.error("seed_explainers failed for %s: %s", ex["id"], e)
+    log.info("Explainers seeded: %d", len(seeded))
+    return jsonify({"seeded": len(seeded), "ids": seeded}), 201
+
+
+@content_bp.route("/api/explainers", methods=["POST"])
+def create_explainer():
+    """
+    POST /api/explainers
+    Create a single explainer.
+
+    Body: Explainer object (id, title, subtitle, field, badgeColor,
+                            readTime, content[], keyInsights[])
+
+    curl -X POST http://127.0.0.1:5000/api/explainers \\
+      -H "Content-Type: application/json" \\
+      -d '{"id":"my-explainer","title":"Test","subtitle":"Sub","field":"AI","badgeColor":"violet","readTime":"5 MIN READ","content":["para1"],"keyInsights":["insight1"]}'
+    """
+    data = request.get_json(silent=True) or {}
+    if not data.get("id") or not data.get("title"):
+        return jsonify({"error": "id and title are required"}), 400
+    doc = {**data, "created_at": _now(), "updated_at": _now()}
+    try:
+        db.collection("explainers").document(data["id"]).set(doc, merge=True)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify(doc), 201
+
+
+@content_bp.route("/api/explainers", methods=["GET"])
+def list_explainers():
+    """
+    GET /api/explainers?field=BIOLOGY
+    List all explainers. Optional ?field= filter.
+
+    Response mirrors explainers.ts export exactly:
+    {
+      "explainers": [
+        {
+          "id":          "quantum-dog",
+          "title":       "The Quantum Dog: Schrödinger's Pet Paradox",
+          "subtitle":    "How quantum superposition works...",
+          "field":       "QUANTUM PHYSICS",
+          "badgeColor":  "cyan",
+          "readTime":    "8 MIN READ",
+          "content":     ["para1", "para2", ...],
+          "keyInsights": ["insight1", ...]
+        }, ...
+      ],
+      "total": 9
+    }
+
+    curl http://127.0.0.1:5000/api/explainers
+    curl "http://127.0.0.1:5000/api/explainers?field=BIOLOGY"
+    """
+    field_filter = request.args.get("field", "").strip().upper()
+    try:
+        q    = db.collection("explainers").order_by("created_at", direction="ASCENDING")
+        docs = q.limit(100).stream()
+        explainers = []
+        for d in docs:
+            ex = d.to_dict()
+            if field_filter and ex.get("field", "").upper() != field_filter:
+                continue
+            # Return only the fields that match the TypeScript interface
+            explainers.append({
+                "id":          ex.get("id"),
+                "title":       ex.get("title"),
+                "subtitle":    ex.get("subtitle"),
+                "field":       ex.get("field"),
+                "badgeColor":  ex.get("badgeColor"),
+                "readTime":    ex.get("readTime"),
+                "content":     ex.get("content", []),
+                "keyInsights": ex.get("keyInsights", []),
+            })
+    except Exception as e:
+        log.error("list_explainers failed: %s", e)
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"explainers": explainers, "total": len(explainers)}), 200
+
+
+@content_bp.route("/api/explainers/<explainer_id>", methods=["GET"])
+def get_explainer(explainer_id: str):
+    """
+    GET /api/explainers/<id>
+    Returns single Explainer object — same shape as one item in explainers.ts.
+
+    curl http://127.0.0.1:5000/api/explainers/quantum-dog
+    """
+    doc = db.collection("explainers").document(explainer_id).get()
+    if not doc.exists:
+        return jsonify({"error": "Explainer not found"}), 404
+    ex = doc.to_dict()
+    return jsonify({
+        "id":          ex.get("id"),
+        "title":       ex.get("title"),
+        "subtitle":    ex.get("subtitle"),
+        "field":       ex.get("field"),
+        "badgeColor":  ex.get("badgeColor"),
+        "readTime":    ex.get("readTime"),
+        "content":     ex.get("content", []),
+        "keyInsights": ex.get("keyInsights", []),
+    }), 200
+
+
+@content_bp.route("/api/explainers/<explainer_id>", methods=["PUT"])
+def update_explainer(explainer_id: str):
+    """
+    PUT /api/explainers/<id>
+    Update an explainer's fields.
+
+    curl -X PUT http://127.0.0.1:5000/api/explainers/quantum-dog \\
+      -H "Content-Type: application/json" \\
+      -d '{"readTime":"10 MIN READ"}'
+    """
+    doc_ref = db.collection("explainers").document(explainer_id)
+    if not doc_ref.get().exists:
+        return jsonify({"error": "Explainer not found"}), 404
+    data = request.get_json(silent=True) or {}
+    data["updated_at"] = _now()
+    data.pop("id", None)
+    try:
+        doc_ref.update(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"updated": True, "id": explainer_id}), 200
+
+
+@content_bp.route("/api/explainers/<explainer_id>", methods=["DELETE"])
+def delete_explainer(explainer_id: str):
+    """
+    DELETE /api/explainers/<id>
+
+    curl -X DELETE http://127.0.0.1:5000/api/explainers/quantum-dog
+    """
+    doc_ref = db.collection("explainers").document(explainer_id)
+    if not doc_ref.get().exists:
+        return jsonify({"error": "Explainer not found"}), 404
+    doc_ref.delete()
+    return jsonify({"deleted": True, "id": explainer_id}), 200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESEARCH FIELDS META
+# ─────────────────────────────────────────────────────────────────────────────
+
+@content_bp.route("/api/research/fields", methods=["GET"])
+def get_fields():
+    """
+    GET /api/research/fields
+    Returns the FIELDS, FIELD_ICONS, and FIELD_COLORS from research-articles.ts.
+
+    Response:
+    {
+      "fields":       ["PHYSICS","CHEMISTRY","BIOLOGY",...],
+      "field_icons":  { "PHYSICS":"⚛️", ... },
+      "field_colors": { "PHYSICS":"cyan", ... }
+    }
+
+    curl http://127.0.0.1:5000/api/research/fields
+    """
+    return jsonify({
+        "fields":       FIELDS_SEED,
+        "field_icons":  FIELD_ICONS_SEED,
+        "field_colors": FIELD_COLORS_SEED,
+    }), 200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESEARCH ARTICLES
+# ─────────────────────────────────────────────────────────────────────────────
+
+@content_bp.route("/api/research/seed", methods=["POST"])
+def seed_research():
+    """
+    POST /api/research/seed
+    Bulk-insert all 11 research articles from research-articles.ts.
+    Also saves the fields meta doc. Safe to re-run.
+
+    Response:
+    { "seeded": 11, "ids": ["a1","a2",...] }
+
+    curl -X POST http://127.0.0.1:5000/api/research/seed
+    """
+    seeded = []
+    for art in RESEARCH_ARTICLES_SEED:
+        doc = {**art, "created_at": _now(), "updated_at": _now()}
+        try:
+            db.collection("research_articles").document(art["id"]).set(doc, merge=True)
+            seeded.append(art["id"])
+        except Exception as e:
+            log.error("seed_research failed for %s: %s", art["id"], e)
+
+    # Also persist the fields meta so it's queryable
+    try:
+        db.collection("research_fields").document("meta").set({
+            "fields":       FIELDS_SEED,
+            "field_icons":  FIELD_ICONS_SEED,
+            "field_colors": FIELD_COLORS_SEED,
+            "updated_at":   _now(),
+        })
+    except Exception as e:
+        log.warning("Could not save research_fields meta: %s", e)
+
+    log.info("Research articles seeded: %d", len(seeded))
+    return jsonify({"seeded": len(seeded), "ids": seeded}), 201
+
+
+@content_bp.route("/api/research/articles", methods=["POST"])
+def create_research_article():
+    """
+    POST /api/research/articles
+    Create a single research article.
+
+    Body: Article object (id, title, abstract, field, author, date,
+                          readTime, content[], quotes[], keyFindings[], relatedTopics[])
+
+    curl -X POST http://127.0.0.1:5000/api/research/articles \\
+      -H "Content-Type: application/json" \\
+      -d '{"id":"a99","title":"Test Article","abstract":"Test abstract","field":"AI","author":"Dr. Test","date":"2025-04-01","readTime":"5 min","content":["para1"],"quotes":[],"keyFindings":["finding1"],"relatedTopics":["AI"]}'
+    """
+    data = request.get_json(silent=True) or {}
+    if not data.get("id") or not data.get("title"):
+        return jsonify({"error": "id and title are required"}), 400
+    if data.get("field") not in FIELDS_SEED:
+        return jsonify({"error": f"field must be one of: {', '.join(FIELDS_SEED)}"}), 400
+    doc = {**data, "created_at": _now(), "updated_at": _now()}
+    try:
+        db.collection("research_articles").document(data["id"]).set(doc, merge=True)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify(doc), 201
+
+
+@content_bp.route("/api/research/articles", methods=["GET"])
+def list_research_articles():
+    """
+    GET /api/research/articles?field=PHYSICS
+    List all research articles. Optional ?field= filter.
+
+    Response mirrors research-articles.ts export exactly:
+    {
+      "articles": [
+        {
+          "id":            "a1",
+          "title":         "Topological Qubits Achieve 99.9% Fidelity",
+          "abstract":      "...",
+          "field":         "PHYSICS",
+          "author":        "Dr. Sarah Chen",
+          "date":          "2025-03-15",
+          "readTime":      "12 min",
+          "content":       ["para1", ...],
+          "quotes":        ["\"quote\" — Author"],
+          "keyFindings":   ["finding1", ...],
+          "relatedTopics": ["topic1", ...]
+        }, ...
+      ],
+      "total": 11,
+      "fields":       ["PHYSICS", ...],
+      "field_icons":  { "PHYSICS": "⚛️", ... },
+      "field_colors": { "PHYSICS": "cyan", ... }
+    }
+
+    curl http://127.0.0.1:5000/api/research/articles
+    curl "http://127.0.0.1:5000/api/research/articles?field=BIOLOGY"
+    """
+    field_filter = request.args.get("field", "").strip().upper()
+    try:
+        q    = db.collection("research_articles").order_by("date", direction="DESCENDING")
+        docs = q.limit(100).stream()
+        articles = []
+        for d in docs:
+            art = d.to_dict()
+            if field_filter and art.get("field", "").upper() != field_filter:
+                continue
+            articles.append({
+                "id":            art.get("id"),
+                "title":         art.get("title"),
+                "abstract":      art.get("abstract"),
+                "field":         art.get("field"),
+                "author":        art.get("author"),
+                "date":          art.get("date"),
+                "readTime":      art.get("readTime"),
+                "content":       art.get("content", []),
+                "quotes":        art.get("quotes", []),
+                "keyFindings":   art.get("keyFindings", []),
+                "relatedTopics": art.get("relatedTopics", []),
+            })
+    except Exception as e:
+        log.error("list_research_articles failed: %s", e)
+        return jsonify({"error": str(e)}), 500
+    return jsonify({
+        "articles":     articles,
+        "total":        len(articles),
+        "fields":       FIELDS_SEED,
+        "field_icons":  FIELD_ICONS_SEED,
+        "field_colors": FIELD_COLORS_SEED,
+    }), 200
+
+
+@content_bp.route("/api/research/articles/<article_id>", methods=["GET"])
+def get_research_article(article_id: str):
+    """
+    GET /api/research/articles/<id>
+    Returns single Article — same shape as one item in research-articles.ts.
+
+    curl http://127.0.0.1:5000/api/research/articles/a1
+    """
+    doc = db.collection("research_articles").document(article_id).get()
+    if not doc.exists:
+        return jsonify({"error": "Research article not found"}), 404
+    art = doc.to_dict()
+    return jsonify({
+        "id":            art.get("id"),
+        "title":         art.get("title"),
+        "abstract":      art.get("abstract"),
+        "field":         art.get("field"),
+        "author":        art.get("author"),
+        "date":          art.get("date"),
+        "readTime":      art.get("readTime"),
+        "content":       art.get("content", []),
+        "quotes":        art.get("quotes", []),
+        "keyFindings":   art.get("keyFindings", []),
+        "relatedTopics": art.get("relatedTopics", []),
+    }), 200
+
+
+@content_bp.route("/api/research/articles/<article_id>", methods=["PUT"])
+def update_research_article(article_id: str):
+    """
+    PUT /api/research/articles/<id>
+    Update a research article's fields.
+
+    curl -X PUT http://127.0.0.1:5000/api/research/articles/a1 \\
+      -H "Content-Type: application/json" \\
+      -d '{"readTime":"15 min"}'
+    """
+    doc_ref = db.collection("research_articles").document(article_id)
+    if not doc_ref.get().exists:
+        return jsonify({"error": "Research article not found"}), 404
+    data = request.get_json(silent=True) or {}
+    data["updated_at"] = _now()
+    data.pop("id", None)
+    try:
+        doc_ref.update(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"updated": True, "id": article_id}), 200
+
+
+@content_bp.route("/api/research/articles/<article_id>", methods=["DELETE"])
+def delete_research_article(article_id: str):
+    """
+    DELETE /api/research/articles/<id>
+
+    curl -X DELETE http://127.0.0.1:5000/api/research/articles/a1
+    """
+    doc_ref = db.collection("research_articles").document(article_id)
+    if not doc_ref.get().exists:
+        return jsonify({"error": "Research article not found"}), 404
+    doc_ref.delete()
+    return jsonify({"deleted": True, "id": article_id}), 200
