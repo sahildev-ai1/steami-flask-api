@@ -1,8 +1,7 @@
 """
-STEAMI Flask API  v3
-— No service account JSON needed (Firestore REST API via web key)
-— No NewsAPI needed (RSS-based article fetching)
-— Gemini 2.5 Flash for AI insights with SVG
+STEAMI Flask API  v4
+— All blueprints registered: chat, feed, static_content
+— CORS handles OPTIONS preflight for every /api/* route
 """
 
 import os
@@ -10,7 +9,7 @@ import uuid
 import logging
 from datetime import datetime, timezone
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -23,6 +22,8 @@ from article_fetcher import (
     fetch_articles_from_url,
     get_rss_sources,
 )
+from chat import chat_bp
+from feed import feed_bp
 from static_content import content_bp
 
 logging.basicConfig(
@@ -32,74 +33,79 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── App ────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
-app.register_blueprint(content_bp)
+
+# CORS must be configured BEFORE blueprints are registered so the
+# after_request CORS headers apply to every route including blueprint routes.
+CORS(
+    app,
+    resources={r"/api/*": {"origins": "*"}},
+    allow_headers=["Content-Type", "Authorization"],
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    supports_credentials=False,
+)
+
+# ── Register blueprints ────────────────────────────────────────────────────
+app.register_blueprint(chat_bp)     # mounts at /api/chat/...
+app.register_blueprint(feed_bp)     # mounts at /api/feed/...
+app.register_blueprint(content_bp)  # mounts at /api/explainers/... and /api/research/...
+
+
+# ── Belt-and-suspenders OPTIONS handler ───────────────────────────────────
+# Flask-CORS sometimes misses blueprint preflight requests when the route
+# returns 404. This before_request hook catches every OPTIONS call first
+# and immediately returns 200 with the correct CORS headers.
+@app.before_request
+def handle_options_preflight():
+    if request.method == "OPTIONS":
+        resp = make_response("", 200)
+        resp.headers["Access-Control-Allow-Origin"]  = "*"
+        resp.headers["Access-Control-Allow-Methods"] = (
+            "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        )
+        resp.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, Authorization"
+        )
+        resp.headers["Access-Control-Max-Age"] = "3600"
+        return resp
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
 # HEALTH
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
 
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "ts": _now()}), 200
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SOURCES — expose the RSS source registry to the frontend
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# SOURCES
+# ══════════════════════════════════════════════════════════════════════════
 
 @app.route("/api/sources", methods=["GET"])
 def list_sources():
-    """
-    Returns the available RSS sources with their keyword lists.
-    Frontend can use this to build the source picker UI.
-
-    curl http://localhost:5000/api/sources
-    """
     return jsonify({"sources": get_rss_sources()}), 200
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ARTICLES — fetch from RSS & save to Firestore
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# ARTICLES — fetch from RSS & save
+# ══════════════════════════════════════════════════════════════════════════
 
 @app.route("/api/articles/fetch", methods=["POST"])
 def fetch_and_save():
-    """
-    Fetch articles from RSS feeds and save to Firestore.
-
-    Body (JSON):
-        topic    : str         — free-text topic / keyword filter
-        keywords : list[str]   — explicit keyword list (alternative to topic)
-        limit    : int         — max articles to return (default 20)
-
-    curl example:
-        curl -X POST http://localhost:5000/api/articles/fetch \\
-             -H "Content-Type: application/json" \\
-             -d '{"topic": "AI", "limit": 10}'
-
-    curl with keywords (mirrors Next.js AIInsights page):
-        curl -X POST http://localhost:5000/api/articles/fetch \\
-             -H "Content-Type: application/json" \\
-             -d '{"keywords": ["AI", "Robotics"], "limit": 10}'
-    """
     data     = request.get_json(silent=True) or {}
     topic    = data.get("topic", "technology")
     keywords = data.get("keywords", [])
     limit    = int(data.get("limit", 20))
 
     try:
-        raw = fetch_articles_from_source(
-            topic=topic,
-            keywords=keywords,
-            limit=limit,
-        )
+        raw = fetch_articles_from_source(topic=topic, keywords=keywords, limit=limit)
     except Exception as e:
         log.error("fetch error: %s", e)
         return jsonify({"error": str(e)}), 502
@@ -107,8 +113,8 @@ def fetch_and_save():
     saved = []
     for art in raw:
         art.setdefault("id", str(uuid.uuid4()))
-        art["topic"]      = topic
-        art["fetched_at"] = _now()
+        art["topic"]       = topic
+        art["fetched_at"]  = _now()
         art["has_insight"] = False
         try:
             db.collection("articles").document(art["id"]).set(art, merge=True)
@@ -122,18 +128,6 @@ def fetch_and_save():
 
 @app.route("/api/articles/fetch-source", methods=["POST"])
 def fetch_from_source_url():
-    """
-    Fetch articles from a user-supplied URL (X, LinkedIn, Facebook, RSS, news site).
-
-    Body (JSON):
-        url   : str  — the page/profile/feed URL
-        limit : int  — max articles (default 20)
-
-    curl example:
-        curl -X POST http://localhost:5000/api/articles/fetch-source \\
-             -H "Content-Type: application/json" \\
-             -d '{"url": "https://x.com/openai", "limit": 10}'
-    """
     data  = request.get_json(silent=True) or {}
     url   = (data.get("url") or "").strip()
     limit = int(data.get("limit", 20))
@@ -159,24 +153,16 @@ def fetch_from_source_url():
         except Exception as e:
             log.error("Firestore save failed: %s", e)
 
-    log.info("fetch-source: saved %d articles from %s", len(saved), url)
+    log.info("fetch-source: saved %d from %s", len(saved), url)
     return jsonify({"saved": len(saved), "articles": saved, "source_url": url}), 201
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
 # ARTICLES — CRUD
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
 
 @app.route("/api/articles", methods=["GET"])
 def list_articles():
-    """
-    List articles from Firestore, newest first.
-
-    Query params:
-        limit : int (default 30)
-
-    curl http://localhost:5000/api/articles?limit=10
-    """
     limit = int(request.args.get("limit", 30))
     try:
         docs = (
@@ -193,9 +179,6 @@ def list_articles():
 
 @app.route("/api/articles/<article_id>", methods=["GET"])
 def get_article(article_id):
-    """
-    curl http://localhost:5000/api/articles/<article_id>
-    """
     doc = db.collection("articles").document(article_id).get()
     if not doc.exists:
         return jsonify({"error": "Not found"}), 404
@@ -204,17 +187,9 @@ def get_article(article_id):
 
 @app.route("/api/articles", methods=["POST"])
 def create_article():
-    """
-    Manually create an article.
-
-    curl -X POST http://localhost:5000/api/articles \\
-         -H "Content-Type: application/json" \\
-         -d '{"title": "Test Article", "content": "Body text here...", "topic": "AI"}'
-    """
     data = request.get_json(silent=True) or {}
     if not data.get("title") or not data.get("content"):
         return jsonify({"error": "title and content are required"}), 400
-
     doc_id = str(uuid.uuid4())
     art = {
         "id":          doc_id,
@@ -230,54 +205,101 @@ def create_article():
     return jsonify(art), 201
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
 # AI INSIGHTS
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/articles/<article_id>/insight", methods=["DELETE"])
+def delete_insight(article_id):
+    """Clear cached insight — next POST will regenerate from Gemini."""
+    doc_ref = db.collection("articles").document(article_id)
+    if not doc_ref.get().exists:
+        return jsonify({"error": "Article not found"}), 404
+    try:
+        doc_ref.update({
+            "ai_insight":           None,
+            "has_insight":          False,
+            "insight_generated_at": None,
+        })
+    except Exception as e:
+        log.warning("Could not clear article insight fields: %s", e)
+    try:
+        db.collection("ai_insights").document(article_id).delete()
+    except Exception as e:
+        log.warning("Could not delete ai_insights doc: %s", e)
+    log.info("Insight cache cleared for %s", article_id)
+    return jsonify({"deleted": True, "article_id": article_id}), 200
+
 
 @app.route("/api/articles/<article_id>/insight", methods=["POST"])
 def generate_insight(article_id):
     """
-    Generate AI insight (summary + SVG) for an article via Gemini.
-    Returns cached result if insight already exists.
-
-    curl -X POST http://localhost:5000/api/articles/<article_id>/insight
+    Generate Gemini insight for an article.
+    Searches both `articles` AND `feed_articles` so no article is missed.
+    Pass ?force=1 to skip cache and regenerate.
     """
-    doc_ref = db.collection("articles").document(article_id)
-    doc     = doc_ref.get()
+    force = request.args.get("force", "0") in ("1", "true", "yes")
 
+    # Search both collections
+    source_table = "articles"
+    doc_ref      = db.collection("articles").document(article_id)
+    doc          = doc_ref.get()
     if not doc.exists:
-        return jsonify({"error": "Article not found"}), 404
+        doc_ref      = db.collection("feed_articles").document(article_id)
+        doc          = doc_ref.get()
+        source_table = "feed_articles"
+    if not doc.exists:
+        return jsonify({"error": "Article not found in articles or feed_articles"}), 404
 
     article = doc.to_dict()
 
-    # Check article-level cache
-    if article.get("ai_insight"):
-        log.info("Returning cached insight for %s", article_id)
-        return jsonify({
-            "article_id": article_id,
-            "ai_insight": article["ai_insight"],
-            "cached":     True,
-        }), 200
+    # Cache check
+    if not force:
+        cached = article.get("ai_insight")
+        if (
+            cached
+            and isinstance(cached, dict)
+            and cached.get("summary")
+            and not cached.get("raw")
+            and len(cached.get("summary", "")) > 50
+        ):
+            log.info("Returning cached insight for %s (table=%s)", article_id, source_table)
+            return jsonify({
+                "article_id":   article_id,
+                "source_table": source_table,
+                "ai_insight":   cached,
+                "cached":       True,
+            }), 200
 
-    # Check dedicated insights collection
-    insight_doc = db.collection("ai_insights").document(article_id).get()
-    if insight_doc.exists:
-        insight_data = insight_doc.to_dict()
-        log.info("Returning insight from ai_insights collection for %s", article_id)
-        return jsonify({
-            "article_id": article_id,
-            "ai_insight": insight_data.get("ai_insight", insight_data),
-            "cached":     True,
-        }), 200
+        insight_doc = db.collection("ai_insights").document(article_id).get()
+        if insight_doc.exists:
+            stored = insight_doc.to_dict().get("ai_insight", {})
+            if (
+                isinstance(stored, dict)
+                and stored.get("summary")
+                and not stored.get("raw")
+                and len(stored.get("summary", "")) > 50
+            ):
+                log.info("Returning cached ai_insights for %s", article_id)
+                return jsonify({
+                    "article_id":   article_id,
+                    "source_table": insight_doc.to_dict().get("source_table", source_table),
+                    "ai_insight":   stored,
+                    "cached":       True,
+                }), 200
+            else:
+                try:
+                    db.collection("ai_insights").document(article_id).delete()
+                except Exception:
+                    pass
 
-    # Generate fresh insight
+    # Generate fresh
     try:
         insight = generate_ai_insight(article)
     except Exception as e:
         log.error("Gemini error for %s: %s", article_id, e)
         return jsonify({"error": str(e)}), 502
 
-    # Save back to article
     try:
         doc_ref.update({
             "ai_insight":           insight,
@@ -285,39 +307,46 @@ def generate_insight(article_id):
             "insight_generated_at": _now(),
         })
     except Exception as e:
-        log.error("Failed to update article with insight: %s", e)
+        log.error("Failed to update %s/%s: %s", source_table, article_id, e)
 
-    # Save to dedicated insights collection
     try:
         db.collection("ai_insights").document(article_id).set({
-            "article_id": article_id,
-            "title":      article.get("title", ""),
-            "topic":      article.get("topic", ""),
-            "source":     article.get("source", ""),
-            "ai_insight": insight,
-            "created_at": _now(),
+            "article_id":      article_id,
+            "source_table":    source_table,
+            "title":           article.get("title", ""),
+            "topic":           article.get("topic", ""),
+            "source":          article.get("source", ""),
+            "matched_domains": article.get("matched_domains", []),
+            "article_url":     article.get("article_url") or article.get("url", ""),
+            "ai_insight":      insight,
+            "created_at":      _now(),
         })
     except Exception as e:
         log.error("Failed to save ai_insights doc: %s", e)
 
-    log.info("Insight generated and saved for %s", article_id)
+    log.info(
+        "Insight generated: %s  table=%s  domain=%s  words=%d  svg=%d chars",
+        article_id, source_table,
+        insight.get("domain", "?"),
+        len(insight.get("summary", "").split()),
+        len(str(insight.get("svg", ""))),
+    )
     return jsonify({
-        "article_id": article_id,
-        "ai_insight": insight,
-        "cached":     False,
+        "article_id":   article_id,
+        "source_table": source_table,
+        "ai_insight":   insight,
+        "cached":       False,
     }), 200
 
 
 @app.route("/api/insights", methods=["GET"])
 def list_insights():
-    """
-    curl http://localhost:5000/api/insights
-    """
+    limit = int(request.args.get("limit", 50))
     try:
         docs = (
             db.collection("ai_insights")
               .order_by("created_at", direction="DESCENDING")
-              .limit(50)
+              .limit(limit)
               .stream()
         )
         return jsonify({"insights": [d.to_dict() for d in docs]}), 200
@@ -327,28 +356,18 @@ def list_insights():
 
 @app.route("/api/insights/<article_id>", methods=["GET"])
 def get_insight(article_id):
-    """
-    curl http://localhost:5000/api/insights/<article_id>
-    """
     doc = db.collection("ai_insights").document(article_id).get()
     if not doc.exists:
         return jsonify({"error": "Insight not found"}), 404
     return jsonify(doc.to_dict()), 200
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FULL PIPELINE (fetch + insight in one shot)
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# PIPELINE  (legacy)
+# ══════════════════════════════════════════════════════════════════════════
 
 @app.route("/api/pipeline", methods=["POST"])
 def pipeline():
-    """
-    Fetch articles via RSS and immediately generate AI insights for all of them.
-
-    curl -X POST http://localhost:5000/api/pipeline \\
-         -H "Content-Type: application/json" \\
-         -d '{"keywords": ["AI", "Machine Learning"], "limit": 2}'
-    """
     data     = request.get_json(silent=True) or {}
     topic    = data.get("topic", "technology")
     keywords = data.get("keywords", [])
@@ -378,18 +397,20 @@ def pipeline():
                 "ai_insight": insight,
                 "created_at": _now(),
             })
-            results.append({"id": art["id"], "title": art.get("title", ""),
-                            "ai_insight": insight, "status": "ok"})
+            results.append({
+                "id": art["id"], "title": art.get("title", ""),
+                "ai_insight": insight, "status": "ok",
+            })
         except Exception as e:
             results.append({"id": art["id"], "status": "error", "error": str(e)})
 
     return jsonify({"processed": len(results), "results": results}), 201
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port  = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
-    log.info("Starting STEAMI Flask API on port %d (debug=%s)", port, debug)
+    log.info("Starting STEAMI Flask API v4 on port %d (debug=%s)", port, debug)
     app.run(host="0.0.0.0", port=port, debug=debug)
