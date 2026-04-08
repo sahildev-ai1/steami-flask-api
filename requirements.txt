@@ -1,9 +1,24 @@
-flask>=3.0.0
-flask-cors>=4.0.0
-requests>=2.31.0
+# STEAMI FastAPI v6 — requirements
+# Run: pip install -r requirements.txt --break-system-packages
+
+# Web framework
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# Environment variables
 python-dotenv>=1.0.0
+
+# HTTP client (for Firestore REST API and RSS fetching)
+requests>=2.31.0
+
+# RSS parsing
 feedparser>=6.0.11
+
+# HTML scraping
 beautifulsoup4>=4.12.0
 lxml>=5.2.0
-gunicorn>=21.2.0
-dotenv>=0.19.0
+
+# Auth — NO extra packages needed!
+# JWT    → stdlib hmac + hashlib + base64
+# Hashing → stdlib hashlib.pbkdf2_hmac
+# Zero extra dependencies for auth.
