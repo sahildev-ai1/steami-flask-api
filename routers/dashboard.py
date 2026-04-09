@@ -31,7 +31,7 @@ from collections import defaultdict
 from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel
 
-from firestore_client import db
+from mongodb_client import db
 from auth import require_auth, require_admin, get_uid
 
 log    = logging.getLogger(__name__)

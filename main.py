@@ -1,5 +1,5 @@
 """
-STEAMI FastAPI  v7
+STEAMI FastAPI  v7 — MongoDB Atlas backend
 ==================
 Run:   uvicorn main:app --host 0.0.0.0 --port 5000 --reload
 Docs:  http://127.0.0.1:5000/docs
@@ -42,7 +42,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Core modules ───────────────────────────────────────────────────────────
-from firestore_client import db
+from mongodb_client import db
 from gemini_client import generate_ai_insight
 from article_fetcher import (
     fetch_articles_from_source,
@@ -277,26 +277,15 @@ def refresh_articles(
         len(all_docs), len(expired_ids), EXPIRY_DAYS, cutoff.date(),
     )
 
-    # ── Step 2: Delete expired articles AND their ai_insights ─────────────
+    # ── Step 2: Deletion disabled (removed by design) ────────────────────
+    # Articles and insights are NEVER deleted automatically.
+    # expired_ids are identified above but intentionally NOT deleted.
+    # The fetcher will skip duplicate URLs, so old articles stay visible
+    # in the database but new articles with the same URL won't be duplicated.
     deleted_articles = 0
     deleted_insights = 0
-
-    for doc_id in expired_ids:
-        # Delete the article document
-        try:
-            db.collection("articles").document(doc_id).delete()
-            deleted_articles += 1
-        except Exception as e:
-            log.warning("refresh: failed to delete article %s: %s", doc_id, e)
-
-        # Delete the corresponding ai_insight (same doc_id in ai_insights collection)
-        try:
-            db.collection("ai_insights").document(doc_id).delete()
-            deleted_insights += 1
-        except Exception as e:
-            log.warning("refresh: failed to delete insight %s: %s", doc_id, e)
-
-    log.info("refresh: deleted %d articles and %d insights", deleted_articles, deleted_insights)
+    log.info("refresh: found %d articles older than %dd (deletion disabled)",
+             len(expired_ids), EXPIRY_DAYS)
 
     # ── Step 3: Fetch fresh articles (min 3 per topic) ────────────────────
     try:
@@ -340,12 +329,12 @@ def refresh_articles(
     )
 
     return {
-        "deleted_articles": deleted_articles,
-        "deleted_insights": deleted_insights,
-        "fetched":          len(raw),
-        "new_saved":        len(saved),
-        "skipped":          skipped,
-        "articles":         saved,
+        "deletion_disabled":      True,
+        "expired_found":          len(expired_ids),
+        "fetched":                len(raw),
+        "new_saved":              len(saved),
+        "skipped":                skipped,
+        "articles":               saved,
     }
 
 

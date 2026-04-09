@@ -41,7 +41,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
-from firestore_client import db
+from mongodb_client import db
 from auth import (
     hash_password, verify_password, create_token,
     require_auth, require_admin, get_uid, ROLES,

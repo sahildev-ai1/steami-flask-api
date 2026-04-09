@@ -11,7 +11,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
 
-from firestore_client import db
+from mongodb_client import db
 # Auth guards — GET routes are public, writes require mod/admin, seed requires admin
 from auth import require_auth, require_mod, require_admin, get_uid
 from content_data import (

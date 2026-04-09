@@ -12,7 +12,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
 
-from firestore_client import db
+from mongodb_client import db
 from gemini_client import generate_ai_insight
 # Auth — only insight endpoint is locked; feed browsing is public
 from auth import require_auth, get_uid

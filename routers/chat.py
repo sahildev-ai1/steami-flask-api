@@ -12,7 +12,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
 
-from firestore_client import db
+from mongodb_client import db
 # ALL chat routes are locked — require any logged-in user
 from auth import require_auth, get_uid
 

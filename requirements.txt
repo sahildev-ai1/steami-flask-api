@@ -1,4 +1,5 @@
-# STEAMI FastAPI v6 — requirements
+# STEAMI FastAPI v7 — requirements
+# Python 3.10+ required
 # Run: pip install -r requirements.txt --break-system-packages
 
 # Web framework
@@ -8,17 +9,20 @@ uvicorn[standard]>=0.29.0
 # Environment variables
 python-dotenv>=1.0.0
 
-# HTTP client (for Firestore REST API and RSS fetching)
+# MongoDB Atlas (replaces Firestore)
+# [srv] adds dnspython for mongodb+srv:// connection string support
+pymongo[srv]>=4.6.0
+
+# HTTP client (RSS fetching + Gemini API calls)
 requests>=2.31.0
 
-# RSS parsing
+# RSS feed parsing
 feedparser>=6.0.11
 
 # HTML scraping
 beautifulsoup4>=4.12.0
 lxml>=5.2.0
 
-# Auth — NO extra packages needed!
-# JWT    → stdlib hmac + hashlib + base64
-# Hashing → stdlib hashlib.pbkdf2_hmac
-# Zero extra dependencies for auth.
+# Auth — NO extra packages needed
+# JWT    -> stdlib hmac + hashlib + base64
+# Hashing -> stdlib hashlib.pbkdf2_hmac
