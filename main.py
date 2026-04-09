@@ -1,27 +1,38 @@
 """
-STEAMI FastAPI  v6
+STEAMI FastAPI  v7
 ==================
 Run:   uvicorn main:app --host 0.0.0.0 --port 5000 --reload
 Docs:  http://127.0.0.1:5000/docs
 
-DUMMY ACCOUNTS (seeded automatically on first startup):
-  ADMIN  admin@steami.dev   /  Admin@steami123   (full access)
-  MOD    mod@steami.dev     /  Mod@steami123     (content management)
-  USER   user@steami.dev    /  User@steami123    (normal browsing + insights)
+NEW IN v7:
+  - Signup: profession field instead of domain/background/statement
+  - POST /api/auth/interests   — save user STEM topic interests after signup
+  - GET  /api/auth/interests   — get own interests
+  - POST /api/articles/refresh — expire articles >25 days (was 30), also deletes
+                                  their ai_insights; fetch min 3 per topic
+  - GET  /api/articles/for-me  — articles filtered by user's saved interests
+  - POST /api/diary            — save selected content to personal diary
+  - GET  /api/diary            — list own diary entries
+  - POST /api/dashboard/event  — log popup open event (for analytics)
+  - GET  /api/dashboard/me     — own activity summary
+  - GET  /api/dashboard/admin  — platform-wide stats (admin only)
 
-ROLE PERMISSIONS:
-  admin — everything including user management and seeding
-  mod   — content management (articles, explainers, research) — no user mgmt
-  user  — authenticated features: chat, AI insights, personal feed
+DUMMY ACCOUNTS (auto-created on startup):
+  admin@steami.dev / Admin@steami123  (admin)
+  mod@steami.dev   / Mod@steami123    (mod)
+  user@steami.dev  / User@steami123   (user)
 
-PUBLIC (no token):   articles list/get, explainers, research, feed/items, sources
-PROTECTED:           insights, chat, article writes, content writes, user management
+ROUTE PROTECTION:
+  Public:       GET articles, GET explainers, GET research, GET feed/items
+  Any auth:     insights, chat, diary, dashboard events, for-me feed
+  mod/admin:    article fetch, article write, explainer/research writes
+  admin only:   user mgmt, seed, delete explainers/research
 """
 
 import os
 import uuid
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,7 +47,10 @@ from gemini_client import generate_ai_insight
 from article_fetcher import (
     fetch_articles_from_source,
     fetch_articles_from_url,
+    fetch_articles_by_domains,
     get_rss_sources,
+    DOMAIN_KEYWORDS,
+    ALL_DOMAINS,
 )
 
 # ── Auth dependency helpers ────────────────────────────────────────────────
@@ -44,7 +58,9 @@ from auth import require_auth, require_mod, require_admin, get_uid
 
 # ── Routers ────────────────────────────────────────────────────────────────
 from routers import chat, feed, content
-from routers.auth_router import router as auth_router, seed_dummy_accounts
+from routers.auth_router  import router as auth_router, seed_dummy_accounts
+from routers.diary        import router as diary_router
+from routers.dashboard    import router as dashboard_router
 
 # ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -54,6 +70,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Article expiry period — articles older than this are deleted on refresh
+EXPIRY_DAYS = 25   # changed from 30 to 25
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # APP
@@ -61,22 +80,19 @@ log = logging.getLogger(__name__)
 
 app = FastAPI(
     title       = "STEAMI API",
-    version     = "6.0.0",
+    version     = "7.0.0",
     description = (
-        "STEAMI Backend — articles, AI insights, chat, feed, explainers.\n\n"
-        "**Test Accounts (login at POST /api/auth/login):**\n"
+        "STEAMI Backend — articles, insights, chat, feed, explainers, diary, dashboard.\n\n"
+        "**Test Accounts (POST /api/auth/login):**\n"
         "- Admin: `admin@steami.dev` / `Admin@steami123`\n"
         "- Mod:   `mod@steami.dev`   / `Mod@steami123`\n"
         "- User:  `user@steami.dev`  / `User@steami123`\n\n"
-        "Copy the `token` from the login response, click **Authorize** "
-        "above, and enter `Bearer <token>` to use protected endpoints."
+        "Paste the `token` value into **Authorize → Bearer <token>** above."
     ),
     swagger_ui_parameters = {"persistAuthorization": True},
 )
 
-# ── CORS ───────────────────────────────────────────────────────────────────
-# FastAPI's CORSMiddleware handles OPTIONS preflights automatically —
-# no before_request hook needed like we had in Flask.
+# ── CORS — allow all origins, handles OPTIONS automatically ────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins     = ["*"],
@@ -86,28 +102,43 @@ app.add_middleware(
 )
 
 
-# ── Startup seed ───────────────────────────────────────────────────────────
+# ── Startup ────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 def on_startup():
     """
-    Runs once when the server starts.
-    Creates the 3 dummy accounts (admin/mod/user) in Firestore if absent.
+    Runs once on server start.
+    Seeds the 3 dummy accounts into Firestore if they don't already exist.
     """
-    log.info("=== STEAMI v6 starting ===")
+    log.info("=== STEAMI v7 starting ===")
     result = seed_dummy_accounts()
-    log.info("Accounts seeded=%s  skipped=%s", result["created"], result["skipped"])
+    log.info("Accounts seeded=%s skipped=%s", result["created"], result["skipped"])
 
 
 # ── Routers ────────────────────────────────────────────────────────────────
-app.include_router(auth_router,   prefix="/api/auth",  tags=["Auth"])
-app.include_router(chat.router,   prefix="/api/chat",  tags=["Chat"])
-app.include_router(feed.router,   prefix="/api/feed",  tags=["Feed"])
-app.include_router(content.router,prefix="/api",       tags=["Content"])
+app.include_router(auth_router,      prefix="/api/auth",      tags=["Auth"])
+app.include_router(chat.router,      prefix="/api/chat",      tags=["Chat"])
+app.include_router(feed.router,      prefix="/api/feed",      tags=["Feed"])
+app.include_router(content.router,   prefix="/api",           tags=["Content"])
+app.include_router(diary_router,     prefix="/api/diary",     tags=["Diary"])
+app.include_router(dashboard_router, prefix="/api/dashboard", tags=["Dashboard"])
 
 
 def _now() -> str:
-    """Current UTC time as ISO string."""
+    """Current UTC time as ISO 8601 string."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_dt(ts: str | None) -> datetime | None:
+    """Parse an ISO timestamp string to a timezone-aware datetime. Returns None on failure."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -116,7 +147,7 @@ def _now() -> str:
 
 @app.get("/health", tags=["Health"], summary="Health check — public")
 def health():
-    return {"status": "ok", "ts": _now()}
+    return {"status": "ok", "version": "7.0.0", "ts": _now()}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -125,7 +156,7 @@ def health():
 
 @app.get("/api/sources", tags=["Articles"], summary="List RSS sources — public")
 def list_sources():
-    """Public: list all RSS sources. No token required."""
+    """Public: list all RSS sources used for article fetching."""
     return {"sources": get_rss_sources()}
 
 
@@ -134,48 +165,345 @@ def list_sources():
 # ══════════════════════════════════════════════════════════════════════════════
 
 class FetchArticlesBody(BaseModel):
+    """Body for POST /api/articles/fetch"""
     topic:    str       = "technology"
     keywords: list[str] = []
     limit:    int       = 20
 
+
 class FetchSourceBody(BaseModel):
+    """Body for POST /api/articles/fetch-source"""
     url:   str
     limit: int = 20
 
+
 class CreateArticleBody(BaseModel):
+    """Body for POST /api/articles"""
     title:   str
     content: str
     url:     str = ""
     source:  str = "manual"
     topic:   str = "general"
 
+
+class RefreshBody(BaseModel):
+    """Body for POST /api/articles/refresh"""
+    domains: list[str] = []   # subset of ALL_DOMAINS — empty means all 10
+    target:  int        = 30  # target number of articles to fetch
+
+
 class PipelineBody(BaseModel):
+    """Body for POST /api/pipeline"""
     topic:    str       = "technology"
     keywords: list[str] = []
     limit:    int       = 3
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ARTICLES — FETCH (requires mod/admin)
+# ARTICLES — REFRESH  (expire old, fetch new by domain topics)
+# Requires: mod | admin
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post(
+    "/api/articles/refresh",
+    status_code = 201,
+    tags        = ["Articles"],
+    summary     = "Refresh articles: expire old (>25d) + fetch new by topics — requires mod/admin",
+)
+def refresh_articles(
+    body:    RefreshBody = RefreshBody(),
+    payload: dict        = Depends(require_mod),   # mod or admin only
+):
+    """
+    POST /api/articles/refresh
+
+    Does three things in order:
+    1. Loads all articles from Firestore and identifies those older than 25 days.
+    2. Deletes expired articles AND their corresponding ai_insights documents.
+    3. Fetches fresh articles from the 3 primary RSS sources, filtered by the
+       10 canonical STEM topics. Guarantees at least 3 articles per topic.
+       Only saves articles whose URL is not already in the database.
+
+    Body (optional):
+    {
+      "domains": ["AI + ROBOTICS", "PHYSICS"],  // omit for all 10 topics
+      "target":  30                              // desired total articles
+    }
+
+    Response:
+    {
+      "deleted_articles": 8,    // articles older than 25 days that were removed
+      "deleted_insights":  8,    // their ai_insights also removed
+      "fetched":          28,    // articles pulled from RSS
+      "new_saved":        22,    // articles actually saved (not already present)
+      "skipped":           6,    // already existed in Firestore
+      "articles":        [ ...new saved articles... ]
+    }
+
+    curl -X POST http://127.0.0.1:5000/api/articles/refresh \\
+      -H "Authorization: Bearer <mod_or_admin_token>" \\
+      -H "Content-Type: application/json" \\
+      -d '{"domains":["AI + ROBOTICS","PHYSICS"],"target":30}'
+    """
+    # Validate domains — empty list means use all 10
+    active_domains = [d for d in body.domains if d in DOMAIN_KEYWORDS] or ALL_DOMAINS
+    cutoff         = datetime.now(timezone.utc) - timedelta(days=EXPIRY_DAYS)
+
+    # ── Step 1: Load all existing articles to find expired ones ───────────
+    try:
+        all_docs = db.collection("articles").stream_all()
+    except Exception as e:
+        log.error("refresh: failed to load articles: %s", e)
+        raise HTTPException(500, detail=f"Firestore read failed: {e}")
+
+    existing_urls: set[str]  = set()
+    expired_ids:   list[str] = []
+
+    for doc in all_docs:
+        d = doc.to_dict()
+
+        # Track URLs so we can skip duplicates when saving new articles
+        url = d.get("article_url") or d.get("url", "")
+        if url:
+            existing_urls.add(url)
+
+        # Mark expired: older than EXPIRY_DAYS (25 days)
+        fetched_at = _parse_dt(d.get("fetched_at"))
+        if fetched_at and fetched_at < cutoff:
+            expired_ids.append(doc.id)
+
+    log.info(
+        "refresh: total=%d existing, %d expired (>%dd), cutoff=%s",
+        len(all_docs), len(expired_ids), EXPIRY_DAYS, cutoff.date(),
+    )
+
+    # ── Step 2: Delete expired articles AND their ai_insights ─────────────
+    deleted_articles = 0
+    deleted_insights = 0
+
+    for doc_id in expired_ids:
+        # Delete the article document
+        try:
+            db.collection("articles").document(doc_id).delete()
+            deleted_articles += 1
+        except Exception as e:
+            log.warning("refresh: failed to delete article %s: %s", doc_id, e)
+
+        # Delete the corresponding ai_insight (same doc_id in ai_insights collection)
+        try:
+            db.collection("ai_insights").document(doc_id).delete()
+            deleted_insights += 1
+        except Exception as e:
+            log.warning("refresh: failed to delete insight %s: %s", doc_id, e)
+
+    log.info("refresh: deleted %d articles and %d insights", deleted_articles, deleted_insights)
+
+    # ── Step 3: Fetch fresh articles (min 3 per topic) ────────────────────
+    try:
+        raw = fetch_articles_by_domains(
+            active_domains = active_domains,
+            target_total   = body.target,
+        )
+    except Exception as e:
+        log.error("refresh: fetch failed: %s", e)
+        raise HTTPException(502, detail=f"RSS fetch failed: {e}")
+
+    # ── Step 4: Save only NEW articles (skip URLs already in Firestore) ───
+    saved:   list[dict] = []
+    skipped: int        = 0
+
+    for art in raw:
+        art_url = art.get("article_url") or art.get("url", "")
+
+        # Skip if this URL is already in the database
+        if art_url and art_url in existing_urls:
+            skipped += 1
+            continue
+
+        # Prepare the article document
+        art.setdefault("id", str(uuid.uuid4()))
+        art["fetched_at"]  = _now()
+        art["has_insight"] = False
+
+        try:
+            db.collection("articles").document(art["id"]).set(art)
+            saved.append(art)
+            # Track the URL so we don't save duplicates within the same batch
+            if art_url:
+                existing_urls.add(art_url)
+        except Exception as e:
+            log.error("refresh: Firestore save failed for %s: %s", art["id"], e)
+
+    log.info(
+        "refresh done: deleted_articles=%d deleted_insights=%d fetched=%d new_saved=%d skipped=%d",
+        deleted_articles, deleted_insights, len(raw), len(saved), skipped,
+    )
+
+    return {
+        "deleted_articles": deleted_articles,
+        "deleted_insights": deleted_insights,
+        "fetched":          len(raw),
+        "new_saved":        len(saved),
+        "skipped":          skipped,
+        "articles":         saved,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ARTICLES — FILTERED BY USER INTERESTS
+# Requires: any auth (user | mod | admin)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get(
+    "/api/articles/for-me",
+    tags    = ["Articles"],
+    summary = "Articles filtered by your saved interests — requires auth",
+)
+def articles_for_me(
+    limit:   int  = Query(30, ge=1, le=200),
+    payload: dict = Depends(require_auth),   # any logged-in user
+):
+    """
+    GET /api/articles/for-me?limit=30
+    Returns articles that match the current user's saved topic interests.
+
+    The user's interests are loaded from Firestore (set via POST /api/auth/interests).
+    Articles are filtered where their matched_domains overlap with the user's interests.
+    Ensures at least one article per interest topic if available.
+
+    If the user has no interests saved, returns all recent articles.
+
+    Response:
+    {
+      "uid":       "user-uuid",
+      "interests": ["AI + ROBOTICS", "PHYSICS"],
+      "total":     18,
+      "articles":  [ { id, title, short_summary, image_url, matched_domains, ... }, ... ]
+    }
+
+    curl -H "Authorization: Bearer <token>" http://127.0.0.1:5000/api/articles/for-me
+    """
+    uid = get_uid(payload)
+
+    # ── Load user's saved interests ────────────────────────────────────────
+    user_interests: list[str] = []
+    try:
+        user_doc = db.collection("users").document(uid).get()
+        if user_doc.exists:
+            user_interests = user_doc.to_dict().get("interests", [])
+    except Exception as e:
+        log.warning("articles_for_me: could not load user %s: %s", uid, e)
+
+    # ── Load recent articles from Firestore ───────────────────────────────
+    try:
+        docs = (
+            db.collection("articles")
+              .order_by("fetched_at", direction="DESCENDING")
+              .limit(300)   # load a big pool to filter from
+              .stream()
+        )
+        all_articles = [d.to_dict() for d in docs]
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+    # ── If no interests set, return recent articles ────────────────────────
+    if not user_interests:
+        return {
+            "uid":       uid,
+            "interests": [],
+            "total":     len(all_articles[:limit]),
+            "articles":  all_articles[:limit],
+        }
+
+    interests_set = set(user_interests)
+
+    # ── Filter articles whose matched_domains overlap with interests ───────
+    def _article_matches(art: dict) -> bool:
+        """Check if this article is relevant to the user's interests."""
+        matched = set(art.get("matched_domains") or [])
+        if matched & interests_set:
+            return True
+        # Fallback: scan title + content for interest keywords
+        text = (art.get("title", "") + " " + art.get("content", "")).lower()
+        for topic in user_interests:
+            kws = DOMAIN_KEYWORDS.get(topic, [])
+            if any(kw.lower() in text for kw in kws):
+                return True
+        return False
+
+    candidate_articles = [a for a in all_articles if _article_matches(a)]
+
+    # ── Guarantee at least 1 article per interest topic ───────────────────
+    topic_covered: set[str]  = set()
+    selected_ids:  set[str]  = set()
+    result:        list[dict] = []
+
+    # Pass 1: pick one article per interest topic
+    for topic in user_interests:
+        if topic in topic_covered:
+            continue
+        for art in candidate_articles:
+            if art["id"] in selected_ids:
+                continue
+            # Check if this article covers the topic
+            matched = set(art.get("matched_domains") or [])
+            text    = (art.get("title", "") + " " + art.get("content", "")).lower()
+            topic_kws = [k.lower() for k in DOMAIN_KEYWORDS.get(topic, [])]
+            if topic in matched or any(k in text for k in topic_kws):
+                result.append(art)
+                selected_ids.add(art["id"])
+                topic_covered.add(topic)
+                break
+
+    # Pass 2: fill remaining slots up to limit
+    for art in candidate_articles:
+        if len(result) >= limit:
+            break
+        if art["id"] not in selected_ids:
+            result.append(art)
+            selected_ids.add(art["id"])
+
+    # Strip heavy fields not needed in the list view
+    slim_fields = [
+        "id", "title", "short_summary", "image_url", "article_url",
+        "url", "matched_domains", "source", "published_at",
+        "fetched_at", "has_insight", "topic",
+    ]
+    slim = [{k: a.get(k) for k in slim_fields} for a in result[:limit]]
+
+    log.info(
+        "articles_for_me: uid=%s interests=%s candidate=%d returned=%d",
+        uid, user_interests, len(candidate_articles), len(slim),
+    )
+
+    return {
+        "uid":       uid,
+        "interests": user_interests,
+        "total":     len(slim),
+        "articles":  slim,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ARTICLES — FETCH FROM RSS  (requires mod/admin)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post(
     "/api/articles/fetch",
     status_code = 201,
     tags        = ["Articles"],
-    summary     = "Fetch articles from RSS — requires mod/admin",
+    summary     = "Fetch articles from RSS by topic — requires mod/admin",
 )
 def fetch_and_save(
     body:    FetchArticlesBody,
-    payload: dict = Depends(require_mod),  # mod or admin only
+    payload: dict = Depends(require_mod),
 ):
-    """Trigger RSS fetch and save results to Firestore. Requires mod/admin."""
+    """Trigger an RSS fetch by topic/keywords. Requires mod/admin."""
     try:
         raw = fetch_articles_from_source(
             topic=body.topic, keywords=body.keywords, limit=body.limit
         )
     except Exception as e:
-        log.error("fetch_and_save: %s", e)
         raise HTTPException(502, detail=str(e))
 
     saved = []
@@ -188,7 +516,6 @@ def fetch_and_save(
         except Exception as e:
             log.error("Firestore save failed for %s: %s", art["id"], e)
 
-    log.info("fetch_and_save: fetched=%d saved=%d by %s", len(raw), len(saved), get_uid(payload))
     return {"saved": len(saved), "articles": saved}
 
 
@@ -196,11 +523,11 @@ def fetch_and_save(
     "/api/articles/fetch-source",
     status_code = 201,
     tags        = ["Articles"],
-    summary     = "Fetch from URL — requires mod/admin",
+    summary     = "Fetch from a URL — requires mod/admin",
 )
 def fetch_from_source_url(
     body:    FetchSourceBody,
-    payload: dict = Depends(require_mod),  # mod or admin only
+    payload: dict = Depends(require_mod),
 ):
     """Fetch articles from a user-supplied URL. Requires mod/admin."""
     url = body.url.strip()
@@ -225,20 +552,17 @@ def fetch_from_source_url(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ARTICLES — CRUD
-# GET routes are PUBLIC — anyone can browse
-# POST requires mod/admin
+# ARTICLES — CRUD  (GET routes are PUBLIC)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/articles", tags=["Articles"], summary="List articles — PUBLIC")
 def list_articles(limit: int = Query(30, ge=1, le=200)):
-    """Public: list articles, newest first. No token required."""
+    """Public: list all articles, newest first. No token required."""
     try:
         docs = (
             db.collection("articles")
               .order_by("fetched_at", direction="DESCENDING")
-              .limit(limit)
-              .stream()
+              .limit(limit).stream()
         )
         return {"articles": [d.to_dict() for d in docs]}
     except Exception as e:
@@ -247,24 +571,17 @@ def list_articles(limit: int = Query(30, ge=1, le=200)):
 
 @app.get("/api/articles/{article_id}", tags=["Articles"], summary="Get article — PUBLIC")
 def get_article(article_id: str):
-    """Public: get a single article. No token required."""
+    """Public: get a single article by ID."""
     doc = db.collection("articles").document(article_id).get()
     if not doc.exists:
         raise HTTPException(404, detail="Article not found")
     return doc.to_dict()
 
 
-@app.post(
-    "/api/articles",
-    status_code = 201,
-    tags        = ["Articles"],
-    summary     = "Create article manually — requires mod/admin",
-)
-def create_article(
-    body:    CreateArticleBody,
-    payload: dict = Depends(require_mod),
-):
-    """Manually create an article. Requires mod/admin."""
+@app.post("/api/articles", status_code=201, tags=["Articles"],
+          summary="Create article manually — requires mod/admin")
+def create_article(body: CreateArticleBody, payload: dict = Depends(require_mod)):
+    """Create an article manually. Requires mod/admin."""
     doc_id = str(uuid.uuid4())
     art = {
         "id": doc_id, "title": body.title, "content": body.content,
@@ -276,7 +593,7 @@ def create_article(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AI INSIGHTS — LOCKED (require_auth = any logged-in user)
+# AI INSIGHTS — LOCKED (require_auth for generate/read, require_mod to delete)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.delete(
@@ -286,19 +603,28 @@ def create_article(
 )
 def delete_insight(
     article_id: str,
-    payload:    dict = Depends(require_mod),  # mod/admin only — users can't delete insights
+    payload:    dict = Depends(require_mod),
 ):
     """
     Clear the cached AI insight so next POST regenerates from Gemini.
+    Also deletes the entry from the ai_insights collection.
     Requires mod or admin.
     """
     doc_ref = db.collection("articles").document(article_id)
     if not doc_ref.get().exists:
         raise HTTPException(404, detail="Article not found")
+
+    # Clear insight fields on the article document
     try:
-        doc_ref.update({"ai_insight": None, "has_insight": False, "insight_generated_at": None})
+        doc_ref.update({
+            "ai_insight":           None,
+            "has_insight":          False,
+            "insight_generated_at": None,
+        })
     except Exception as e:
         log.warning("delete_insight: could not clear fields: %s", e)
+
+    # Delete from the dedicated ai_insights collection
     try:
         db.collection("ai_insights").document(article_id).delete()
     except Exception as e:
@@ -316,16 +642,14 @@ def delete_insight(
 def generate_insight(
     article_id: str,
     force:      bool = Query(False, description="true = skip cache and regenerate"),
-    payload:    dict = Depends(require_auth),  # ANY logged-in user (user/mod/admin)
+    payload:    dict = Depends(require_auth),   # any logged-in user
 ):
     """
-    **LOCKED — requires login (any role).**
-
-    Generate an AI insight (summary + explanatory SVG) for one article.
+    **LOCKED — requires any valid login (user/mod/admin).**
+    Generate an AI insight (summary + SVG diagram) for one article on demand.
     Searches both `articles` and `feed_articles` automatically.
-    Results are cached — use ?force=true to regenerate.
     """
-    # ── Find article (check both collections) ─────────────────────────────
+    # ── Find article in either collection ─────────────────────────────────
     source_table = "articles"
     doc_ref      = db.collection("articles").document(article_id)
     doc          = doc_ref.get()
@@ -340,7 +664,6 @@ def generate_insight(
 
     # ── Cache check ────────────────────────────────────────────────────────
     if not force:
-        # Check article-level cache
         cached = article.get("ai_insight")
         if (
             cached and isinstance(cached, dict)
@@ -350,7 +673,6 @@ def generate_insight(
             return {"article_id": article_id, "source_table": source_table,
                     "ai_insight": cached, "cached": True}
 
-        # Check shared ai_insights collection
         insight_doc = db.collection("ai_insights").document(article_id).get()
         if insight_doc.exists:
             stored = insight_doc.to_dict().get("ai_insight", {})
@@ -363,7 +685,7 @@ def generate_insight(
                     "cached":       True,
                 }
             else:
-                # Old/broken cache — delete so we regenerate cleanly
+                # Old/broken cache — delete so we can regenerate
                 try:
                     db.collection("ai_insights").document(article_id).delete()
                 except Exception:
@@ -376,7 +698,7 @@ def generate_insight(
         log.error("generate_insight: Gemini error for %s: %s", article_id, e)
         raise HTTPException(502, detail=str(e))
 
-    # ── Persist to article doc ─────────────────────────────────────────────
+    # ── Persist to article document ────────────────────────────────────────
     try:
         doc_ref.update({
             "ai_insight": insight, "has_insight": True, "insight_generated_at": _now()
@@ -400,7 +722,7 @@ def generate_insight(
     except Exception as e:
         log.error("generate_insight: ai_insights save failed: %s", e)
 
-    log.info("generate_insight: OK %s table=%s domain=%s words=%d by user=%s",
+    log.info("generate_insight: OK %s table=%s domain=%s words=%d by=%s",
              article_id, source_table, insight.get("domain","?"),
              len(insight.get("summary","").split()), get_uid(payload))
 
@@ -408,16 +730,12 @@ def generate_insight(
             "ai_insight": insight, "cached": False}
 
 
-@app.get(
-    "/api/insights",
-    tags    = ["Insights"],
-    summary = "List all insights — REQUIRES LOGIN",
-)
+@app.get("/api/insights", tags=["Insights"], summary="List all insights — REQUIRES LOGIN")
 def list_insights(
     limit:   int  = Query(50, ge=1, le=200),
-    payload: dict = Depends(require_auth),  # any logged-in user
+    payload: dict = Depends(require_auth),
 ):
-    """**LOCKED — requires login.** List all AI insights, newest first."""
+    """**LOCKED.** List all AI insights, newest first."""
     try:
         docs = (
             db.collection("ai_insights")
@@ -429,16 +747,10 @@ def list_insights(
         raise HTTPException(500, detail=str(e))
 
 
-@app.get(
-    "/api/insights/{article_id}",
-    tags    = ["Insights"],
-    summary = "Get single insight — REQUIRES LOGIN",
-)
-def get_insight(
-    article_id: str,
-    payload:    dict = Depends(require_auth),  # any logged-in user
-):
-    """**LOCKED — requires login.** Get a single AI insight by article ID."""
+@app.get("/api/insights/{article_id}", tags=["Insights"],
+         summary="Get single insight — REQUIRES LOGIN")
+def get_insight(article_id: str, payload: dict = Depends(require_auth)):
+    """**LOCKED.** Get a single AI insight by article ID."""
     doc = db.collection("ai_insights").document(article_id).get()
     if not doc.exists:
         raise HTTPException(404, detail="Insight not found")
@@ -446,23 +758,13 @@ def get_insight(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PIPELINE — requires mod/admin
+# PIPELINE  (legacy — requires mod/admin)
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.post(
-    "/api/pipeline",
-    status_code = 201,
-    tags        = ["Articles"],
-    summary     = "Fetch + generate insights — requires mod/admin",
-)
-def pipeline(
-    body:    PipelineBody,
-    payload: dict = Depends(require_mod),
-):
-    """
-    Fetch articles and immediately generate insights for all of them.
-    Heavy operation — use sparingly. Requires mod/admin.
-    """
+@app.post("/api/pipeline", status_code=201, tags=["Articles"],
+          summary="Fetch + generate insights — requires mod/admin")
+def pipeline(body: PipelineBody, payload: dict = Depends(require_mod)):
+    """Fetch articles and immediately generate AI insights. Requires mod/admin."""
     try:
         raw = fetch_articles_from_source(
             topic=body.topic, keywords=body.keywords, limit=body.limit

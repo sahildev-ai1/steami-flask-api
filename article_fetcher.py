@@ -69,62 +69,87 @@ RSS_SOURCES = PRIMARY_SOURCES + [
 # DOMAIN → KEYWORDS MAP  (canonical; used everywhere)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Keys here MUST match the VALID_TOPICS list in routers/auth_router.py
+# so that user interests map directly to article domains.
 DOMAIN_KEYWORDS: dict[str, list[str]] = {
-    "Robotics": [
-        "robot", "robotics", "automation", "drone", "autonomous vehicle",
-        "self-driving", "mechanical arm", "cobots", "industrial robot",
-    ],
-    "Space": [
-        "space", "nasa", "astronomy", "rocket", "satellite", "mars",
-        "moon", "orbit", "telescope", "astrophysics", "spacex", "isro",
-        "galaxy", "universe", "cosmos", "black hole",
-    ],
-    "AI": [
-        "artificial intelligence", "machine learning", "deep learning",
-        "neural network", "large language model", "llm", "chatgpt",
-        "generative ai", "ai model", "transformer", "diffusion model",
-        "reinforcement learning", "computer vision", "nlp",
-    ],
-    "Finance": [
-        "stock", "market", "finance", "investment", "cryptocurrency",
-        "bitcoin", "blockchain", "economy", "gdp", "interest rate",
-        "inflation", "venture capital", "ipo", "fintech", "banking",
-    ],
-    "Physics": [
+    # ── 1. PHYSICS ────────────────────────────────────────────────────────
+    "PHYSICS": [
         "physics", "quantum", "particle", "electron", "photon",
         "semiconductor", "superconductor", "fusion", "nuclear",
         "relativity", "dark matter", "dark energy", "hadron",
+        "qubit", "topological", "fermion", "boson", "wave function",
     ],
-    "Chemistry": [
+    # ── 2. CHEMISTRY ──────────────────────────────────────────────────────
+    "CHEMISTRY": [
         "chemistry", "molecule", "compound", "polymer", "catalyst",
         "chemical", "reaction", "synthesis", "nanotechnology",
         "material science", "carbon", "hydrogen", "protein",
+        "periodic table", "organic chemistry", "inorganic", "electrolyte",
     ],
-    "Biology/Medicine": [
-        "biology", "medicine", "gene", "dna", "rna", "vaccine",
-        "crispr", "cancer", "drug", "clinical trial", "bacteria",
-        "virus", "cell", "brain", "neuroscience", "genomics",
-        "biotech", "pharmaceutical", "health", "disease",
+    # ── 3. BIOLOGY ────────────────────────────────────────────────────────
+    "BIOLOGY": [
+        "biology", "gene", "dna", "rna", "crispr", "genome",
+        "cell", "bacteria", "virus", "evolution", "ecology",
+        "neuroscience", "brain", "neuron", "biotech", "genomics",
+        "synthetic biology", "organism", "protein folding", "alphafold",
     ],
-    "Engineering": [
-        "engineering", "infrastructure", "bridge", "circuit",
-        "processor", "chip", "microchip", "3d printing",
-        "manufacturing", "architecture", "renewable energy",
-        "solar panel", "battery", "electric vehicle", "ev",
+    # ── 4. MEDICINE ───────────────────────────────────────────────────────
+    "MEDICINE": [
+        "medicine", "vaccine", "cancer", "drug", "clinical trial",
+        "pharmaceutical", "health", "disease", "treatment", "therapy",
+        "antibiotic", "surgery", "hospital", "patient", "diagnosis",
+        "mental health", "pandemic", "epidemic", "biomarker", "stem cell",
     ],
-    "Mathematics": [
-        "mathematics", "algorithm", "computation", "theorem",
-        "statistics", "probability", "cryptography", "topology",
-        "calculus", "graph theory", "optimization", "simulation",
+    # ── 5. EARTH & SPACE ──────────────────────────────────────────────────
+    "EARTH & SPACE": [
+        "space", "nasa", "astronomy", "rocket", "satellite", "mars",
+        "moon", "orbit", "telescope", "astrophysics", "spacex", "isro",
+        "galaxy", "universe", "cosmos", "black hole", "exoplanet",
+        "climate", "earthquake", "ocean", "atmosphere", "glacier",
     ],
-    "Computer Science": [
+    # ── 6. COMPUTER SCIENCE ───────────────────────────────────────────────
+    "COMPUTER SCIENCE": [
         "software", "programming", "cybersecurity", "cloud",
         "database", "operating system", "compiler", "open source",
         "api", "microservices", "kubernetes", "devops", "web",
         "mobile app", "internet", "network", "hack", "data science",
+        "algorithm", "cryptography", "quantum computing", "blockchain",
+    ],
+    # ── 7. AI + ROBOTICS ──────────────────────────────────────────────────
+    "AI + ROBOTICS": [
+        "artificial intelligence", "machine learning", "deep learning",
+        "neural network", "large language model", "llm", "chatgpt",
+        "generative ai", "ai model", "transformer", "diffusion model",
+        "reinforcement learning", "computer vision", "nlp",
+        "robot", "robotics", "automation", "drone", "autonomous vehicle",
+        "self-driving", "humanoid", "cobots", "industrial robot",
+    ],
+    # ── 8. ENGINEERING ────────────────────────────────────────────────────
+    "ENGINEERING": [
+        "engineering", "infrastructure", "bridge", "circuit",
+        "processor", "chip", "microchip", "3d printing",
+        "manufacturing", "architecture", "renewable energy",
+        "solar panel", "battery", "electric vehicle", "ev",
+        "semiconductor fabrication", "materials", "turbine",
+    ],
+    # ── 9. MATHEMATICS & DATA ─────────────────────────────────────────────
+    "MATHEMATICS & DATA": [
+        "mathematics", "theorem", "statistics", "probability",
+        "topology", "calculus", "graph theory", "optimization",
+        "data science", "big data", "analytics", "simulation",
+        "riemann", "prime", "number theory", "geometry", "algebra",
+    ],
+    # ── 10. CLIMATE & ENERGY ──────────────────────────────────────────────
+    "CLIMATE & ENERGY": [
+        "climate change", "global warming", "carbon", "emissions",
+        "renewable energy", "solar", "wind power", "nuclear energy",
+        "fossil fuel", "net zero", "sustainability", "green energy",
+        "co2", "deforestation", "biodiversity", "electric grid",
+        "hydrogen fuel", "energy storage", "carbon capture",
     ],
 }
 
+# Flat list of all 10 domain names — used for validation and iteration
 ALL_DOMAINS: list[str] = list(DOMAIN_KEYWORDS.keys())
 
 
@@ -176,34 +201,50 @@ def fetch_articles_by_domains(
     # Cap filtered pool at 35
     pool = scored[:35]
 
-    # ── 3. Guarantee ≥1 per domain ─────────────────────────────────────────
-    domain_covered: set[str] = set()
+    # ── 3. Guarantee MINIMUM 3 articles per active domain ────────────────
+    # We track how many articles each domain has so far.
+    MIN_PER_DOMAIN = 3  # minimum articles required per topic
+
+    domain_count: dict[str, int] = {d: 0 for d in domains}
     selected: list[dict] = []
     pool_ids: set[str] = set()
 
     def _add(art: dict, matched_doms: list[str]) -> None:
+        """Add an article to selected and update domain counters."""
         art["matched_domains"] = matched_doms
         selected.append(art)
         pool_ids.add(art["id"])
-        domain_covered.update(matched_doms)
+        for d in matched_doms:
+            if d in domain_count:
+                domain_count[d] += 1
 
-    # First pass: pick best article per domain
+    # First pass: fill each domain to MIN_PER_DOMAIN articles
+    # We iterate over the pool multiple times until all domains are satisfied
     for domain in domains:
-        if domain in domain_covered:
+        needed = MIN_PER_DOMAIN - domain_count.get(domain, 0)
+        if needed <= 0:
             continue
+        # Find articles that match this domain and haven't been selected yet
         for _, matched, art in pool:
+            if needed <= 0:
+                break
             if art["id"] in pool_ids:
                 continue
             if domain in matched:
                 _add(art, matched)
-                break
+                needed -= 1
 
-    # Second pass: fill up to target_total from remaining pool
+    # Second pass: fill remaining slots up to target_total
     for _, matched, art in pool:
         if len(selected) >= target_total:
             break
         if art["id"] not in pool_ids:
             _add(art, matched)
+
+    log.info(
+        "domain coverage: %s",
+        {d: domain_count[d] for d in domains}
+    )
 
     # ── 4. Enrich: image + short_summary ──────────────────────────────────
     enriched = []
