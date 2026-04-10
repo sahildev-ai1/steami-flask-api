@@ -225,6 +225,20 @@ class UpdateRoleBody(BaseModel):
     role: str  # "user" | "mod" | "admin"
 
 
+class UpdateUserBody(BaseModel):
+    """
+    Admin: update any field on a user profile.
+    All fields are optional — only provided fields are changed.
+    To deactivate an account set is_active=False.
+    """
+    full_name:  Optional[str]       = None
+    email:      Optional[str]       = None
+    profession: Optional[str]       = None
+    interests:  Optional[list]      = None
+    is_active:  Optional[bool]      = None
+    role:       Optional[str]       = None   # can also change role here
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -489,3 +503,92 @@ def delete_user(uid: str, payload: dict = Depends(require_admin)):
     doc_ref.delete()
     log.info("deleted user: %s by %s", uid, get_uid(payload))
     return {"deleted": True, "uid": uid}
+
+@router.get("/users/{uid}", summary="Get single user by ID — admin only")
+def get_user_by_id(uid: str, payload: dict = Depends(require_admin)):
+    """
+    GET /api/auth/users/{uid}
+    Get a single user's full profile by their ID. ADMIN ONLY.
+
+    Response: full user object (without password_hash)
+
+    curl -H "Authorization: Bearer <admin_token>" http://127.0.0.1:5000/api/auth/users/USER_ID
+    """
+    doc = db.collection("users").document(uid).get()
+    if not doc.exists:
+        raise HTTPException(404, detail="User not found.")
+    return _safe(doc.to_dict())
+
+
+@router.put("/users/{uid}", summary="Update user profile — admin only")
+def admin_update_user(
+    uid:     str,
+    body:    UpdateUserBody,
+    payload: dict = Depends(require_admin),
+):
+    """
+    PUT /api/auth/users/{uid}
+    Update any profile field for a user. ADMIN ONLY.
+    Only the fields provided in the body are changed; others stay the same.
+
+    Body (all fields optional):
+    {
+      "full_name":  "New Name",
+      "email":      "new@email.com",
+      "profession": "researcher",
+      "interests":  ["PHYSICS", "AI + ROBOTICS"],
+      "is_active":  true,
+      "role":       "mod"
+    }
+
+    Response: { "updated": true, "uid": "..." }
+
+    curl -X PUT http://127.0.0.1:5000/api/auth/users/USER_ID \
+      -H "Authorization: Bearer <admin_token>" \
+      -H "Content-Type: application/json" \
+      -d '{"full_name":"Updated Name","is_active":true,"profession":"researcher"}'
+    """
+    doc_ref = db.collection("users").document(uid)
+    if not doc_ref.get().exists:
+        raise HTTPException(404, detail="User not found.")
+
+    # Build update dict with only fields that were provided (not None)
+    updates: dict = {"updated_at": _now()}
+
+    if body.full_name  is not None: updates["full_name"]  = body.full_name.strip()
+    if body.profession is not None:
+        if body.profession not in VALID_PROFESSIONS:
+            raise HTTPException(400, detail=f"Invalid profession: {body.profession}")
+        updates["profession"] = body.profession
+    if body.interests  is not None:
+        # Validate topic names
+        invalid = [t for t in body.interests if t not in VALID_TOPICS]
+        if invalid:
+            raise HTTPException(400, detail=f"Invalid topics: {invalid}")
+        updates["interests"] = list(dict.fromkeys(body.interests))
+    if body.is_active  is not None: updates["is_active"]  = body.is_active
+    if body.role       is not None:
+        if body.role not in ROLES:
+            raise HTTPException(400, detail=f"Invalid role: {body.role}")
+        # Prevent admin from changing their own role
+        if uid == get_uid(payload) and body.role != "admin":
+            raise HTTPException(400, detail="Cannot change your own role.")
+        updates["role"] = body.role
+    if body.email is not None:
+        new_email = body.email.lower().strip()
+        if "@" not in new_email:
+            raise HTTPException(400, detail="Invalid email format.")
+        # Check the new email is not already taken by another user
+        existing = _find_by_email(new_email)
+        if existing and existing.get("id") != uid:
+            raise HTTPException(409, detail="Email already in use by another account.")
+        updates["email"] = new_email
+
+    try:
+        doc_ref.update(updates)
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+    log.info("admin_update_user: uid=%s fields=%s by admin=%s",
+             uid, list(updates.keys()), get_uid(payload))
+    return {"updated": True, "uid": uid, "updated_fields": list(updates.keys())}
