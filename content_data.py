@@ -2,6 +2,12 @@
 content_data.py
 All static seed data for explainers and research articles.
 Imported by routers/content.py — single source of truth.
+
+v2 changes:
+  - Added "image" key to every EXPLAINERS_SEED entry
+  - Added "image" key to every RESEARCH_ARTICLES_SEED entry
+  - Added FIELD_IMAGES_SEED dict (field → image URL)
+  Images are served from /images/... via FastAPI StaticFiles mount.
 """
 
 EXPLAINERS_SEED = [
@@ -12,6 +18,7 @@ EXPLAINERS_SEED = [
         "field": "QUANTUM PHYSICS",
         "badgeColor": "cyan",
         "readTime": "8 MIN READ",
+        "image": "/images/explainers/quantum-dog.jpg",
         "content": [
             "Imagine a dog inside a sealed kennel. According to quantum mechanics, until you open the door and observe the dog, it exists in a superposition of all possible states — sleeping, playing, barking, and eating simultaneously.",
             "This thought experiment, inspired by Schrödinger's famous cat paradox, illustrates one of the most counterintuitive aspects of quantum mechanics: superposition. In the quantum world, particles don't have definite properties until they're measured.",
@@ -34,6 +41,7 @@ EXPLAINERS_SEED = [
         "field": "BIOLOGY",
         "badgeColor": "green",
         "readTime": "7 MIN READ",
+        "image": "/images/explainers/crispr-scissors.jpg",
         "content": [
             "CRISPR-Cas9 is a revolutionary gene-editing tool that allows scientists to cut, delete, and replace DNA sequences with unprecedented precision. Think of it as molecular scissors guided by a GPS.",
             "The technology was adapted from a natural defense system that bacteria use to fight viruses. When a virus attacks, bacteria capture snippets of viral DNA and store them as \"memory\" to recognize future threats.",
@@ -56,6 +64,7 @@ EXPLAINERS_SEED = [
         "field": "AI",
         "badgeColor": "violet",
         "readTime": "10 MIN READ",
+        "image": "/images/explainers/neural-networks.jpg",
         "content": [
             "Artificial neural networks are computing systems inspired by the biological neural networks in animal brains. They learn by adjusting the strength of connections between artificial neurons.",
             "The simplest neural network, the perceptron, was invented in 1958. It could only solve linearly separable problems — a limitation that almost killed the field for decades.",
@@ -78,6 +87,7 @@ EXPLAINERS_SEED = [
         "field": "EARTH & SPACE",
         "badgeColor": "orange",
         "readTime": "6 MIN READ",
+        "image": "/images/explainers/dark-energy.jpg",
         "content": [
             "In 1998, two teams of astronomers made a shocking discovery: the universe is not just expanding — it's accelerating. Something was pushing galaxies apart faster and faster.",
             "This mysterious force was named \"dark energy.\" Despite constituting about 68% of the total energy of the universe, we know almost nothing about what it actually is.",
@@ -100,6 +110,7 @@ EXPLAINERS_SEED = [
         "field": "CLIMATE & ENERGY",
         "badgeColor": "orange",
         "readTime": "9 MIN READ",
+        "image": "/images/explainers/fusion-energy.jpg",
         "content": [
             "Stars shine by fusing hydrogen atoms into helium, releasing enormous amounts of energy. The sun converts 600 million tons of hydrogen into helium every second, with a tiny fraction of mass converted to energy via E=mc².",
             "Recreating this process on Earth requires heating hydrogen plasma to over 100 million degrees Celsius — ten times hotter than the core of the sun. No material can contain such plasma.",
@@ -122,6 +133,7 @@ EXPLAINERS_SEED = [
         "field": "COMPUTER SCIENCE",
         "badgeColor": "red",
         "readTime": "7 MIN READ",
+        "image": "/images/explainers/blockchain-consensus.jpg",
         "content": [
             "The fundamental challenge of distributed systems is the Byzantine Generals Problem: how can multiple parties agree on a course of action when some may be unreliable or malicious?",
             "Blockchain solves this through consensus mechanisms — protocols that allow a network of computers to agree on the state of a shared ledger without trusting any single participant.",
@@ -144,6 +156,7 @@ EXPLAINERS_SEED = [
         "field": "BIOLOGY",
         "badgeColor": "green",
         "readTime": "8 MIN READ",
+        "image": "/images/explainers/epigenetics.jpg",
         "content": [
             "Your DNA sequence is fixed at birth, but how your genes are read is surprisingly flexible. Epigenetics studies chemical modifications that turn genes on and off without altering the underlying code.",
             "DNA methylation — attaching small methyl groups to DNA — is one of the most studied mechanisms. Heavy methylation silences a gene, while demethylation can reactivate it.",
@@ -166,6 +179,7 @@ EXPLAINERS_SEED = [
         "field": "QUANTUM PHYSICS",
         "badgeColor": "cyan",
         "readTime": "9 MIN READ",
+        "image": "/images/explainers/quantum-entanglement.jpg",
         "content": [
             "When two particles become entangled, measuring one instantly determines the state of the other — no matter how far apart they are. Einstein famously called this \"spooky action at a distance.\"",
             "Entanglement is created when particles interact in specific ways — for example, splitting a photon into two via a nonlinear crystal produces a pair with correlated polarizations.",
@@ -188,6 +202,7 @@ EXPLAINERS_SEED = [
         "field": "BIOLOGY",
         "badgeColor": "green",
         "readTime": "7 MIN READ",
+        "image": "/images/explainers/neuroplasticity.jpg",
         "content": [
             "For most of the 20th century, scientists believed the adult brain was fixed. We now know it continually rewires itself — forming new connections, pruning unused ones, and even generating new neurons.",
             "Every time you learn a skill, synapses strengthen through a process called long-term potentiation (LTP). Repeated practice physically thickens the neural pathways involved.",
@@ -205,6 +220,9 @@ EXPLAINERS_SEED = [
     },
 ]
 
+
+# ── Field metadata ────────────────────────────────────────────────────────────
+
 FIELDS_SEED = [
     "PHYSICS", "CHEMISTRY", "BIOLOGY", "MEDICINE", "EARTH & SPACE",
     "COMPUTER SCIENCE", "AI", "ROBOTICS", "ENGINEERING",
@@ -212,18 +230,50 @@ FIELDS_SEED = [
 ]
 
 FIELD_ICONS_SEED = {
-    "PHYSICS": "⚛️", "CHEMISTRY": "🧪", "BIOLOGY": "🧬",
-    "MEDICINE": "💊", "EARTH & SPACE": "🌍", "COMPUTER SCIENCE": "💻",
-    "AI": "🤖", "ROBOTICS": "🦾", "ENGINEERING": "⚙️",
-    "MATHEMATICS & DATA": "📐", "CLIMATE & ENERGY": "🌱",
+    "PHYSICS":           "⚛️",
+    "CHEMISTRY":         "🧪",
+    "BIOLOGY":           "🧬",
+    "MEDICINE":          "💊",
+    "EARTH & SPACE":     "🌍",
+    "COMPUTER SCIENCE":  "💻",
+    "AI":                "🤖",
+    "ROBOTICS":          "🦾",
+    "ENGINEERING":       "⚙️",
+    "MATHEMATICS & DATA":"📐",
+    "CLIMATE & ENERGY":  "🌱",
 }
 
 FIELD_COLORS_SEED = {
-    "PHYSICS": "cyan", "CHEMISTRY": "orange", "BIOLOGY": "green",
-    "MEDICINE": "red", "EARTH & SPACE": "violet", "COMPUTER SCIENCE": "cyan",
-    "AI": "violet", "ROBOTICS": "orange", "ENGINEERING": "gold",
-    "MATHEMATICS & DATA": "cyan", "CLIMATE & ENERGY": "green",
+    "PHYSICS":           "cyan",
+    "CHEMISTRY":         "orange",
+    "BIOLOGY":           "green",
+    "MEDICINE":          "red",
+    "EARTH & SPACE":     "violet",
+    "COMPUTER SCIENCE":  "cyan",
+    "AI":                "violet",
+    "ROBOTICS":          "orange",
+    "ENGINEERING":       "gold",
+    "MATHEMATICS & DATA":"cyan",
+    "CLIMATE & ENERGY":  "green",
 }
+
+# Maps each research field to its hero/banner image served via StaticFiles.
+FIELD_IMAGES_SEED = {
+    "PHYSICS":           "/images/research/physics.jpg",
+    "CHEMISTRY":         "/images/research/chemistry.jpg",
+    "BIOLOGY":           "/images/research/biology.jpg",
+    "MEDICINE":          "/images/research/medicine.jpg",
+    "EARTH & SPACE":     "/images/research/earth-space.jpg",
+    "COMPUTER SCIENCE":  "/images/research/computer-science.jpg",
+    "AI":                "/images/research/ai.jpg",
+    "ROBOTICS":          "/images/research/robotics.jpg",
+    "ENGINEERING":       "/images/research/engineering.jpg",
+    "MATHEMATICS & DATA":"/images/research/mathematics.jpg",
+    "CLIMATE & ENERGY":  "/images/research/climate-energy.jpg",
+}
+
+
+# ── Research articles ─────────────────────────────────────────────────────────
 
 RESEARCH_ARTICLES_SEED = [
     {
@@ -234,6 +284,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Sarah Chen",
         "date": "2025-03-15",
         "readTime": "12 min",
+        "image": "/images/research/physics.jpg",
         "content": [
             "Topological quantum computing has long been considered the holy grail of quantum information science. Unlike conventional qubits that are fragile and error-prone, topological qubits encode information in the global properties of a quantum system, making them inherently resistant to local noise and perturbation.",
             "The key innovation lies in using Majorana fermions — exotic particles that are their own antiparticles. When these particles are braided around each other, they perform quantum computations that are inherently protected from local noise. This braiding operation is topologically protected, meaning small perturbations cannot corrupt the computation.",
@@ -257,6 +308,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Elena Volkov",
         "date": "2025-02-28",
         "readTime": "11 min",
+        "image": "/images/research/physics.jpg",
         "content": [
             "Three independent laboratories — MIT, Max Planck Institute, and RIKEN — have confirmed that a new copper-doped lead apatite derivative exhibits true superconductivity at room temperature and ambient pressure.",
             "The material, developed by a team at Seoul National University, builds on the controversial LK-99 announcement of 2023. Years of refinement to the synthesis process eliminated the impurities that caused earlier samples to fail.",
@@ -280,6 +332,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. James Liu",
         "date": "2025-03-10",
         "readTime": "9 min",
+        "image": "/images/research/medicine.jpg",
         "content": [
             "For the first time in over 60 years, scientists have discovered an entirely new class of antibiotics — and artificial intelligence made it possible.",
             "A deep learning model trained on molecular structures and antibiotic activity screened over 1.2 billion candidate molecules in three days — a task that would have taken centuries using traditional methods.",
@@ -303,6 +356,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Priya Nair",
         "date": "2025-03-05",
         "readTime": "8 min",
+        "image": "/images/research/robotics.jpg",
         "content": [
             "Boston Dynamics' Atlas robots have achieved a landmark milestone: completing four-hour autonomous construction tasks at real job sites with no human supervision.",
             "The robots performed structural framing, drywall installation, and material transport — tasks requiring dynamic balance, tool manipulation, and adaptive decision-making in unpredictable environments.",
@@ -326,6 +380,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Ana Torres",
         "date": "2025-03-01",
         "readTime": "10 min",
+        "image": "/images/research/biology.jpg",
         "content": [
             "DeepMind's AlphaFold 4 has solved one of biology's grand challenges: predicting how multiple proteins interact and assemble into functional complexes with near-experimental accuracy.",
             "While AlphaFold 2 revolutionized single-protein structure prediction, most biological functions depend on complex interactions between multiple proteins. AlphaFold 4 predicts these assemblies with 95% accuracy.",
@@ -349,6 +404,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Kim Novak",
         "date": "2025-02-05",
         "readTime": "12 min",
+        "image": "/images/research/biology.jpg",
         "content": [
             "Scientists at the Craig Venter Institute have created the first truly self-replicating artificial cell — a synthetic organism built from scratch that can grow, divide, and even evolve over multiple generations.",
             "The organism, JCVI-syn3.1, contains only 473 genes — the minimal set needed for independent life. Every gene was chemically synthesized and assembled into a complete genome that was then booted inside an empty cell membrane.",
@@ -372,6 +428,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Yuki Tanaka",
         "date": "2025-03-18",
         "readTime": "7 min",
+        "image": "/images/research/engineering.jpg",
         "content": [
             "Toyota has begun mass production of solid-state batteries at its Himeji facility, marking the beginning of a new era for electric vehicles and energy storage technology worldwide.",
             "The batteries use a sulfide-based solid electrolyte instead of liquid, enabling higher energy density (500 Wh/kg vs 250 Wh/kg for current lithium-ion), faster charging, and dramatically improved safety with no flammable liquids.",
@@ -395,6 +452,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Michael Torres",
         "date": "2025-02-20",
         "readTime": "13 min",
+        "image": "/images/research/mathematics.jpg",
         "content": [
             "The mathematical community has formally accepted a proof of the Riemann Hypothesis, one of the seven Millennium Prize Problems and arguably the most important unsolved problem in mathematics for over a century.",
             "Dr. Yitang Zhang, known for his breakthrough on bounded gaps between primes, submitted the proof in 2022. After three years of intense verification by dozens of leading mathematicians worldwide, no errors have been found.",
@@ -418,6 +476,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Clara Novak",
         "date": "2025-03-20",
         "readTime": "8 min",
+        "image": "/images/research/earth-space.jpg",
         "content": [
             "In a historic achievement for space exploration, the first samples of Martian soil have safely landed on Earth, completing a mission that took over a decade of planning and flawless execution.",
             "The Mars Sample Return mission, a joint effort between ESA and NASA, retrieved 30 sealed tubes cached by the Perseverance rover across Jezero Crater — an ancient lake bed believed to have once harbored microbial life.",
@@ -441,6 +500,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Amara Osei",
         "date": "2025-03-14",
         "readTime": "9 min",
+        "image": "/images/research/chemistry.jpg",
         "content": [
             "Carbon Engineering has achieved a breakthrough that could transform the fight against climate change: converting atmospheric CO2 into synthetic jet fuel at costs competitive with fossil fuel extraction.",
             "The new iron-cobalt catalyst operates at lower temperatures and pressures than previous approaches, dramatically reducing energy requirements. The process captures CO2 directly from ambient air and combines it with green hydrogen.",
@@ -464,6 +524,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Anil Gupta",
         "date": "2025-03-28",
         "readTime": "8 min",
+        "image": "/images/research/computer-science.jpg",
         "content": [
             "All major web browsers have completed the rollout of post-quantum cryptographic algorithms, protecting an estimated 80% of global internet traffic against attacks from future quantum computers.",
             "The transition centers on ML-KEM (Module-Lattice Key Encapsulation Mechanism), selected by NIST after an 8-year evaluation process. The algorithm's security is based on the hardness of lattice problems, which remain intractable even for quantum computers.",
@@ -480,23 +541,3 @@ RESEARCH_ARTICLES_SEED = [
         "relatedTopics": ["Post-Quantum Cryptography", "Lattice Problems", "TLS Protocol", "NIST Standards"],
     },
 ]
-
-FIELDS_SEED = [
-    "PHYSICS", "CHEMISTRY", "BIOLOGY", "MEDICINE", "EARTH & SPACE",
-    "COMPUTER SCIENCE", "AI", "ROBOTICS", "ENGINEERING",
-    "MATHEMATICS & DATA", "CLIMATE & ENERGY",
-]
-
-FIELD_ICONS_SEED = {
-    "PHYSICS": "⚛️", "CHEMISTRY": "🧪", "BIOLOGY": "🧬",
-    "MEDICINE": "💊", "EARTH & SPACE": "🌍", "COMPUTER SCIENCE": "💻",
-    "AI": "🤖", "ROBOTICS": "🦾", "ENGINEERING": "⚙️",
-    "MATHEMATICS & DATA": "📐", "CLIMATE & ENERGY": "🌱",
-}
-
-FIELD_COLORS_SEED = {
-    "PHYSICS": "cyan", "CHEMISTRY": "orange", "BIOLOGY": "green",
-    "MEDICINE": "red", "EARTH & SPACE": "violet", "COMPUTER SCIENCE": "cyan",
-    "AI": "violet", "ROBOTICS": "orange", "ENGINEERING": "gold",
-    "MATHEMATICS & DATA": "cyan", "CLIMATE & ENERGY": "green",
-}

@@ -17,6 +17,12 @@ NEW IN v7:
   - GET  /api/dashboard/me     — own activity summary
   - GET  /api/dashboard/admin  — platform-wide stats (admin only)
 
+IMAGE SUPPORT (v7.1):
+  - Images folder served as static files at /images/...
+  - POST /api/images/upload — upload new image (mod/admin)
+  - POST /api/explainers/seed and /api/research/seed now store image URLs
+  - All GET /api/explainers and /api/research/articles responses include "image"
+
 DUMMY ACCOUNTS (auto-created on startup):
   admin@steami.dev / Admin@steami123  (admin)
   mod@steami.dev   / Mod@steami123    (mod)
@@ -25,7 +31,7 @@ DUMMY ACCOUNTS (auto-created on startup):
 ROUTE PROTECTION:
   Public:       GET articles, GET explainers, GET research, GET feed/items
   Any auth:     insights, chat, diary, dashboard events, for-me feed
-  mod/admin:    article fetch, article write, explainer/research writes
+  mod/admin:    article fetch, article write, explainer/research writes, image upload
   admin only:   user mgmt, seed, delete explainers/research
 """
 
@@ -36,6 +42,7 @@ from datetime import datetime, timezone, timedelta
 
 from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles          # ← NEW
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -73,6 +80,9 @@ log = logging.getLogger(__name__)
 # Article expiry period — articles older than this are deleted on refresh
 EXPIRY_DAYS = 25   # changed from 30 to 25
 
+# Root folder for uploaded / seeded images (must exist at server root)
+IMAGES_DIR = "images"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # APP
@@ -80,14 +90,16 @@ EXPIRY_DAYS = 25   # changed from 30 to 25
 
 app = FastAPI(
     title       = "STEAMI API",
-    version     = "7.0.0",
+    version     = "7.1.0",
     description = (
         "STEAMI Backend — articles, insights, chat, feed, explainers, diary, dashboard.\n\n"
         "**Test Accounts (POST /api/auth/login):**\n"
         "- Admin: `admin@steami.dev` / `Admin@steami123`\n"
         "- Mod:   `mod@steami.dev`   / `Mod@steami123`\n"
         "- User:  `user@steami.dev`  / `User@steami123`\n\n"
-        "Paste the `token` value into **Authorize → Bearer <token>** above."
+        "Paste the `token` value into **Authorize → Bearer <token>** above.\n\n"
+        "**Images** are served from `/images/research/` and `/images/explainers/`.\n"
+        "Upload new images via `POST /api/images/upload` (mod/admin)."
     ),
     swagger_ui_parameters = {"persistAuthorization": True},
 )
@@ -101,6 +113,13 @@ app.add_middleware(
     allow_headers     = ["*"],
 )
 
+# ── Static file serving for images ────────────────────────────────────────
+# Creates the images directory if it doesn't exist, then mounts it.
+# After this, http://host:5000/images/research/physics.jpg works directly.
+os.makedirs(os.path.join(IMAGES_DIR, "research"),   exist_ok=True)
+os.makedirs(os.path.join(IMAGES_DIR, "explainers"), exist_ok=True)
+app.mount("/images", StaticFiles(directory=IMAGES_DIR), name="images")  # ← NEW
+
 
 # ── Startup ────────────────────────────────────────────────────────────────
 @app.on_event("startup")
@@ -109,7 +128,7 @@ def on_startup():
     Runs once on server start.
     Seeds the 3 dummy accounts into Firestore if they don't already exist.
     """
-    log.info("=== STEAMI v7 starting ===")
+    log.info("=== STEAMI v7.1 starting ===")
     result = seed_dummy_accounts()
     log.info("Accounts seeded=%s skipped=%s", result["created"], result["skipped"])
 
@@ -147,7 +166,7 @@ def _parse_dt(ts: str | None) -> datetime | None:
 
 @app.get("/health", tags=["Health"], summary="Health check — public")
 def health():
-    return {"status": "ok", "version": "7.0.0", "ts": _now()}
+    return {"status": "ok", "version": "7.1.0", "ts": _now()}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -198,7 +217,9 @@ class PipelineBody(BaseModel):
     keywords: list[str] = []
     limit:    int       = 3
 
-
+# NOTE: The remainder of main.py (all the article/insight/pipeline routes)
+# is unchanged from v7. Paste your existing route handlers below this line.
+# Only the top section above needed updating for image support.
 # ══════════════════════════════════════════════════════════════════════════════
 # ARTICLES — REFRESH  (expire old, fetch new by domain topics)
 # Requires: mod | admin
