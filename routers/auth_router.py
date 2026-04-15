@@ -718,3 +718,262 @@ def get_newsletter_recipients(
         "recipients": recipients,
         "by_topic":   by_topic,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# USER SELF-SERVICE — edit own profile
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EditProfileBody(BaseModel):
+    """
+    Fields a user can update on their own profile.
+    All fields are optional — only the ones provided are changed.
+    To change password, provide both current_password and new_password.
+    """
+    full_name:        Optional[str]  = None   # display name
+    profession:       Optional[str]  = None   # student | researcher | etc.
+    interests:        Optional[list] = None   # list of VALID_TOPICS
+    subscribe_email:  Optional[bool] = None   # email digest opt-in toggle
+    # Password change — both must be provided together
+    current_password: Optional[str]  = None   # must match what's stored
+    new_password:     Optional[str]  = None   # min 6 chars
+
+
+@router.put("/profile", summary="Edit own profile — requires auth")
+def edit_profile(
+    body:    EditProfileBody,
+    payload: dict = Depends(require_auth),   # any logged-in user
+):
+    """
+    PUT /api/auth/profile
+    Lets a logged-in user update their own profile information.
+    All fields are optional — send only what you want to change.
+
+    Editable fields:
+      full_name       — display name shown in the UI
+      profession      — student | working_professional | professor |
+                        researcher | self_learner | educator | other
+      interests       — list of STEM topics (from the 10 valid topics)
+      subscribe_email — true/false to toggle daily email digest
+      current_password + new_password — to change password (both required)
+
+    Body examples:
+      Change name only:
+        { "full_name": "Sahil Kumar" }
+
+      Change profession and interests:
+        { "profession": "researcher", "interests": ["AI + ROBOTICS", "PHYSICS"] }
+
+      Toggle email subscription:
+        { "subscribe_email": false }
+
+      Change password:
+        { "current_password": "OldPass123", "new_password": "NewPass456" }
+
+    Response:
+    {
+      "updated":        true,
+      "updated_fields": ["full_name", "profession"],
+      "user": { ...updated user profile without password_hash... }
+    }
+
+    curl -X PUT http://127.0.0.1:5000/api/auth/profile \\
+      -H "Authorization: Bearer <token>" \\
+      -H "Content-Type: application/json" \\
+      -d '{"full_name":"New Name","profession":"researcher"}'
+    """
+    uid     = get_uid(payload)
+    doc_ref = db.collection("users").document(uid)
+    doc     = doc_ref.get()
+
+    if not doc.exists:
+        raise HTTPException(404, detail="User not found.")
+
+    user    = doc.to_dict()
+    updates = {}   # only the fields the user actually provided
+
+    # ── full_name ──────────────────────────────────────────────────────────
+    if body.full_name is not None:
+        name = body.full_name.strip()
+        if not name:
+            raise HTTPException(400, detail="full_name cannot be empty.")
+        updates["full_name"] = name
+
+    # ── profession ─────────────────────────────────────────────────────────
+    if body.profession is not None:
+        if body.profession not in VALID_PROFESSIONS:
+            raise HTTPException(
+                400,
+                detail=f"Invalid profession. Choose from: {', '.join(VALID_PROFESSIONS)}"
+            )
+        updates["profession"] = body.profession
+
+    # ── interests ──────────────────────────────────────────────────────────
+    if body.interests is not None:
+        invalid = [t for t in body.interests if t not in VALID_TOPICS]
+        if invalid:
+            raise HTTPException(
+                400,
+                detail=f"Invalid topics: {invalid}. Valid options: {VALID_TOPICS}"
+            )
+        # Deduplicate while preserving order
+        updates["interests"] = list(dict.fromkeys(body.interests))
+
+    # ── subscribe_email ─────────────────────────────────────────────────────
+    if body.subscribe_email is not None:
+        updates["subscribe_email"] = body.subscribe_email
+
+    # ── password change ────────────────────────────────────────────────────
+    # Both fields must be provided together — neither alone is accepted.
+    if body.current_password is not None or body.new_password is not None:
+        if not body.current_password or not body.new_password:
+            raise HTTPException(
+                400,
+                detail="Provide both current_password and new_password to change password."
+            )
+        # Verify the current password before allowing the change
+        if not verify_password(body.current_password, user.get("password_hash", "")):
+            raise HTTPException(401, detail="Current password is incorrect.")
+        if len(body.new_password) < 6:
+            raise HTTPException(400, detail="New password must be at least 6 characters.")
+        # Hash the new password — never store plain text
+        updates["password_hash"] = hash_password(body.new_password)
+
+    # Nothing to update
+    if not updates:
+        raise HTTPException(400, detail="No fields provided to update.")
+
+    # Always stamp the update time
+    updates["updated_at"] = _now()
+
+    try:
+        doc_ref.update(updates)
+    except Exception as e:
+        log.error("edit_profile: update failed uid=%s: %s", uid, e)
+        raise HTTPException(500, detail=str(e))
+
+    # Fetch the updated document to return the fresh profile
+    updated_doc = doc_ref.get()
+    safe_user   = _safe(updated_doc.to_dict())
+
+    # Build the list of field names that were actually changed
+    # (exclude password_hash — show "password" instead for clarity)
+    changed_fields = [
+        "password" if k == "password_hash" else k
+        for k in updates.keys()
+        if k != "updated_at"
+    ]
+
+    log.info("edit_profile: uid=%s changed=%s", uid, changed_fields)
+    return {
+        "updated":        True,
+        "updated_fields": changed_fields,
+        "user":           safe_user,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUBSCRIBE TOGGLE — single-click flip for the user table UI
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.patch("/subscribe/toggle", summary="Toggle email subscription on/off — requires auth")
+def toggle_subscription(payload: dict = Depends(require_auth)):
+    """
+    PATCH /api/auth/subscribe/toggle
+    Flip the current user's subscribe_email value in a single request.
+    No request body needed — just call this endpoint and the value switches.
+
+    Designed for a toggle switch / checkbox in the user table UI:
+      - If currently True  → sets to False (unsubscribe)
+      - If currently False → sets to True  (subscribe)
+
+    Response:
+    {
+      "updated":         true,
+      "subscribe_email": false,   ← the NEW value after toggling
+      "message":         "Unsubscribed from daily email digest"
+    }
+
+    curl -X PATCH http://127.0.0.1:5000/api/auth/subscribe/toggle \\
+      -H "Authorization: Bearer <token>"
+    """
+    uid     = get_uid(payload)
+    doc_ref = db.collection("users").document(uid)
+    doc     = doc_ref.get()
+
+    if not doc.exists:
+        raise HTTPException(404, detail="User not found.")
+
+    # Read current value — default False if field doesn't exist yet
+    current = doc.to_dict().get("subscribe_email", False)
+
+    # Flip it
+    new_value = not current
+
+    try:
+        doc_ref.update({"subscribe_email": new_value, "updated_at": _now()})
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+    message = (
+        "Subscribed to daily email digest"
+        if new_value else
+        "Unsubscribed from daily email digest"
+    )
+    log.info("toggle_subscription: uid=%s %s→%s", uid, current, new_value)
+    return {
+        "updated":         True,
+        "subscribe_email": new_value,
+        "message":         message,
+    }
+
+
+@router.patch("/users/{uid}/subscribe/toggle", summary="Admin toggle subscribe for any user")
+def admin_toggle_subscription(
+    uid:     str,
+    payload: dict = Depends(require_admin),   # admin only
+):
+    """
+    PATCH /api/auth/users/{uid}/subscribe/toggle
+    Admin version — flip the subscribe_email value for ANY user by their ID.
+    Useful for the admin user management table where admins can toggle
+    a user's subscription with a single click.
+
+    Response:
+    {
+      "updated":         true,
+      "uid":             "user-uuid",
+      "subscribe_email": true,    ← new value
+      "message":         "Subscribed to daily email digest"
+    }
+
+    curl -X PATCH http://127.0.0.1:5000/api/auth/users/USER_ID/subscribe/toggle \\
+      -H "Authorization: Bearer <admin_token>"
+    """
+    doc_ref = db.collection("users").document(uid)
+    doc     = doc_ref.get()
+
+    if not doc.exists:
+        raise HTTPException(404, detail="User not found.")
+
+    current   = doc.to_dict().get("subscribe_email", False)
+    new_value = not current
+
+    try:
+        doc_ref.update({"subscribe_email": new_value, "updated_at": _now()})
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+    message = (
+        "Subscribed to daily email digest"
+        if new_value else
+        "Unsubscribed from daily email digest"
+    )
+    log.info("admin_toggle_subscription: uid=%s %s→%s by admin=%s",
+             uid, current, new_value, get_uid(payload))
+    return {
+        "updated":         True,
+        "uid":             uid,
+        "subscribe_email": new_value,
+        "message":         message,
+    }
