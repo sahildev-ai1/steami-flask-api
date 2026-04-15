@@ -94,7 +94,8 @@ DUMMY_ACCOUNTS: list[dict] = [
         "plain_password": "Admin@steami123",
         "role":           "admin",
         "profession":     "other",
-        "interests":      VALID_TOPICS,       # admin tracks all topics
+        "interests":      VALID_TOPICS,
+        "subscribe_email":True,  # subscribed to daily insights
     },
     {
         "id":             "mod-steami-001",
@@ -104,6 +105,7 @@ DUMMY_ACCOUNTS: list[dict] = [
         "role":           "mod",
         "profession":     "researcher",
         "interests":      ["AI + ROBOTICS", "COMPUTER SCIENCE", "PHYSICS"],
+        "subscribe_email":True,
     },
     {
         "id":             "user-steami-001",
@@ -113,6 +115,7 @@ DUMMY_ACCOUNTS: list[dict] = [
         "role":           "user",
         "profession":     "student",
         "interests":      ["AI + ROBOTICS", "EARTH & SPACE", "BIOLOGY"],
+        "subscribe_email":True,
     },
 ]
 
@@ -144,6 +147,7 @@ def seed_dummy_accounts() -> dict:
             "profession":    acc["profession"],
             "interests":     acc["interests"],
             "is_active":     True,
+            "subscribe_email": acc.get("subscribe_email", False),
             "created_at":    _now(),
             "updated_at":    _now(),
         }
@@ -190,8 +194,9 @@ def _safe(user: dict) -> dict:
         "email":      user.get("email"),
         "role":       user.get("role"),
         "profession": user.get("profession", ""),
-        "interests":  user.get("interests", []),
-        "is_active":  user.get("is_active", True),
+        "interests":       user.get("interests", []),
+        "subscribe_email": user.get("subscribe_email", False),
+        "is_active":       user.get("is_active", True),
         "created_at": user.get("created_at"),
     }
 
@@ -228,6 +233,7 @@ class UpdateRoleBody(BaseModel):
 class UpdateUserBody(BaseModel):
     """
     Admin: update any field on a user profile.
+    subscribe_email: True/False to toggle email digest subscription.
     All fields are optional — only provided fields are changed.
     To deactivate an account set is_active=False.
     """
@@ -305,9 +311,10 @@ def signup(body: SignupBody):
         "role":          "user",                          # always "user" at signup
         "profession":    body.profession,
         "interests":     [],                              # set later via /interests
-        "is_active":     True,
-        "created_at":    _now(),
-        "updated_at":    _now(),
+        "is_active":         True,
+        "subscribe_email":    body.subscribe_email,  # email digest opt-in
+        "created_at":        _now(),
+        "updated_at":        _now(),
     }
 
     try:
@@ -566,7 +573,8 @@ def admin_update_user(
         if invalid:
             raise HTTPException(400, detail=f"Invalid topics: {invalid}")
         updates["interests"] = list(dict.fromkeys(body.interests))
-    if body.is_active  is not None: updates["is_active"]  = body.is_active
+    if body.is_active        is not None: updates["is_active"]        = body.is_active
+    if body.subscribe_email is not None: updates["subscribe_email"] = body.subscribe_email
     if body.role       is not None:
         if body.role not in ROLES:
             raise HTTPException(400, detail=f"Invalid role: {body.role}")
@@ -592,3 +600,121 @@ def admin_update_user(
     log.info("admin_update_user: uid=%s fields=%s by admin=%s",
              uid, list(updates.keys()), get_uid(payload))
     return {"updated": True, "uid": uid, "updated_fields": list(updates.keys())}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EMAIL NEWSLETTER — subscription management + email list API
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SubscribeBody(BaseModel):
+    """Toggle the user's daily email digest subscription."""
+    subscribe: bool  # True = subscribe, False = unsubscribe
+
+
+@router.post("/subscribe", summary="Update email digest subscription — requires auth")
+def update_subscription(
+    body:    SubscribeBody,
+    payload: dict = Depends(require_auth),
+):
+    """
+    POST /api/auth/subscribe
+    Opt in or out of the daily article insight email digest.
+    Can also be set during signup via the subscribe_email field.
+
+    Body: { "subscribe": true }
+
+    Response: { "updated": true, "subscribe_email": true }
+
+    curl -X POST http://127.0.0.1:5000/api/auth/subscribe \\
+      -H "Authorization: Bearer <token>" \\
+      -H "Content-Type: application/json" \\
+      -d '{"subscribe": true}'
+    """
+    uid     = get_uid(payload)
+    doc_ref = db.collection("users").document(uid)
+    if not doc_ref.get().exists:
+        raise HTTPException(404, detail="User not found.")
+    try:
+        doc_ref.update({"subscribe_email": body.subscribe, "updated_at": _now()})
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+    action = "Subscribed to" if body.subscribe else "Unsubscribed from"
+    log.info("%s email digest: uid=%s", action, uid)
+    return {"updated": True, "subscribe_email": body.subscribe}
+
+
+@router.get("/newsletter/recipients", summary="Get subscribed users for email send — admin only")
+def get_newsletter_recipients(
+    payload: dict = Depends(require_admin),
+):
+    """
+    GET /api/auth/newsletter/recipients
+    Returns all users who have opted in to the daily email digest,
+    grouped by their interest topics.
+
+    Use this endpoint when sending the daily newsletter:
+    - Call this to get the full recipient list with emails + interests
+    - For each interest topic, gather articles and insights from /api/articles
+      and /api/insights, then send personalised emails
+
+    Response:
+    {
+      "total": 42,
+      "recipients": [
+        {
+          "id":         "user-uuid",
+          "full_name":  "Sahil Kumar",
+          "email":      "sahil@example.com",
+          "interests":  ["AI + ROBOTICS", "PHYSICS"],
+          "profession": "student"
+        }, ...
+      ],
+      "by_topic": {
+        "AI + ROBOTICS":  ["sahil@example.com", "admin@steami.dev"],
+        "PHYSICS":        ["sahil@example.com"],
+        ...
+      }
+    }
+
+    curl -H "Authorization: Bearer <admin_token>" \\
+      http://127.0.0.1:5000/api/auth/newsletter/recipients
+    """
+    try:
+        # Fetch all users who have subscribe_email = True
+        docs = (
+            db.collection("users")
+              .where("subscribe_email", "==", True)
+              .stream()
+        )
+        recipients = []
+        for d in docs:
+            u = d.to_dict()
+            if not u.get("is_active", True):
+                continue  # skip deactivated accounts
+            recipients.append({
+                "id":        u.get("id"),
+                "full_name": u.get("full_name", ""),
+                "email":     u.get("email", ""),
+                "interests": u.get("interests", []),
+                "profession":u.get("profession", ""),
+            })
+    except Exception as e:
+        log.error("get_newsletter_recipients failed: %s", e)
+        raise HTTPException(500, detail=str(e))
+
+    # Build a by_topic map: topic → list of email addresses
+    # Useful for sending topic-specific batches
+    by_topic: dict = {}
+    for r in recipients:
+        for topic in r.get("interests", []):
+            if topic not in by_topic:
+                by_topic[topic] = []
+            by_topic[topic].append(r["email"])
+
+    log.info("newsletter/recipients: %d subscribed users, %d topics",
+             len(recipients), len(by_topic))
+    return {
+        "total":      len(recipients),
+        "recipients": recipients,
+        "by_topic":   by_topic,
+    }

@@ -50,7 +50,7 @@ load_dotenv()
 
 # ── Core modules ───────────────────────────────────────────────────────────
 from mongodb_client import db
-from gemini_client import generate_ai_insight
+from ollama_agent import generate_ai_insight   # Gemma 4 via Ollama Cloud
 from article_fetcher import (
     fetch_articles_from_source,
     fetch_articles_from_url,
@@ -90,7 +90,7 @@ IMAGES_DIR = "images"
 
 app = FastAPI(
     title       = "STEAMI API",
-    version     = "7.1.0",
+    version     = "8.0.0",
     description = (
         "STEAMI Backend — articles, insights, chat, feed, explainers, diary, dashboard.\n\n"
         "**Test Accounts (POST /api/auth/login):**\n"
@@ -128,13 +128,13 @@ def on_startup():
     Runs once on server start.
     Seeds the 3 dummy accounts into Firestore if they don't already exist.
     """
-    log.info("=== STEAMI v7.1 starting ===")
+    log.info("=== STEAMI v8.0 starting ===")
     result = seed_dummy_accounts()
     log.info("Accounts seeded=%s skipped=%s", result["created"], result["skipped"])
 
 
 # ── Routers ────────────────────────────────────────────────────────────────
-app.include_router(auth_router,      prefix="/api/auth",      tags=["Auth"])
+app.include_router(auth_router,      prefix="/api/auth",      tags=["Auth"])  # includes /newsletter/recipients
 app.include_router(chat.router,      prefix="/api/chat",      tags=["Chat"])
 app.include_router(feed.router,      prefix="/api/feed",      tags=["Feed"])
 app.include_router(content.router,   prefix="/api",           tags=["Content"])
@@ -166,7 +166,7 @@ def _parse_dt(ts: str | None) -> datetime | None:
 
 @app.get("/health", tags=["Health"], summary="Health check — public")
 def health():
-    return {"status": "ok", "version": "7.1.0", "ts": _now()}
+    return {"status": "ok", "version": "8.0.0", "ts": _now()}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -318,7 +318,7 @@ def refresh_articles(
         log.error("refresh: fetch failed: %s", e)
         raise HTTPException(502, detail=f"RSS fetch failed: {e}")
 
-    # ── Step 4: Save only NEW articles (skip URLs already in Firestore) ───
+    # ── Step 4: Save only NEW articles (skip URLs already in database) ──────
     saved:   list[dict] = []
     skipped: int        = 0
 
@@ -338,24 +338,67 @@ def refresh_articles(
         try:
             db.collection("articles").document(art["id"]).set(art)
             saved.append(art)
-            # Track the URL so we don't save duplicates within the same batch
             if art_url:
                 existing_urls.add(art_url)
         except Exception as e:
-            log.error("refresh: Firestore save failed for %s: %s", art["id"], e)
+            log.error("refresh: MongoDB save failed for %s: %s", art["id"], e)
+
+    # ── Step 5: Auto-generate AI insights for all newly saved articles ────
+    # Generate insights at fetch time so they are ready immediately when
+    # users browse or receive the daily email digest.
+    insights_ok  = 0
+    insights_err = 0
+
+    for art in saved:
+        try:
+            insight = generate_ai_insight(art)
+
+            # Save insight back to the article document
+            db.collection("articles").document(art["id"]).update({
+                "ai_insight":           insight,
+                "has_insight":          True,
+                "insight_generated_at": _now(),
+            })
+
+            # Save to the shared ai_insights collection
+            db.collection("ai_insights").document(art["id"]).set({
+                "article_id":      art["id"],
+                "source_table":    "articles",
+                "title":           art.get("title", ""),
+                "topic":           art.get("topic", ""),
+                "source":          art.get("source", ""),
+                "matched_domains": art.get("matched_domains", []),
+                "article_url":     art.get("article_url") or art.get("url", ""),
+                "ai_insight":      insight,
+                "created_at":      _now(),
+            })
+
+            # Update the in-memory article so the response includes the insight
+            art["ai_insight"]  = insight
+            art["has_insight"] = True
+            insights_ok += 1
+
+        except Exception as e:
+            # Insight generation failure should NOT block the whole refresh
+            log.error("refresh: insight generation failed for %s: %s",
+                      art.get("id"), e)
+            insights_err += 1
 
     log.info(
-        "refresh done: deleted_articles=%d deleted_insights=%d fetched=%d new_saved=%d skipped=%d",
-        deleted_articles, deleted_insights, len(raw), len(saved), skipped,
+        "refresh done: fetched=%d new_saved=%d skipped=%d "
+        "insights_ok=%d insights_err=%d",
+        len(raw), len(saved), skipped, insights_ok, insights_err,
     )
 
     return {
-        "deletion_disabled":      True,
-        "expired_found":          len(expired_ids),
-        "fetched":                len(raw),
-        "new_saved":              len(saved),
-        "skipped":                skipped,
-        "articles":               saved,
+        "deletion_disabled": True,
+        "expired_found":     len(expired_ids),
+        "fetched":           len(raw),
+        "new_saved":         len(saved),
+        "skipped":           skipped,
+        "insights_generated":insights_ok,
+        "insights_failed":   insights_err,
+        "articles":          saved,
     }
 
 
