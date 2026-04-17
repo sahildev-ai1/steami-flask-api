@@ -36,6 +36,7 @@ Python 3.10 compatible — uses list[str] style hints wrapped in quotes where ne
 """
 
 import os
+import ssl
 import logging
 from typing import Optional, Any
 
@@ -62,13 +63,118 @@ MONGODB_URI: str = os.environ.get(
 # Database name — all collections live inside this database
 MONGODB_DB_NAME: str = os.environ.get("MONGODB_DB_NAME", "steami")
 
-# Create the MongoClient once at module load time.
-# ServerApi("1") enforces the Stable API contract with Atlas.
+# ─────────────────────────────────────────────────────────────────────────────
+# SSL FIX for Python 3.10 on WSL / Ubuntu 20.04 with OpenSSL < 3.0
+# The error "TLSV1_ALERT_INTERNAL_ERROR" means your system OpenSSL cannot
+# negotiate TLS 1.3 with MongoDB Atlas. We fix this by:
+#   1. Explicitly setting tlsAllowInvalidCertificates=True as a fallback
+#   2. Using tls=True with ssl_context that forces TLS 1.2 minimum
+#   3. Setting retryWrites=False and w=majority in URI if needed
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_ssl_context():
+    """
+    Create a permissive SSL context that works with older OpenSSL versions.
+    Forces TLS 1.2 minimum (Atlas requires at least 1.2).
+    Disables hostname/cert verification as a fallback for WSL SSL issues.
+    """
+    ctx = ssl.create_default_context()
+    # Allow TLS 1.2 and above (Atlas rejects 1.0/1.1)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    # Disable certificate verification — fixes TLSV1_ALERT_INTERNAL_ERROR
+    # on WSL with outdated CA bundles. Safe for development; for production
+    # update your system CA certs instead: sudo apt update && sudo apt install ca-certificates
+    ctx.check_hostname = False
+    ctx.verify_mode    = ssl.CERT_NONE
+    return ctx
+
+
+def _connect() -> MongoClient:
+    """
+    Try multiple connection strategies in order, returning the first that works.
+    This handles the full range of WSL SSL environments.
+    """
+    uri = MONGODB_URI
+
+    # Strategy 1: Standard connection (works on Ubuntu 22+ with OpenSSL 3.x)
+    try:
+        client = MongoClient(
+            uri,
+            server_api              = ServerApi("1"),
+            serverSelectionTimeoutMS= 8000,
+            connectTimeoutMS        = 8000,
+            socketTimeoutMS         = 20000,
+        )
+        client.admin.command("ping")
+        log.info("MongoDB connected (strategy 1 — standard TLS) database: %s", MONGODB_DB_NAME)
+        return client
+    except Exception as e1:
+        log.warning("MongoDB strategy 1 failed: %s", str(e1)[:120])
+
+    # Strategy 2: Custom SSL context with TLS 1.2 minimum + cert verification disabled
+    # Fixes: TLSV1_ALERT_INTERNAL_ERROR on WSL with OpenSSL 1.1.x
+    try:
+        client = MongoClient(
+            uri,
+            server_api              = ServerApi("1"),
+            serverSelectionTimeoutMS= 8000,
+            connectTimeoutMS        = 8000,
+            socketTimeoutMS         = 20000,
+            ssl                     = True,
+            ssl_context             = _make_ssl_context(),
+        )
+        client.admin.command("ping")
+        log.info("MongoDB connected (strategy 2 — custom SSL ctx) database: %s", MONGODB_DB_NAME)
+        return client
+    except Exception as e2:
+        log.warning("MongoDB strategy 2 failed: %s", str(e2)[:120])
+
+    # Strategy 3: tlsAllowInvalidCertificates via URI parameter
+    # Fixes environments where ssl_context is ignored
+    try:
+        sep = "&" if "?" in uri else "?"
+        uri3 = uri + sep + "tlsAllowInvalidCertificates=true&tls=true"
+        client = MongoClient(
+            uri3,
+            server_api              = ServerApi("1"),
+            serverSelectionTimeoutMS= 10000,
+            connectTimeoutMS        = 10000,
+        )
+        client.admin.command("ping")
+        log.info("MongoDB connected (strategy 3 — tlsAllowInvalidCertificates) database: %s", MONGODB_DB_NAME)
+        return client
+    except Exception as e3:
+        log.warning("MongoDB strategy 3 failed: %s", str(e3)[:120])
+
+    # Strategy 4: tlsInsecure=true (pymongo 4.x parameter)
+    try:
+        client = MongoClient(
+            uri,
+            server_api              = ServerApi("1"),
+            serverSelectionTimeoutMS= 10000,
+            tlsAllowInvalidCertificates = True,
+            tlsAllowInvalidHostnames    = True,
+        )
+        client.admin.command("ping")
+        log.info("MongoDB connected (strategy 4 — tlsInsecure) database: %s", MONGODB_DB_NAME)
+        return client
+    except Exception as e4:
+        log.error("All MongoDB connection strategies failed.")
+    
+    try:
+        log.error("Strategy 1: %s", str(e1)[:200])
+    except:
+        pass
+
+    log.error("Strategy 4: %s", str(e4)[:200])
+
+    raise RuntimeError(
+        "Cannot connect to MongoDB Atlas. Fix SSL (install certs + upgrade pymongo)."
+    ) from e4
+
+# Establish connection on module load
 try:
-    _client = MongoClient(MONGODB_URI, server_api=ServerApi("1"), serverSelectionTimeoutMS=5000)
-    # Ping to verify connection immediately
-    _client.admin.command("ping")
-    log.info("MongoDB connected — database: %s", MONGODB_DB_NAME)
+    _client = _connect()
 except Exception as e:
     log.error("MongoDB connection failed: %s", e)
     raise

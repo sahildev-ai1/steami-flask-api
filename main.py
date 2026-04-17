@@ -37,6 +37,8 @@ ROUTE PROTECTION:
 
 import os
 import uuid
+import time
+import threading
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -343,62 +345,51 @@ def refresh_articles(
         except Exception as e:
             log.error("refresh: MongoDB save failed for %s: %s", art["id"], e)
 
-    # ── Step 5: Auto-generate AI insights for all newly saved articles ────
-    # Generate insights at fetch time so they are ready immediately when
-    # users browse or receive the daily email digest.
-    insights_ok  = 0
-    insights_err = 0
-
+    # ── Step 5: Add all newly saved articles to the insight queue ───────────
+    # Instead of generating insights inline (which causes 120s timeouts for
+    # 30 articles), we queue them. The admin calls POST /api/articles/insights/process
+    # every 5 minutes to generate 2 insights per batch — no timeouts.
+    queued = 0
     for art in saved:
         try:
-            insight = generate_ai_insight(art)
+            # Only queue if no insight exists yet
+            existing = db.collection("ai_insights").document(art["id"]).get()
+            if existing.exists:
+                continue  # already has an insight — skip
 
-            # Save insight back to the article document
-            db.collection("articles").document(art["id"]).update({
-                "ai_insight":           insight,
-                "has_insight":          True,
-                "insight_generated_at": _now(),
-            })
-
-            # Save to the shared ai_insights collection
-            db.collection("ai_insights").document(art["id"]).set({
-                "article_id":      art["id"],
-                "source_table":    "articles",
-                "title":           art.get("title", ""),
-                "topic":           art.get("topic", ""),
-                "source":          art.get("source", ""),
+            db.collection("insight_queue").document(art["id"]).set({
+                "article_id":    art["id"],
+                "title":         art.get("title", ""),
                 "matched_domains": art.get("matched_domains", []),
-                "article_url":     art.get("article_url") or art.get("url", ""),
-                "ai_insight":      insight,
-                "created_at":      _now(),
+                "queued_at":     _now(),
+                "status":        "pending",    # pending → processing → done / failed
+                "attempts":      0,
+                "last_error":    "",
             })
-
-            # Update the in-memory article so the response includes the insight
-            art["ai_insight"]  = insight
-            art["has_insight"] = True
-            insights_ok += 1
-
+            queued += 1
         except Exception as e:
-            # Insight generation failure should NOT block the whole refresh
-            log.error("refresh: insight generation failed for %s: %s",
-                      art.get("id"), e)
-            insights_err += 1
+            log.error("refresh: failed to queue article %s: %s", art.get("id"), e)
+
+    # Count total pending items in queue
+    try:
+        all_pending = db.collection("insight_queue").where("status", "==", "pending").stream()
+        queue_total = len(all_pending)
+    except Exception:
+        queue_total = queued
 
     log.info(
-        "refresh done: fetched=%d new_saved=%d skipped=%d "
-        "insights_ok=%d insights_err=%d",
-        len(raw), len(saved), skipped, insights_ok, insights_err,
+        "refresh done: fetched=%d new_saved=%d skipped=%d queued=%d queue_total=%d",
+        len(raw), len(saved), skipped, queued, queue_total,
     )
 
     return {
-        "deletion_disabled": True,
-        "expired_found":     len(expired_ids),
-        "fetched":           len(raw),
-        "new_saved":         len(saved),
-        "skipped":           skipped,
-        "insights_generated":insights_ok,
-        "insights_failed":   insights_err,
-        "articles":          saved,
+        "expired_found": len(expired_ids),
+        "fetched":       len(raw),
+        "new_saved":     len(saved),
+        "skipped":       skipped,
+        "queued":        queued,
+        "queue_total":   queue_total,
+        "articles":      saved,
     }
 
 
@@ -845,3 +836,388 @@ def pipeline(body: PipelineBody, payload: dict = Depends(require_mod)):
             results.append({"id": art["id"], "status": "error", "error": str(e)})
 
     return {"processed": len(results), "results": results}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INSIGHT QUEUE — batch processor and status endpoints
+# ══════════════════════════════════════════════════════════════════════════════
+
+# How the queue works:
+#   1. POST /api/articles/refresh  (admin) → saves articles + adds each to insight_queue
+#   2. POST /api/articles/insights/process (admin) → picks next batch_size pending items,
+#      generates insights one by one, marks each done/failed
+#   3. Admin calls step 2 every 5 minutes (cron job or manual clicks in admin panel)
+#
+# With batch_size=2 and 30 articles:
+#   15 batches × 5 min interval = 75 minutes total — no timeouts
+#
+# MongoDB collection: insight_queue
+# Document fields:
+#   article_id, title, matched_domains, queued_at, status, attempts, last_error
+#
+# Status values:
+#   pending    — waiting to be processed
+#   processing — currently being processed (set at start, in case of crash)
+#   done       — insight generated and saved
+#   failed     — gave up after max_attempts
+
+
+class ProcessBody(BaseModel):
+    """
+    Body for POST /api/articles/insights/process
+    batch_size: how many insights to generate in this call (default 2)
+    """
+    batch_size: int = 2   # generate this many insights per call
+
+
+@app.post(
+    "/api/articles/insights/process",
+    status_code = 200,
+    tags        = ["Insights"],
+    summary     = "Process next batch from insight queue — ADMIN ONLY",
+)
+def process_insight_queue(
+    body:    ProcessBody = ProcessBody(),
+    payload: dict        = Depends(require_admin),   # ADMIN ONLY
+):
+    """
+    POST /api/articles/insights/process
+    ADMIN ONLY — processes the next N articles from the insight_queue.
+
+    Call this endpoint every 5 minutes to gradually generate insights
+    without hitting the Ollama 120-second timeout:
+      - batch_size=2 (default) → 2 insights per call
+      - 30 articles → 15 calls × 5 min = 75 minutes total
+
+    The endpoint:
+    1. Picks the oldest `batch_size` pending queue items
+    2. For each: generates the AI insight via Ollama Cloud
+    3. Saves insight to the article doc + ai_insights collection
+    4. Marks queue item as "done" (or "failed" on error)
+    5. Returns what was processed + how many items remain
+
+    Body (optional):
+    { "batch_size": 2 }   // how many to process this call
+
+    Response:
+    {
+      "processed":    2,
+      "succeeded":    2,
+      "failed":       0,
+      "remaining":    18,   // still pending in queue
+      "results": [
+        { "article_id": "...", "title": "...", "status": "done" },
+        { "article_id": "...", "title": "...", "status": "done" }
+      ]
+    }
+
+    curl -X POST http://127.0.0.1:5000/api/articles/insights/process \\
+      -H "Authorization: Bearer <admin_token>" \\
+      -H "Content-Type: application/json" \\
+      -d '{"batch_size": 2}'
+    """
+    batch_size   = max(1, min(body.batch_size, 10))  # cap at 10 per call
+    max_attempts = 3  # give up after this many failed attempts per article
+    results      = []
+    succeeded    = 0
+    failed       = 0
+
+    # ── Pick the next batch_size pending items, oldest first ──────────────
+    try:
+        pending_docs = (
+            db.collection("insight_queue")
+              .where("status", "==", "pending")
+              .order_by("queued_at", direction="ASCENDING")
+              .limit(batch_size)
+              .stream()
+        )
+        pending = [d.to_dict() for d in pending_docs]
+    except Exception as e:
+        raise HTTPException(500, detail=f"Could not read insight_queue: {e}")
+
+    if not pending:
+        # Count how many failed/done items exist for context
+        try:
+            done_docs   = db.collection("insight_queue").where("status", "==", "done").stream()
+            failed_docs = db.collection("insight_queue").where("status", "==", "failed").stream()
+            done_count   = len(done_docs)
+            failed_count = len(failed_docs)
+        except Exception:
+            done_count = failed_count = 0
+
+        return {
+            "processed":  0,
+            "succeeded":  0,
+            "failed":     0,
+            "remaining":  0,
+            "done_total": done_count,
+            "failed_total": failed_count,
+            "message":    "Queue is empty — all articles have been processed.",
+            "results":    [],
+        }
+
+    # ── Process each item ──────────────────────────────────────────────────
+    for item in pending:
+        article_id = item["article_id"]
+        title      = item.get("title", "")
+        attempts   = item.get("attempts", 0) + 1
+
+        # Mark as processing so we don't double-pick if something goes wrong
+        try:
+            db.collection("insight_queue").document(article_id).update({
+                "status":   "processing",
+                "attempts": attempts,
+            })
+        except Exception as e:
+            log.warning("process_queue: could not mark processing for %s: %s", article_id, e)
+
+        # Fetch the full article from MongoDB
+        try:
+            art_doc = db.collection("articles").document(article_id).get()
+            if not art_doc.exists:
+                raise ValueError(f"Article {article_id} not found in articles collection")
+            article = art_doc.to_dict()
+        except Exception as e:
+            log.error("process_queue: could not load article %s: %s", article_id, e)
+            try:
+                db.collection("insight_queue").document(article_id).update({
+                    "status":     "failed" if attempts >= max_attempts else "pending",
+                    "last_error": str(e),
+                })
+            except Exception:
+                pass
+            results.append({
+                "article_id": article_id,
+                "title":      title,
+                "status":     "failed",
+                "error":      str(e),
+            })
+            failed += 1
+            continue
+
+        # Generate the AI insight
+        try:
+            log.info("process_queue: generating insight for %s (attempt %d)", article_id, attempts)
+            insight = generate_ai_insight(article)
+
+            # Save insight to the article document
+            db.collection("articles").document(article_id).update({
+                "ai_insight":           insight,
+                "has_insight":          True,
+                "insight_generated_at": _now(),
+            })
+
+            # Save to the shared ai_insights collection
+            db.collection("ai_insights").document(article_id).set({
+                "article_id":      article_id,
+                "source_table":    "articles",
+                "title":           article.get("title", ""),
+                "topic":           article.get("topic", ""),
+                "source":          article.get("source", ""),
+                "matched_domains": article.get("matched_domains", []),
+                "article_url":     article.get("article_url") or article.get("url", ""),
+                "ai_insight":      insight,
+                "created_at":      _now(),
+            })
+
+            # Mark queue item as done
+            db.collection("insight_queue").document(article_id).update({
+                "status":       "done",
+                "completed_at": _now(),
+                "last_error":   "",
+            })
+
+            results.append({
+                "article_id": article_id,
+                "title":      title,
+                "status":     "done",
+                "domain":     insight.get("domain", ""),
+            })
+            succeeded += 1
+            log.info("process_queue: done %s (%s)", article_id, title[:50])
+
+        except Exception as e:
+            log.error("process_queue: insight failed for %s (attempt %d): %s",
+                      article_id, attempts, e)
+
+            # If too many attempts, mark as permanently failed
+            new_status = "failed" if attempts >= max_attempts else "pending"
+            try:
+                db.collection("insight_queue").document(article_id).update({
+                    "status":     new_status,
+                    "last_error": str(e)[:500],
+                })
+            except Exception:
+                pass
+
+            results.append({
+                "article_id": article_id,
+                "title":      title,
+                "status":     new_status,
+                "error":      str(e)[:200],
+                "attempts":   attempts,
+            })
+            failed += 1
+
+    # Count remaining pending items after this batch
+    try:
+        remaining_docs = db.collection("insight_queue").where("status", "==", "pending").stream()
+        remaining      = len(remaining_docs)
+    except Exception:
+        remaining = -1   # unknown, don't fail the response
+
+    log.info("process_queue: batch done — succeeded=%d failed=%d remaining=%d",
+             succeeded, failed, remaining)
+    return {
+        "processed":  len(results),
+        "succeeded":  succeeded,
+        "failed":     failed,
+        "remaining":  remaining,
+        "results":    results,
+    }
+
+
+@app.get(
+    "/api/articles/insights/queue",
+    tags    = ["Insights"],
+    summary = "Check insight queue status — ADMIN ONLY",
+)
+def get_insight_queue_status(payload: dict = Depends(require_admin)):
+    """
+    GET /api/articles/insights/queue
+    ADMIN ONLY — check the current state of the insight generation queue.
+
+    Use this to monitor progress while insights are being generated.
+
+    Response:
+    {
+      "pending":    18,   // waiting to be processed
+      "done":       4,    // successfully completed
+      "failed":     1,    // gave up after 3 attempts
+      "processing": 0,    // currently mid-generation (should be 0 when idle)
+      "total":      23,
+      "items": [           // all pending items (so admin knows what's coming)
+        { "article_id": "...", "title": "...", "queued_at": "...", "attempts": 0 },
+        ...
+      ]
+    }
+
+    curl -H "Authorization: Bearer <admin_token>" \\
+      http://127.0.0.1:5000/api/articles/insights/queue
+    """
+    try:
+        all_docs = db.collection("insight_queue").stream()
+        items    = [d.to_dict() for d in all_docs]
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+    # Group by status
+    by_status = {"pending": [], "done": [], "failed": [], "processing": []}
+    for item in items:
+        s = item.get("status", "pending")
+        if s in by_status:
+            by_status[s].append(item)
+        else:
+            by_status["pending"].append(item)
+
+    return {
+        "pending":    len(by_status["pending"]),
+        "done":       len(by_status["done"]),
+        "failed":     len(by_status["failed"]),
+        "processing": len(by_status["processing"]),
+        "total":      len(items),
+        "items":      sorted(by_status["pending"], key=lambda x: x.get("queued_at", "")),
+    }
+
+
+@app.delete(
+    "/api/articles/insights/queue",
+    tags    = ["Insights"],
+    summary = "Clear insight queue — ADMIN ONLY",
+)
+def clear_insight_queue(payload: dict = Depends(require_admin)):
+    """
+    DELETE /api/articles/insights/queue
+    ADMIN ONLY — delete all items from the insight_queue collection.
+    Use this to reset after errors or before a fresh refresh.
+
+    curl -X DELETE http://127.0.0.1:5000/api/articles/insights/queue \\
+      -H "Authorization: Bearer <admin_token>"
+    """
+    try:
+        docs    = db.collection("insight_queue").stream()
+        deleted = 0
+        for d in docs:
+            db.collection("insight_queue").document(d.id).delete()
+            deleted += 1
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+    log.info("insight_queue cleared: %d items deleted by admin=%s", deleted, get_uid(payload))
+    return {"cleared": True, "deleted": deleted}
+
+
+@app.get(
+    "/api/articles/refresh/check",
+    tags    = ["Articles"],
+    summary = "Check for new articles in DB — any auth (read-only)",
+)
+def refresh_check(
+    since_hours: int  = Query(24, ge=1, le=168, description="Look for articles added in the last N hours"),
+    payload:     dict = Depends(require_auth),   # any logged-in user
+):
+    """
+    GET /api/articles/refresh/check?since_hours=24
+    ANY authenticated user — check if new articles have been added to the
+    database recently, without triggering any RSS fetch.
+
+    This is the user-facing "refresh" — it just reads the DB.
+    Only admins can trigger actual RSS fetching via POST /api/articles/refresh.
+
+    Response:
+    {
+      "new_articles":  5,    // articles added in the last since_hours hours
+      "since_hours":   24,
+      "articles": [ ...the new articles, newest first... ]
+    }
+
+    curl -H "Authorization: Bearer <token>" \\
+      "http://127.0.0.1:5000/api/articles/refresh/check?since_hours=24"
+    """
+    from datetime import timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+    cutoff_iso = cutoff.isoformat()
+
+    try:
+        docs = (
+            db.collection("articles")
+              .order_by("fetched_at", direction="DESCENDING")
+              .limit(50)
+              .stream()
+        )
+        new_articles = []
+        for d in docs:
+            art = d.to_dict()
+            fetched_str = art.get("fetched_at", "")
+            if not fetched_str:
+                continue
+            # Keep only articles newer than the cutoff
+            if fetched_str >= cutoff_iso:
+                # Return slim fields — no heavy content/full_content
+                new_articles.append({
+                    "id":              art.get("id"),
+                    "title":           art.get("title"),
+                    "short_summary":   art.get("short_summary", ""),
+                    "image_url":       art.get("image_url", ""),
+                    "article_url":     art.get("article_url") or art.get("url", ""),
+                    "matched_domains": art.get("matched_domains", []),
+                    "source":          art.get("source", ""),
+                    "fetched_at":      art.get("fetched_at"),
+                    "has_insight":     art.get("has_insight", False),
+                })
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+    return {
+        "new_articles": len(new_articles),
+        "since_hours":  since_hours,
+        "articles":     new_articles,
+    }
