@@ -80,7 +80,8 @@ router = APIRouter()
 # accessible at               http://host:5000/images/research/physics.jpg
 # ─────────────────────────────────────────────────────────────────────────────
 
-IMAGES_ROOT  = "images"                        # disk directory (project root)
+_BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+IMAGES_ROOT = os.path.join(_BASE_DIR, "images")                  # disk directory (project root)
 ALLOWED_MIME = {                               # accepted file types
     "image/jpeg",
     "image/jpg",

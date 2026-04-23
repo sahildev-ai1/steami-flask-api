@@ -26,7 +26,7 @@ NEW IN v9:
   - GET  /.well-known/ai-plugin.json — AI plugin manifest
 
 DAILY NEWSLETTER SETUP:
-  1. Add SMTP env vars to .env (see routers/newsletter.py for full list).
+  1. Add BREVO_API_KEY, BREVO_SENDER_EMAIL, BREVO_SENDER_NAME to .env (see routers/newsletter.py).
   2. Set up a daily cron job (or GitHub Actions scheduled workflow):
        0 9 * * * curl -X POST https://your-api.com/api/newsletter/send-daily \\
          -H "Authorization: Bearer <admin_token>"
@@ -45,11 +45,9 @@ ENV VARS (.env):
   MONGO_URI         — MongoDB Atlas connection string
   JWT_SECRET        — secret for signing JWTs
   GEMINI_API_KEY    — Gemini AI API key
-  SMTP_HOST         — e.g. smtp.gmail.com
-  SMTP_PORT         — e.g. 587
-  SMTP_USER         — sender email
-  SMTP_PASSWORD     — app password
-  SMTP_FROM_NAME    — e.g. "STEAMI Newsletter"
+  BREVO_API_KEY     — from https://app.brevo.com → Settings → SMTP & API → API Keys
+  BREVO_SENDER_EMAIL — verified sender email, e.g. hello@steami.com
+  BREVO_SENDER_NAME  — display name, e.g. "STEAMI Newsletter"
   SITE_URL          — e.g. https://steami.com   ← update when domain is decided
   SITE_NAME         — e.g. STEAMI
 
@@ -111,7 +109,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 EXPIRY_DAYS = 25
-IMAGES_DIR  = "images"
 SITE_NAME   = os.getenv("SITE_NAME", "STEAMI")
 SITE_URL    = os.getenv("SITE_URL",  "https://steami.com")
 
@@ -153,6 +150,9 @@ app.add_middleware(
 add_ddos_protection(app)
 
 # ── Static files ──────────────────────────────────────────────────────────
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+IMAGES_DIR  = os.path.join(BASE_DIR, "images")
+
 os.makedirs(os.path.join(IMAGES_DIR, "research"),   exist_ok=True)
 os.makedirs(os.path.join(IMAGES_DIR, "explainers"), exist_ok=True)
 app.mount("/images", StaticFiles(directory=IMAGES_DIR), name="images")
