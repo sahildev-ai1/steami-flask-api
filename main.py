@@ -1,38 +1,62 @@
 """
-STEAMI FastAPI  v7 — MongoDB Atlas backend
-==================
+STEAMI FastAPI  v9 — MongoDB Atlas backend
+==========================================
 Run:   uvicorn main:app --host 0.0.0.0 --port 5000 --reload
 Docs:  http://127.0.0.1:5000/docs
 
-NEW IN v7:
-  - Signup: profession field instead of domain/background/statement
-  - POST /api/auth/interests   — save user STEM topic interests after signup
-  - GET  /api/auth/interests   — get own interests
-  - POST /api/articles/refresh — expire articles >25 days (was 30), also deletes
-                                  their ai_insights; fetch min 3 per topic
-  - GET  /api/articles/for-me  — articles filtered by user's saved interests
-  - POST /api/diary            — save selected content to personal diary
-  - GET  /api/diary            — list own diary entries
-  - POST /api/dashboard/event  — log popup open event (for analytics)
-  - GET  /api/dashboard/me     — own activity summary
-  - GET  /api/dashboard/admin  — platform-wide stats (admin only)
+NEW IN v9:
+  ── Google OAuth ──────────────────────────────────────────────────────────────
+  - POST /api/auth/google         — sign in / sign up with Google ID token
+  - PATCH /api/auth/profile       — update profession, bio, interests, avatar
+  - GET  /api/auth/profile        — get own full profile
 
-IMAGE SUPPORT (v7.1):
-  - Images folder served as static files at /images/...
-  - POST /api/images/upload — upload new image (mod/admin)
-  - POST /api/explainers/seed and /api/research/seed now store image URLs
-  - All GET /api/explainers and /api/research/articles responses include "image"
+  ── Newsletter & Mailer (merged from mailer repo) ────────────────────────────
+  - GET  /api/newsletter/recipients   — all subscribed emails (admin)
+  - POST /api/newsletter/subscribe    — subscribe email (public)
+  - POST /api/newsletter/unsubscribe  — unsubscribe (public)
+  - POST /api/newsletter/send-daily   — send digest to all subscribers (admin)
+  - GET  /api/newsletter/preview      — preview digest HTML (admin)
+  - POST /api/newsletter/test         — send test email (admin)
+  - POST /api/newsletter/ai-subscribe — AI agent subscription endpoint (public)
+
+  ── Public AI Context ─────────────────────────────────────────────────────────
+  - GET  /api/public/ai-context   — JSON prompt for AI agents visiting the site
+  - GET  /api/public/ai-context.txt — plain-text version for AI crawlers
+  - GET  /api/public/site-info    — basic site metadata
+  - GET  /.well-known/ai-plugin.json — AI plugin manifest
+
+DAILY NEWSLETTER SETUP:
+  1. Add SMTP env vars to .env (see routers/newsletter.py for full list).
+  2. Set up a daily cron job (or GitHub Actions scheduled workflow):
+       0 9 * * * curl -X POST https://your-api.com/api/newsletter/send-daily \\
+         -H "Authorization: Bearer <admin_token>"
+  3. All subscribed users (from newsletter_subscribers collection AND users
+     with subscribed_newsletter=True) will receive the digest.
+
+GOOGLE AUTH SETUP:
+  1. Go to Google Cloud Console → APIs & Services → Credentials.
+  2. Create an OAuth 2.0 Client ID (Web application).
+  3. Add your domain to Authorized JavaScript origins.
+  4. On the frontend, use Google Sign-In SDK to get an id_token.
+  5. POST the id_token to /api/auth/google.
+  No extra env vars needed — token verification uses Google's public endpoint.
+
+ENV VARS (.env):
+  MONGO_URI         — MongoDB Atlas connection string
+  JWT_SECRET        — secret for signing JWTs
+  GEMINI_API_KEY    — Gemini AI API key
+  SMTP_HOST         — e.g. smtp.gmail.com
+  SMTP_PORT         — e.g. 587
+  SMTP_USER         — sender email
+  SMTP_PASSWORD     — app password
+  SMTP_FROM_NAME    — e.g. "STEAMI Newsletter"
+  SITE_URL          — e.g. https://steami.com   ← update when domain is decided
+  SITE_NAME         — e.g. STEAMI
 
 DUMMY ACCOUNTS (auto-created on startup):
   admin@steami.dev / Admin@steami123  (admin)
   mod@steami.dev   / Mod@steami123    (mod)
   user@steami.dev  / User@steami123   (user)
-
-ROUTE PROTECTION:
-  Public:       GET articles, GET explainers, GET research, GET feed/items
-  Any auth:     insights, chat, diary, dashboard events, for-me feed
-  mod/admin:    article fetch, article write, explainer/research writes, image upload
-  admin only:   user mgmt, seed, delete explainers/research
 """
 
 import os
@@ -44,7 +68,8 @@ from datetime import datetime, timezone, timedelta
 
 from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles          # ← NEW
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -52,7 +77,7 @@ load_dotenv()
 
 # ── Core modules ───────────────────────────────────────────────────────────
 from mongodb_client import db
-from ollama_agent import generate_ai_insight   # Gemma 4 via Ollama Cloud
+from ollama_agent import generate_ai_insight
 from article_fetcher import (
     fetch_articles_from_source,
     fetch_articles_from_url,
@@ -62,14 +87,20 @@ from article_fetcher import (
     ALL_DOMAINS,
 )
 
+# ── DDoS protection ───────────────────────────────────────────────────────
+from ddos_protection import add_ddos_protection
+
 # ── Auth dependency helpers ────────────────────────────────────────────────
 from auth import require_auth, require_mod, require_admin, get_uid
 
 # ── Routers ────────────────────────────────────────────────────────────────
 from routers import chat, feed, content
-from routers.auth_router  import router as auth_router, seed_dummy_accounts
-from routers.diary        import router as diary_router
-from routers.dashboard    import router as dashboard_router
+from routers.auth_router   import router as auth_router, seed_dummy_accounts
+from routers.diary         import router as diary_router
+from routers.dashboard     import router as dashboard_router
+from routers.google_auth   import router as google_auth_router   # ← NEW v9
+from routers.newsletter    import router as newsletter_router    # ← NEW v9
+from routers.public_ai     import router as public_ai_router     # ← NEW v9
 
 # ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -79,11 +110,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Article expiry period — articles older than this are deleted on refresh
-EXPIRY_DAYS = 25   # changed from 30 to 25
-
-# Root folder for uploaded / seeded images (must exist at server root)
-IMAGES_DIR = "images"
+EXPIRY_DAYS = 25
+IMAGES_DIR  = "images"
+SITE_NAME   = os.getenv("SITE_NAME", "STEAMI")
+SITE_URL    = os.getenv("SITE_URL",  "https://steami.com")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -92,21 +122,25 @@ IMAGES_DIR = "images"
 
 app = FastAPI(
     title       = "STEAMI API",
-    version     = "8.0.0",
+    version     = "9.0.0",
     description = (
-        "STEAMI Backend — articles, insights, chat, feed, explainers, diary, dashboard.\n\n"
+        "STEAMI Backend — articles, insights, chat, feed, explainers, diary, dashboard, "
+        "newsletter, Google auth.\n\n"
         "**Test Accounts (POST /api/auth/login):**\n"
         "- Admin: `admin@steami.dev` / `Admin@steami123`\n"
         "- Mod:   `mod@steami.dev`   / `Mod@steami123`\n"
         "- User:  `user@steami.dev`  / `User@steami123`\n\n"
         "Paste the `token` value into **Authorize → Bearer <token>** above.\n\n"
-        "**Images** are served from `/images/research/` and `/images/explainers/`.\n"
-        "Upload new images via `POST /api/images/upload` (mod/admin)."
+        "**Google Auth:** POST /api/auth/google with `{\"id_token\": \"<google-id-token>\"}`\n\n"
+        "**Newsletter:** POST /api/newsletter/send-daily to send the daily digest.\n\n"
+        "**AI Agents:** GET /api/public/ai-context for full context, "
+        "POST /api/newsletter/ai-subscribe to subscribe users.\n\n"
+        "**Security:** DDoS protection active. Admin can manage bans at `GET /api/security/stats`."
     ),
     swagger_ui_parameters = {"persistAuthorization": True},
 )
 
-# ── CORS — allow all origins, handles OPTIONS automatically ────────────────
+# ── CORS ─────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins     = ["*"],
@@ -115,42 +149,94 @@ app.add_middleware(
     allow_headers     = ["*"],
 )
 
-# ── Static file serving for images ────────────────────────────────────────
-# Creates the images directory if it doesn't exist, then mounts it.
-# After this, http://host:5000/images/research/physics.jpg works directly.
+# ── DDoS protection ───────────────────────────────────────────────────────
+add_ddos_protection(app)
+
+# ── Static files ──────────────────────────────────────────────────────────
 os.makedirs(os.path.join(IMAGES_DIR, "research"),   exist_ok=True)
 os.makedirs(os.path.join(IMAGES_DIR, "explainers"), exist_ok=True)
-app.mount("/images", StaticFiles(directory=IMAGES_DIR), name="images")  # ← NEW
+app.mount("/images", StaticFiles(directory=IMAGES_DIR), name="images")
 
 
-# ── Startup ────────────────────────────────────────────────────────────────
+# ── Startup ───────────────────────────────────────────────────────────────
 @app.on_event("startup")
 def on_startup():
-    """
-    Runs once on server start.
-    Seeds the 3 dummy accounts into Firestore if they don't already exist.
-    """
-    log.info("=== STEAMI v8.0 starting ===")
+    log.info("=== STEAMI v9 starting ===")
     result = seed_dummy_accounts()
     log.info("Accounts seeded=%s skipped=%s", result["created"], result["skipped"])
 
 
-# ── Routers ────────────────────────────────────────────────────────────────
-app.include_router(auth_router,      prefix="/api/auth",      tags=["Auth"])  # includes /newsletter/recipients
-app.include_router(chat.router,      prefix="/api/chat",      tags=["Chat"])
-app.include_router(feed.router,      prefix="/api/feed",      tags=["Feed"])
-app.include_router(content.router,   prefix="/api",           tags=["Content"])
-app.include_router(diary_router,     prefix="/api/diary",     tags=["Diary"])
-app.include_router(dashboard_router, prefix="/api/dashboard", tags=["Dashboard"])
+# ── Routers ───────────────────────────────────────────────────────────────
+app.include_router(auth_router,         prefix="/api/auth",        tags=["Auth"])
+app.include_router(google_auth_router,  prefix="/api/auth",        tags=["Auth"])      # ← NEW
+app.include_router(newsletter_router,   prefix="/api/newsletter",  tags=["Newsletter"]) # ← NEW
+app.include_router(public_ai_router,    prefix="/api/public",      tags=["Public"])    # ← NEW
+app.include_router(chat.router,         prefix="/api/chat",        tags=["Chat"])
+app.include_router(feed.router,         prefix="/api/feed",        tags=["Feed"])
+app.include_router(content.router,      prefix="/api",             tags=["Content"])
+app.include_router(diary_router,        prefix="/api/diary",       tags=["Diary"])
+app.include_router(dashboard_router,    prefix="/api/dashboard",   tags=["Dashboard"])
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WELL-KNOWN — AI Plugin Manifest
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get(
+    "/.well-known/ai-plugin.json",
+    include_in_schema=False,   # not shown in Swagger — for AI crawlers only
+)
+def ai_plugin_manifest():
+    """
+    AI plugin manifest — consumed by AI assistants (ChatGPT plugins, etc.)
+    that discover STEAMI and want to understand what it offers.
+    """
+    return JSONResponse({
+        "schema_version":     "v1",
+        "name_for_human":     SITE_NAME,
+        "name_for_model":     "steami",
+        "description_for_human": (
+            f"{SITE_NAME} — AI-powered STEM articles, insights, explainers, and "
+            "a daily newsletter for students, researchers, and professionals."
+        ),
+        "description_for_model": (
+            f"{SITE_NAME} is an AI-powered STEM knowledge platform. "
+            "You can help users subscribe to the newsletter, discover articles, "
+            "and understand AI-generated insights. "
+            f"Full context: {SITE_URL}/api/public/ai-context"
+        ),
+        "auth":         {"type": "none"},
+        "api": {
+            "type":       "openapi",
+            "url":        f"{SITE_URL}/openapi.json",
+            "is_user_authenticated": False,
+        },
+        "logo_url":         f"{SITE_URL}/logo.png",
+        "contact_email":    f"admin@steami.dev",
+        "legal_info_url":   f"{SITE_URL}/terms",
+    })
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLAIN-TEXT AI CONTEXT (served at root level for easy discovery)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/ai-context.txt", include_in_schema=False)
+def ai_context_txt_root():
+    """Redirect to the public_ai router's plain-text endpoint."""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/api/public/ai-context.txt")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _now() -> str:
-    """Current UTC time as ISO 8601 string."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def _parse_dt(ts: str | None) -> datetime | None:
-    """Parse an ISO timestamp string to a timezone-aware datetime. Returns None on failure."""
     if not ts:
         return None
     try:
@@ -168,7 +254,7 @@ def _parse_dt(ts: str | None) -> datetime | None:
 
 @app.get("/health", tags=["Health"], summary="Health check — public")
 def health():
-    return {"status": "ok", "version": "8.0.0", "ts": _now()}
+    return {"status": "ok", "version": "9.0.0", "ts": _now()}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -177,7 +263,6 @@ def health():
 
 @app.get("/api/sources", tags=["Articles"], summary="List RSS sources — public")
 def list_sources():
-    """Public: list all RSS sources used for article fetching."""
     return {"sources": get_rss_sources()}
 
 
@@ -186,47 +271,42 @@ def list_sources():
 # ══════════════════════════════════════════════════════════════════════════════
 
 class FetchArticlesBody(BaseModel):
-    """Body for POST /api/articles/fetch"""
     topic:    str       = "technology"
     keywords: list[str] = []
     limit:    int       = 20
 
-
 class FetchSourceBody(BaseModel):
-    """Body for POST /api/articles/fetch-source"""
     url:   str
     limit: int = 20
 
-
 class CreateArticleBody(BaseModel):
-    """Body for POST /api/articles"""
     title:   str
     content: str
     url:     str = ""
     source:  str = "manual"
     topic:   str = "general"
 
-
 class RefreshBody(BaseModel):
-    """Body for POST /api/articles/refresh"""
-    domains: list[str] = []   # subset of ALL_DOMAINS — empty means all 10
-    target:  int        = 30  # target number of articles to fetch
-
+    domains: list[str] = []
+    target:  int        = 30
 
 class PipelineBody(BaseModel):
-    """Body for POST /api/pipeline"""
     topic:    str       = "technology"
     keywords: list[str] = []
     limit:    int       = 3
 
-# NOTE: The remainder of main.py (all the article/insight/pipeline routes)
-# is unchanged from v7. Paste your existing route handlers below this line.
-# Only the top section above needed updating for image support.
+class ProcessBody(BaseModel):
+    batch_size: int = 2
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# ARTICLES — REFRESH  (expire old, fetch new by domain topics)
-# Requires: mod | admin
+# ALL REMAINING ROUTES ARE UNCHANGED FROM v8
+# (article refresh, fetch, CRUD, insights, pipeline, queue)
+# Paste your existing route handlers below this line unchanged.
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── paste all your existing @app.post / @app.get / @app.delete route
+#    handlers from v8 here — nothing changes in them ──────────────────────
 @app.post(
     "/api/articles/refresh",
     status_code = 201,

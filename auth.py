@@ -1,6 +1,6 @@
 """
-auth.py — Authentication utilities for STEAMI API
-====================================================
+auth.py — Authentication utilities for STEAMI API  (v9)
+=========================================================
 Implements:
   - Password hashing using PBKDF2-HMAC-SHA256 (stdlib hashlib — no bcrypt needed)
   - JWT creation and verification using HMAC-SHA256 (stdlib hmac — no python-jose needed)
@@ -185,6 +185,11 @@ def create_token(user_id: str, role: str) -> str:
     return f"{header}.{payload}.{signature}"
 
 
+# Alias used by routers/google_auth.py (and any future router that needs to
+# issue a token without knowing STEAMI's internal function name).
+create_jwt = create_token
+
+
 def decode_token(token: str) -> dict:
     """
     Decode and verify a JWT token.
@@ -319,5 +324,18 @@ def require_admin(payload: dict = Depends(require_auth)) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_uid(payload: dict) -> str:
-    """Extract the user ID from a decoded token payload."""
-    return payload.get("sub", "")
+    """
+    Extract the user ID from a decoded token payload.
+    Checks both 'sub' (standard JWT) and 'uid' (legacy field) for compatibility.
+    """
+    return payload.get("sub") or payload.get("uid", "")
+
+
+def is_admin(payload: dict) -> bool:
+    """Return True if the payload belongs to an admin user."""
+    return payload.get("role") == "admin"
+
+
+def is_mod_or_admin(payload: dict) -> bool:
+    """Return True if the payload belongs to a mod or admin user."""
+    return payload.get("role") in ("mod", "admin")
