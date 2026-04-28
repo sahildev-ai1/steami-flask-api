@@ -1,16 +1,47 @@
 """
-STEAMI FastAPI  v9 — MongoDB Atlas backend
+STEAMI FastAPI  v11 — MongoDB Atlas backend
 ==========================================
 Run:   uvicorn main:app --host 0.0.0.0 --port 5000 --reload
 Docs:  http://127.0.0.1:5000/docs
 
-NEW IN v9:
+CHANGES IN v11:
+  ── Blog Posts ────────────────────────────────────────────────────────────────
+  - POST /api/blog/seed              — bulk seed from content_data.py (admin)
+  - POST /api/blog                   — create post (mod/admin)
+  - GET  /api/blog                   — list posts; filter by ?field= ?type= ?tag=
+  - GET  /api/blog/{id}              — get one post (public)
+  - PUT  /api/blog/{id}              — update any fields (mod/admin)
+  - DELETE /api/blog/{id}            — delete + remove cover image from disk (admin)
+  - POST /api/blog/{id}/cover-image  — upload/replace cover image (mod/admin)
+
+  ── CMS Edit Helpers (mod/admin) ─────────────────────────────────────────────
+  - GET /api/cms/explainers          — slim list for management table
+  - GET /api/cms/explainers/{id}     — full doc pre-populated for edit form
+  - GET /api/cms/research            — slim list for management table
+  - GET /api/cms/research/{id}       — full doc pre-populated for edit form
+  - GET /api/cms/blog                — slim list for management table
+  - GET /api/cms/blog/{id}           — full doc pre-populated for edit form
+
+  ── Explainer / Research Enhancements ────────────────────────────────────────
+  - Explainers now include: author, context, technicalDetail, impact fields
+  - Image upload/replace automatically deletes the OLD image file from disk
+  - Document delete (explainer/research/blog) also deletes image from disk
+  - Research article delete: only removes image file if no sibling in same
+    field still references it (field-shared images are safe)
+  - images/blog/ folder auto-created on startup
+
+  ── Swagger UI Fix ────────────────────────────────────────────────────────────
+  - content.router now registered WITHOUT a top-level tags= override so that
+    each route's own tags= kwarg is respected → Blog, CMS, Explainers, Research,
+    Images all appear as separate groups in Swagger UI
+
+CHANGES IN v10:
   ── Google OAuth ──────────────────────────────────────────────────────────────
   - POST /api/auth/google         — sign in / sign up with Google ID token
   - PATCH /api/auth/profile       — update profession, bio, interests, avatar
   - GET  /api/auth/profile        — get own full profile
 
-  ── Newsletter & Mailer (merged from mailer repo) ────────────────────────────
+  ── Newsletter & Mailer ───────────────────────────────────────────────────────
   - GET  /api/newsletter/recipients   — all subscribed emails (admin)
   - POST /api/newsletter/subscribe    — subscribe email (public)
   - POST /api/newsletter/unsubscribe  — unsubscribe (public)
@@ -18,38 +49,53 @@ NEW IN v9:
   - GET  /api/newsletter/preview      — preview digest HTML (admin)
   - POST /api/newsletter/test         — send test email (admin)
   - POST /api/newsletter/ai-subscribe — AI agent subscription endpoint (public)
+  - Signup auto-subscribes every new user via POST /api/newsletter/subscribe.
 
   ── Public AI Context ─────────────────────────────────────────────────────────
-  - GET  /api/public/ai-context   — JSON prompt for AI agents visiting the site
-  - GET  /api/public/ai-context.txt — plain-text version for AI crawlers
-  - GET  /api/public/site-info    — basic site metadata
+  - GET  /api/public/ai-context      — JSON prompt for AI agents
+  - GET  /api/public/ai-context.txt  — plain-text version for AI crawlers
+  - GET  /api/public/site-info       — basic site metadata
   - GET  /.well-known/ai-plugin.json — AI plugin manifest
 
+  ── Article Fetch ─────────────────────────────────────────────────────────────
+  - POST /api/articles/refresh  MOD/ADMIN only.
+  - Can select specific domains or leave empty for all 10.
+  - Max 40 articles per fetch. ScienceDaily added as 4th primary source.
+  - After fetch, AI insights auto-generated in background (2-3 min gap each).
+
+  ── AI Insight Generation ─────────────────────────────────────────────────────
+  - Insights generated AUTOMATICALLY in background thread after refresh.
+  - Users cannot trigger insight generation — mod/admin only via process endpoint.
+  - GET /api/articles/insights/status (public) shows real-time progress.
+
+  ── Feed ──────────────────────────────────────────────────────────────────────
+  - Max 4 articles per feed selection.
+  - Feed insights auto-generated in background thread (2-3 min gap each).
+  - POST /api/feed/items/{id}/insight requires mod/admin only.
+
 DAILY NEWSLETTER SETUP:
-  1. Add BREVO_API_KEY, BREVO_SENDER_EMAIL, BREVO_SENDER_NAME to .env (see routers/newsletter.py).
-  2. Set up a daily cron job (or GitHub Actions scheduled workflow):
+  1. Add BREVO_API_KEY, BREVO_SENDER_EMAIL, BREVO_SENDER_NAME to .env.
+  2. Set up a daily cron job:
        0 9 * * * curl -X POST https://your-api.com/api/newsletter/send-daily \\
          -H "Authorization: Bearer <admin_token>"
-  3. All subscribed users (from newsletter_subscribers collection AND users
-     with subscribed_newsletter=True) will receive the digest.
 
 GOOGLE AUTH SETUP:
-  1. Go to Google Cloud Console → APIs & Services → Credentials.
+  1. Go to Google Cloud Console -> APIs & Services -> Credentials.
   2. Create an OAuth 2.0 Client ID (Web application).
   3. Add your domain to Authorized JavaScript origins.
   4. On the frontend, use Google Sign-In SDK to get an id_token.
   5. POST the id_token to /api/auth/google.
-  No extra env vars needed — token verification uses Google's public endpoint.
 
 ENV VARS (.env):
-  MONGO_URI         — MongoDB Atlas connection string
-  JWT_SECRET        — secret for signing JWTs
-  GEMINI_API_KEY    — Gemini AI API key
-  BREVO_API_KEY     — from https://app.brevo.com → Settings → SMTP & API → API Keys
+  MONGO_URI          — MongoDB Atlas connection string
+  JWT_SECRET         — secret for signing JWTs
+  OLLAMA_BASE_URL    — Ollama server base URL
+  BREVO_API_KEY      — from https://app.brevo.com
   BREVO_SENDER_EMAIL — verified sender email, e.g. hello@steami.com
   BREVO_SENDER_NAME  — display name, e.g. "STEAMI Newsletter"
-  SITE_URL          — e.g. https://steami.com   ← update when domain is decided
-  SITE_NAME         — e.g. STEAMI
+  SITE_URL           — e.g. https://steami.com
+  SITE_NAME          — e.g. STEAMI
+  API_BASE_URL       — internal base URL (default http://127.0.0.1:5000)
 
 DUMMY ACCOUNTS (auto-created on startup):
   admin@steami.dev / Admin@steami123  (admin)
@@ -60,6 +106,7 @@ DUMMY ACCOUNTS (auto-created on startup):
 import os
 import uuid
 import time
+import random
 import threading
 import logging
 from datetime import datetime, timezone, timedelta
@@ -83,9 +130,10 @@ from article_fetcher import (
     get_rss_sources,
     DOMAIN_KEYWORDS,
     ALL_DOMAINS,
+    MAX_FETCH_LIMIT,
 )
 
-# ── DDoS protection ───────────────────────────────────────────────────────
+# ── DDoS protection ────────────────────────────────────────────────────────
 from ddos_protection import add_ddos_protection
 
 # ── Auth dependency helpers ────────────────────────────────────────────────
@@ -96,9 +144,9 @@ from routers import chat, feed, content
 from routers.auth_router   import router as auth_router, seed_dummy_accounts
 from routers.diary         import router as diary_router
 from routers.dashboard     import router as dashboard_router
-from routers.google_auth   import router as google_auth_router   # ← NEW v9
-from routers.newsletter    import router as newsletter_router    # ← NEW v9
-from routers.public_ai     import router as public_ai_router     # ← NEW v9
+from routers.google_auth   import router as google_auth_router
+from routers.newsletter    import router as newsletter_router
+from routers.public_ai     import router as public_ai_router
 
 # ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -112,6 +160,10 @@ EXPIRY_DAYS = 25
 SITE_NAME   = os.getenv("SITE_NAME", "STEAMI")
 SITE_URL    = os.getenv("SITE_URL",  "https://steami.com")
 
+# Delay between background insight generations (seconds)
+INSIGHT_DELAY_MIN = 120   # 2 minutes
+INSIGHT_DELAY_MAX = 180   # 3 minutes
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # APP
@@ -119,17 +171,22 @@ SITE_URL    = os.getenv("SITE_URL",  "https://steami.com")
 
 app = FastAPI(
     title       = "STEAMI API",
-    version     = "9.0.0",
+    version     = "11.0.0",
     description = (
-        "STEAMI Backend — articles, insights, chat, feed, explainers, diary, dashboard, "
-        "newsletter, Google auth.\n\n"
+        "STEAMI Backend — articles, insights, chat, feed, explainers, research, blog, diary, dashboard, "
+        "newsletter, Google auth, CMS.\n\n"
         "**Test Accounts (POST /api/auth/login):**\n"
         "- Admin: `admin@steami.dev` / `Admin@steami123`\n"
         "- Mod:   `mod@steami.dev`   / `Mod@steami123`\n"
         "- User:  `user@steami.dev`  / `User@steami123`\n\n"
-        "Paste the `token` value into **Authorize → Bearer <token>** above.\n\n"
+        "Paste the `token` value into **Authorize -> Bearer <token>** above.\n\n"
         "**Google Auth:** POST /api/auth/google with `{\"id_token\": \"<google-id-token>\"}`\n\n"
         "**Newsletter:** POST /api/newsletter/send-daily to send the daily digest.\n\n"
+        "**Article Fetch:** Mod/admin only. After fetch, AI insights are generated "
+        "automatically in the background (2-3 min gap between each).\n\n"
+        "**Feed:** Text-selection feed is public. Feed insights auto-generate in background.\n\n"
+        "**Blog:** Full CRUD at `/api/blog` — seed via POST /api/blog/seed (admin).\n\n"
+        "**CMS:** GET /api/cms/explainers|research|blog for edit-form-ready docs (mod/admin).\n\n"
         "**AI Agents:** GET /api/public/ai-context for full context, "
         "POST /api/newsletter/ai-subscribe to subscribe users.\n\n"
         "**Security:** DDoS protection active. Admin can manage bans at `GET /api/security/stats`."
@@ -137,7 +194,7 @@ app = FastAPI(
     swagger_ui_parameters = {"persistAuthorization": True},
 )
 
-# ── CORS ─────────────────────────────────────────────────────────────────
+# ── CORS ──────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins     = ["*"],
@@ -146,51 +203,53 @@ app.add_middleware(
     allow_headers     = ["*"],
 )
 
-# ── DDoS protection ───────────────────────────────────────────────────────
+# ── DDoS protection ────────────────────────────────────────────────────────
 add_ddos_protection(app)
 
-# ── Static files ──────────────────────────────────────────────────────────
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-IMAGES_DIR  = os.path.join(BASE_DIR, "images")
+# ── Static files ───────────────────────────────────────────────────────────
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+IMAGES_DIR = os.path.join(BASE_DIR, "images")
 
 os.makedirs(os.path.join(IMAGES_DIR, "research"),   exist_ok=True)
 os.makedirs(os.path.join(IMAGES_DIR, "explainers"), exist_ok=True)
+os.makedirs(os.path.join(IMAGES_DIR, "blog"),       exist_ok=True)
 app.mount("/images", StaticFiles(directory=IMAGES_DIR), name="images")
 
 
-# ── Startup ───────────────────────────────────────────────────────────────
+# ── Startup ────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 def on_startup():
-    log.info("=== STEAMI v9 starting ===")
+    log.info("=== STEAMI v11 starting ===")
     result = seed_dummy_accounts()
     log.info("Accounts seeded=%s skipped=%s", result["created"], result["skipped"])
 
 
-# ── Routers ───────────────────────────────────────────────────────────────
+# ── Routers ────────────────────────────────────────────────────────────────
 app.include_router(auth_router,         prefix="/api/auth",        tags=["Auth"])
-app.include_router(google_auth_router,  prefix="/api/auth",        tags=["Auth"])      # ← NEW
-app.include_router(newsletter_router,   prefix="/api/newsletter",  tags=["Newsletter"]) # ← NEW
-app.include_router(public_ai_router,    prefix="/api/public",      tags=["Public"])    # ← NEW
+app.include_router(google_auth_router,  prefix="/api/auth",        tags=["Auth"])
+app.include_router(newsletter_router,   prefix="/api/newsletter",  tags=["Newsletter"])
+app.include_router(public_ai_router,    prefix="/api/public",      tags=["Public"])
 app.include_router(chat.router,         prefix="/api/chat",        tags=["Chat"])
 app.include_router(feed.router,         prefix="/api/feed",        tags=["Feed"])
-app.include_router(content.router,      prefix="/api",             tags=["Content"])
 app.include_router(diary_router,        prefix="/api/diary",       tags=["Diary"])
 app.include_router(dashboard_router,    prefix="/api/dashboard",   tags=["Dashboard"])
+
+# content.router handles multiple tag groups — registered without a top-level tag
+# so each route's own tags= kwarg controls the Swagger UI grouping:
+#   Explainers  → /api/explainers/*
+#   Research    → /api/research/*
+#   Blog        → /api/blog/*
+#   CMS         → /api/cms/*
+#   Images      → /api/images/*
+app.include_router(content.router, prefix="/api")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # WELL-KNOWN — AI Plugin Manifest
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.get(
-    "/.well-known/ai-plugin.json",
-    include_in_schema=False,   # not shown in Swagger — for AI crawlers only
-)
+@app.get("/.well-known/ai-plugin.json", include_in_schema=False)
 def ai_plugin_manifest():
-    """
-    AI plugin manifest — consumed by AI assistants (ChatGPT plugins, etc.)
-    that discover STEAMI and want to understand what it offers.
-    """
     return JSONResponse({
         "schema_version":     "v1",
         "name_for_human":     SITE_NAME,
@@ -205,25 +264,20 @@ def ai_plugin_manifest():
             "and understand AI-generated insights. "
             f"Full context: {SITE_URL}/api/public/ai-context"
         ),
-        "auth":         {"type": "none"},
+        "auth":  {"type": "none"},
         "api": {
-            "type":       "openapi",
-            "url":        f"{SITE_URL}/openapi.json",
+            "type":                  "openapi",
+            "url":                   f"{SITE_URL}/openapi.json",
             "is_user_authenticated": False,
         },
-        "logo_url":         f"{SITE_URL}/logo.png",
-        "contact_email":    f"admin@steami.dev",
-        "legal_info_url":   f"{SITE_URL}/terms",
+        "logo_url":       f"{SITE_URL}/logo.png",
+        "contact_email":  "admin@steami.dev",
+        "legal_info_url": f"{SITE_URL}/terms",
     })
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PLAIN-TEXT AI CONTEXT (served at root level for easy discovery)
-# ══════════════════════════════════════════════════════════════════════════════
-
 @app.get("/ai-context.txt", include_in_schema=False)
 def ai_context_txt_root():
-    """Redirect to the public_ai router's plain-text endpoint."""
     from fastapi.responses import RedirectResponse
     return RedirectResponse(url="/api/public/ai-context.txt")
 
@@ -236,11 +290,11 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _parse_dt(ts: str | None) -> datetime | None:
+def _parse_dt(ts) -> datetime | None:
     if not ts:
         return None
     try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
@@ -249,16 +303,142 @@ def _parse_dt(ts: str | None) -> datetime | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HEALTH — PUBLIC
+# BACKGROUND INSIGHT GENERATOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Global flag — only one insight-generation thread at a time
+_insight_thread_running = False
+_insight_thread_lock    = threading.Lock()
+
+
+def _generate_insights_background(article_ids: list, source_table: str = "articles") -> None:
+    """
+    Background thread: generate AI insights one by one with a 2-3 minute sleep
+    between each to avoid Ollama 120-second timeouts.
+    Each insight is saved immediately so the frontend can show real-time progress.
+    """
+    global _insight_thread_running
+
+    log.info("insight_bg: starting for %d articles (table=%s)", len(article_ids), source_table)
+
+    for i, article_id in enumerate(article_ids):
+        delay = random.randint(INSIGHT_DELAY_MIN, INSIGHT_DELAY_MAX) if i > 0 else 5
+        log.info("insight_bg: waiting %ds before article %d/%d id=%s",
+                 delay, i + 1, len(article_ids), article_id)
+        time.sleep(delay)
+
+        # Load article
+        try:
+            art_doc = db.collection(source_table).document(article_id).get()
+            if not art_doc.exists:
+                log.warning("insight_bg: %s not found in %s", article_id, source_table)
+                _queue_mark(article_id, "failed", "Article not found")
+                continue
+            article = art_doc.to_dict()
+        except Exception as e:
+            log.error("insight_bg: load error %s: %s", article_id, e)
+            _queue_mark(article_id, "failed", str(e))
+            continue
+
+        # Skip if already has insight
+        if article.get("has_insight"):
+            log.info("insight_bg: skip %s (already has insight)", article_id)
+            _queue_mark(article_id, "done", "")
+            continue
+
+        # Generate
+        try:
+            log.info("insight_bg: generating %d/%d — %s",
+                     i + 1, len(article_ids), article.get("title", "")[:60])
+            insight = generate_ai_insight(article)
+        except Exception as e:
+            log.error("insight_bg: generate failed %s: %s", article_id, e)
+            _queue_mark(article_id, "pending", str(e))
+            continue
+
+        # Persist to article doc
+        try:
+            db.collection(source_table).document(article_id).update({
+                "ai_insight":           insight,
+                "has_insight":          True,
+                "insight_generated_at": _now(),
+            })
+        except Exception as e:
+            log.error("insight_bg: article update failed %s: %s", article_id, e)
+
+        # Persist to shared ai_insights collection
+        try:
+            db.collection("ai_insights").document(article_id).set({
+                "article_id":      article_id,
+                "source_table":    source_table,
+                "title":           article.get("title", ""),
+                "topic":           article.get("topic", ""),
+                "source":          article.get("source", ""),
+                "matched_domains": article.get("matched_domains", []),
+                "article_url":     article.get("article_url") or article.get("url", ""),
+                "ai_insight":      insight,
+                "created_at":      _now(),
+            })
+        except Exception as e:
+            log.error("insight_bg: ai_insights save failed %s: %s", article_id, e)
+
+        _queue_mark(article_id, "done", "")
+        log.info("insight_bg: done %s domain=%s", article_id, insight.get("domain", "?"))
+
+    with _insight_thread_lock:
+        global _insight_thread_running
+        _insight_thread_running = False
+
+    log.info("insight_bg: thread finished — processed %d articles", len(article_ids))
+
+
+def _queue_mark(article_id: str, status: str, error: str) -> None:
+    """Update insight_queue status — non-fatal on error."""
+    try:
+        updates = {"status": status}
+        if status == "done":
+            updates["completed_at"] = _now()
+            updates["last_error"]   = ""
+        elif error:
+            updates["last_error"] = error[:500]
+        db.collection("insight_queue").document(article_id).update(updates)
+    except Exception:
+        pass
+
+
+def _start_insight_thread(article_ids: list, source_table: str = "articles") -> bool:
+    """
+    Start background insight thread if none is running.
+    Returns True if thread started, False if already running.
+    """
+    global _insight_thread_running
+    with _insight_thread_lock:
+        if _insight_thread_running:
+            log.info("_start_insight_thread: already running — skipping")
+            return False
+        _insight_thread_running = True
+
+    t = threading.Thread(
+        target=_generate_insights_background,
+        args=(article_ids, source_table),
+        daemon=True,
+        name="insight-generator",
+    )
+    t.start()
+    return True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/health", tags=["Health"], summary="Health check — public")
 def health():
-    return {"status": "ok", "version": "9.0.0", "ts": _now()}
+    return {"status": "ok", "version": "11.0.0", "ts": _now()}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SOURCES — PUBLIC
+# SOURCES
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/sources", tags=["Articles"], summary="List RSS sources — public")
@@ -272,7 +452,7 @@ def list_sources():
 
 class FetchArticlesBody(BaseModel):
     topic:    str       = "technology"
-    keywords: list[str] = []
+    keywords: list      = []
     limit:    int       = 20
 
 class FetchSourceBody(BaseModel):
@@ -287,132 +467,97 @@ class CreateArticleBody(BaseModel):
     topic:   str = "general"
 
 class RefreshBody(BaseModel):
-    domains: list[str] = []
-    target:  int        = 30
+    """
+    Body for POST /api/articles/refresh (MOD/ADMIN).
+    domains: list of domain names to include (empty = all 10).
+    target:  how many articles to fetch (max 40, default 40).
+    """
+    domains: list = []
+    target:  int  = MAX_FETCH_LIMIT
 
 class PipelineBody(BaseModel):
-    topic:    str       = "technology"
-    keywords: list[str] = []
-    limit:    int       = 3
+    topic:    str  = "technology"
+    keywords: list = []
+    limit:    int  = 3
 
 class ProcessBody(BaseModel):
     batch_size: int = 2
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ALL REMAINING ROUTES ARE UNCHANGED FROM v8
-# (article refresh, fetch, CRUD, insights, pipeline, queue)
-# Paste your existing route handlers below this line unchanged.
+# ARTICLES — REFRESH  (MOD/ADMIN)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── paste all your existing @app.post / @app.get / @app.delete route
-#    handlers from v8 here — nothing changes in them ──────────────────────
 @app.post(
     "/api/articles/refresh",
     status_code = 201,
     tags        = ["Articles"],
-    summary     = "Refresh articles: expire old (>25d) + fetch new by topics — requires mod/admin",
+    summary     = "Fetch up to 40 articles by domain — MOD/ADMIN. Auto-generates insights in background.",
 )
 def refresh_articles(
     body:    RefreshBody = RefreshBody(),
-    payload: dict        = Depends(require_mod),   # mod or admin only
+    payload: dict        = Depends(require_mod),
 ):
     """
-    POST /api/articles/refresh
+    POST /api/articles/refresh  — MOD/ADMIN
 
-    Does three things in order:
-    1. Loads all articles from Firestore and identifies those older than 25 days.
-    2. Deletes expired articles AND their corresponding ai_insights documents.
-    3. Fetches fresh articles from the 3 primary RSS sources, filtered by the
-       10 canonical STEM topics. Guarantees at least 3 articles per topic.
-       Only saves articles whose URL is not already in the database.
+    Fetches fresh articles from 4 primary RSS sources (MIT Tech Review,
+    BBC Tech, NYTimes Tech, ScienceDaily). Saves only new articles (skips
+    duplicates by URL). Then automatically starts generating AI insights
+    in a background thread with a 2-3 minute pause between each.
 
-    Body (optional):
-    {
-      "domains": ["AI + ROBOTICS", "PHYSICS"],  // omit for all 10 topics
-      "target":  30                              // desired total articles
-    }
+    Body (all optional):
+      { "domains": ["AI + ROBOTICS", "PHYSICS"], "target": 40 }
 
-    Response:
-    {
-      "deleted_articles": 8,    // articles older than 25 days that were removed
-      "deleted_insights":  8,    // their ai_insights also removed
-      "fetched":          28,    // articles pulled from RSS
-      "new_saved":        22,    // articles actually saved (not already present)
-      "skipped":           6,    // already existed in Firestore
-      "articles":        [ ...new saved articles... ]
-    }
-
-    curl -X POST http://127.0.0.1:5000/api/articles/refresh \\
-      -H "Authorization: Bearer <mod_or_admin_token>" \\
-      -H "Content-Type: application/json" \\
-      -d '{"domains":["AI + ROBOTICS","PHYSICS"],"target":30}'
+    Response includes insight_thread=true when background generation starts.
+    Poll GET /api/articles/insights/status to track progress.
     """
-    # Validate domains — empty list means use all 10
     active_domains = [d for d in body.domains if d in DOMAIN_KEYWORDS] or ALL_DOMAINS
+    target         = min(max(1, body.target), MAX_FETCH_LIMIT)
     cutoff         = datetime.now(timezone.utc) - timedelta(days=EXPIRY_DAYS)
 
-    # ── Step 1: Load all existing articles to find expired ones ───────────
+    # Load existing URLs + identify expired articles
     try:
         all_docs = db.collection("articles").stream_all()
     except Exception as e:
         log.error("refresh: failed to load articles: %s", e)
-        raise HTTPException(500, detail=f"Firestore read failed: {e}")
+        raise HTTPException(500, detail=f"DB read failed: {e}")
 
-    existing_urls: set[str]  = set()
-    expired_ids:   list[str] = []
+    existing_urls = set()
+    expired_ids   = []
 
     for doc in all_docs:
-        d = doc.to_dict()
-
-        # Track URLs so we can skip duplicates when saving new articles
+        d   = doc.to_dict()
         url = d.get("article_url") or d.get("url", "")
         if url:
             existing_urls.add(url)
-
-        # Mark expired: older than EXPIRY_DAYS (25 days)
         fetched_at = _parse_dt(d.get("fetched_at"))
         if fetched_at and fetched_at < cutoff:
             expired_ids.append(doc.id)
 
-    log.info(
-        "refresh: total=%d existing, %d expired (>%dd), cutoff=%s",
-        len(all_docs), len(expired_ids), EXPIRY_DAYS, cutoff.date(),
-    )
+    log.info("refresh: total=%d existing, %d expired (deletion disabled)",
+             len(all_docs), len(expired_ids))
 
-    # ── Step 2: Deletion disabled (removed by design) ────────────────────
-    # Articles and insights are NEVER deleted automatically.
-    # expired_ids are identified above but intentionally NOT deleted.
-    # The fetcher will skip duplicate URLs, so old articles stay visible
-    # in the database but new articles with the same URL won't be duplicated.
-    deleted_articles = 0
-    deleted_insights = 0
-    log.info("refresh: found %d articles older than %dd (deletion disabled)",
-             len(expired_ids), EXPIRY_DAYS)
-
-    # ── Step 3: Fetch fresh articles (min 3 per topic) ────────────────────
+    # Fetch from RSS
     try:
         raw = fetch_articles_by_domains(
-            active_domains = active_domains,
-            target_total   = body.target,
+            active_domains=active_domains,
+            target_total=target,
         )
     except Exception as e:
         log.error("refresh: fetch failed: %s", e)
         raise HTTPException(502, detail=f"RSS fetch failed: {e}")
 
-    # ── Step 4: Save only NEW articles (skip URLs already in database) ──────
-    saved:   list[dict] = []
-    skipped: int        = 0
+    # Save only new articles
+    saved   = []
+    skipped = 0
 
     for art in raw:
         art_url = art.get("article_url") or art.get("url", "")
-
-        # Skip if this URL is already in the database
         if art_url and art_url in existing_urls:
             skipped += 1
             continue
 
-        # Prepare the article document
         art.setdefault("id", str(uuid.uuid4()))
         art["fetched_at"]  = _now()
         art["has_insight"] = False
@@ -423,59 +568,63 @@ def refresh_articles(
             if art_url:
                 existing_urls.add(art_url)
         except Exception as e:
-            log.error("refresh: MongoDB save failed for %s: %s", art["id"], e)
+            log.error("refresh: save failed for %s: %s", art.get("id"), e)
 
-    # ── Step 5: Add all newly saved articles to the insight queue ───────────
-    # Instead of generating insights inline (which causes 120s timeouts for
-    # 30 articles), we queue them. The admin calls POST /api/articles/insights/process
-    # every 5 minutes to generate 2 insights per batch — no timeouts.
-    queued = 0
+    # Queue each new article for insight generation
+    queued          = 0
+    ids_to_process  = []
+
     for art in saved:
         try:
-            # Only queue if no insight exists yet
-            existing = db.collection("ai_insights").document(art["id"]).get()
-            if existing.exists:
-                continue  # already has an insight — skip
-
+            existing_insight = db.collection("ai_insights").document(art["id"]).get()
+            if existing_insight.exists:
+                continue
             db.collection("insight_queue").document(art["id"]).set({
-                "article_id":    art["id"],
-                "title":         art.get("title", ""),
+                "article_id":      art["id"],
+                "title":           art.get("title", ""),
                 "matched_domains": art.get("matched_domains", []),
-                "queued_at":     _now(),
-                "status":        "pending",    # pending → processing → done / failed
-                "attempts":      0,
-                "last_error":    "",
+                "queued_at":       _now(),
+                "status":          "pending",
+                "attempts":        0,
+                "last_error":      "",
             })
+            ids_to_process.append(art["id"])
             queued += 1
         except Exception as e:
-            log.error("refresh: failed to queue article %s: %s", art.get("id"), e)
+            log.error("refresh: queue failed for %s: %s", art.get("id"), e)
 
-    # Count total pending items in queue
-    try:
-        all_pending = db.collection("insight_queue").where("status", "==", "pending").stream()
-        queue_total = len(all_pending)
-    except Exception:
-        queue_total = queued
+    # Start background insight thread
+    thread_started = False
+    if ids_to_process:
+        thread_started = _start_insight_thread(ids_to_process, source_table="articles")
+        if not thread_started:
+            log.info("refresh: insight thread already running — %d articles queued",
+                     len(ids_to_process))
 
-    log.info(
-        "refresh done: fetched=%d new_saved=%d skipped=%d queued=%d queue_total=%d",
-        len(raw), len(saved), skipped, queued, queue_total,
-    )
+    log.info("refresh done: fetched=%d new_saved=%d skipped=%d queued=%d thread=%s",
+             len(raw), len(saved), skipped, queued, thread_started)
 
     return {
-        "expired_found": len(expired_ids),
-        "fetched":       len(raw),
-        "new_saved":     len(saved),
-        "skipped":       skipped,
-        "queued":        queued,
-        "queue_total":   queue_total,
-        "articles":      saved,
+        "expired_found":  len(expired_ids),
+        "fetched":        len(raw),
+        "new_saved":      len(saved),
+        "skipped":        skipped,
+        "queued":         queued,
+        "insight_thread": thread_started,
+        "domains_used":   active_domains,
+        "articles":       saved,
+        "message": (
+            f"Fetched {len(saved)} new articles. "
+            "AI insights are being generated in the background — "
+            "check GET /api/articles/insights/status for progress."
+            if saved else
+            "No new articles found (all already in database)."
+        ),
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ARTICLES — FILTERED BY USER INTERESTS
-# Requires: any auth (user | mod | admin)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get(
@@ -485,32 +634,16 @@ def refresh_articles(
 )
 def articles_for_me(
     limit:   int  = Query(30, ge=1, le=200),
-    payload: dict = Depends(require_auth),   # any logged-in user
+    payload: dict = Depends(require_auth),
 ):
     """
     GET /api/articles/for-me?limit=30
-    Returns articles that match the current user's saved topic interests.
-
-    The user's interests are loaded from Firestore (set via POST /api/auth/interests).
-    Articles are filtered where their matched_domains overlap with the user's interests.
-    Ensures at least one article per interest topic if available.
-
-    If the user has no interests saved, returns all recent articles.
-
-    Response:
-    {
-      "uid":       "user-uuid",
-      "interests": ["AI + ROBOTICS", "PHYSICS"],
-      "total":     18,
-      "articles":  [ { id, title, short_summary, image_url, matched_domains, ... }, ... ]
-    }
-
-    curl -H "Authorization: Bearer <token>" http://127.0.0.1:5000/api/articles/for-me
+    Returns articles matching the current user's saved topic interests.
+    If no interests are saved, returns all recent articles.
     """
     uid = get_uid(payload)
 
-    # ── Load user's saved interests ────────────────────────────────────────
-    user_interests: list[str] = []
+    user_interests = []
     try:
         user_doc = db.collection("users").document(uid).get()
         if user_doc.exists:
@@ -518,36 +651,26 @@ def articles_for_me(
     except Exception as e:
         log.warning("articles_for_me: could not load user %s: %s", uid, e)
 
-    # ── Load recent articles from Firestore ───────────────────────────────
     try:
         docs = (
             db.collection("articles")
               .order_by("fetched_at", direction="DESCENDING")
-              .limit(300)   # load a big pool to filter from
-              .stream()
+              .limit(300).stream()
         )
         all_articles = [d.to_dict() for d in docs]
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
-    # ── If no interests set, return recent articles ────────────────────────
     if not user_interests:
-        return {
-            "uid":       uid,
-            "interests": [],
-            "total":     len(all_articles[:limit]),
-            "articles":  all_articles[:limit],
-        }
+        return {"uid": uid, "interests": [],
+                "total": len(all_articles[:limit]), "articles": all_articles[:limit]}
 
     interests_set = set(user_interests)
 
-    # ── Filter articles whose matched_domains overlap with interests ───────
     def _article_matches(art: dict) -> bool:
-        """Check if this article is relevant to the user's interests."""
         matched = set(art.get("matched_domains") or [])
         if matched & interests_set:
             return True
-        # Fallback: scan title + content for interest keywords
         text = (art.get("title", "") + " " + art.get("content", "")).lower()
         for topic in user_interests:
             kws = DOMAIN_KEYWORDS.get(topic, [])
@@ -557,21 +680,18 @@ def articles_for_me(
 
     candidate_articles = [a for a in all_articles if _article_matches(a)]
 
-    # ── Guarantee at least 1 article per interest topic ───────────────────
-    topic_covered: set[str]  = set()
-    selected_ids:  set[str]  = set()
-    result:        list[dict] = []
+    topic_covered = set()
+    selected_ids  = set()
+    result        = []
 
-    # Pass 1: pick one article per interest topic
     for topic in user_interests:
         if topic in topic_covered:
             continue
         for art in candidate_articles:
             if art["id"] in selected_ids:
                 continue
-            # Check if this article covers the topic
-            matched = set(art.get("matched_domains") or [])
-            text    = (art.get("title", "") + " " + art.get("content", "")).lower()
+            matched   = set(art.get("matched_domains") or [])
+            text      = (art.get("title", "") + " " + art.get("content", "")).lower()
             topic_kws = [k.lower() for k in DOMAIN_KEYWORDS.get(topic, [])]
             if topic in matched or any(k in text for k in topic_kws):
                 result.append(art)
@@ -579,7 +699,6 @@ def articles_for_me(
                 topic_covered.add(topic)
                 break
 
-    # Pass 2: fill remaining slots up to limit
     for art in candidate_articles:
         if len(result) >= limit:
             break
@@ -587,7 +706,6 @@ def articles_for_me(
             result.append(art)
             selected_ids.add(art["id"])
 
-    # Strip heavy fields not needed in the list view
     slim_fields = [
         "id", "title", "short_summary", "image_url", "article_url",
         "url", "matched_domains", "source", "published_at",
@@ -595,21 +713,14 @@ def articles_for_me(
     ]
     slim = [{k: a.get(k) for k in slim_fields} for a in result[:limit]]
 
-    log.info(
-        "articles_for_me: uid=%s interests=%s candidate=%d returned=%d",
-        uid, user_interests, len(candidate_articles), len(slim),
-    )
+    log.info("articles_for_me: uid=%s interests=%s candidate=%d returned=%d",
+             uid, user_interests, len(candidate_articles), len(slim))
 
-    return {
-        "uid":       uid,
-        "interests": user_interests,
-        "total":     len(slim),
-        "articles":  slim,
-    }
+    return {"uid": uid, "interests": user_interests, "total": len(slim), "articles": slim}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ARTICLES — FETCH FROM RSS  (requires mod/admin)
+# ARTICLES — FETCH FROM RSS  (mod/admin)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post(
@@ -618,10 +729,7 @@ def articles_for_me(
     tags        = ["Articles"],
     summary     = "Fetch articles from RSS by topic — requires mod/admin",
 )
-def fetch_and_save(
-    body:    FetchArticlesBody,
-    payload: dict = Depends(require_mod),
-):
+def fetch_and_save(body: FetchArticlesBody, payload: dict = Depends(require_mod)):
     """Trigger an RSS fetch by topic/keywords. Requires mod/admin."""
     try:
         raw = fetch_articles_from_source(
@@ -638,7 +746,7 @@ def fetch_and_save(
             db.collection("articles").document(art["id"]).set(art, merge=True)
             saved.append(art)
         except Exception as e:
-            log.error("Firestore save failed for %s: %s", art["id"], e)
+            log.error("save failed for %s: %s", art["id"], e)
 
     return {"saved": len(saved), "articles": saved}
 
@@ -649,10 +757,7 @@ def fetch_and_save(
     tags        = ["Articles"],
     summary     = "Fetch from a URL — requires mod/admin",
 )
-def fetch_from_source_url(
-    body:    FetchSourceBody,
-    payload: dict = Depends(require_mod),
-):
+def fetch_from_source_url(body: FetchSourceBody, payload: dict = Depends(require_mod)):
     """Fetch articles from a user-supplied URL. Requires mod/admin."""
     url = body.url.strip()
     if not url:
@@ -670,18 +775,18 @@ def fetch_from_source_url(
             db.collection("articles").document(art["id"]).set(art, merge=True)
             saved.append(art)
         except Exception as e:
-            log.error("Firestore save failed: %s", e)
+            log.error("save failed: %s", e)
 
     return {"saved": len(saved), "articles": saved, "source_url": url}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ARTICLES — CRUD  (GET routes are PUBLIC)
+# ARTICLES — CRUD  (GET routes PUBLIC)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/articles", tags=["Articles"], summary="List articles — PUBLIC")
 def list_articles(limit: int = Query(30, ge=1, le=200)):
-    """Public: list all articles, newest first. No token required."""
+    """Public: list all articles, newest first."""
     try:
         docs = (
             db.collection("articles")
@@ -717,28 +822,67 @@ def create_article(body: CreateArticleBody, payload: dict = Depends(require_mod)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AI INSIGHTS — LOCKED (require_auth for generate/read, require_mod to delete)
+# AI INSIGHTS
+# Users can READ insights but cannot trigger generation.
+# Generation is automatic after mod/admin refresh.
 # ══════════════════════════════════════════════════════════════════════════════
+
+@app.get(
+    "/api/articles/insights/status",
+    tags    = ["Insights"],
+    summary = "Insight generation progress — PUBLIC",
+)
+def get_insight_status():
+    """
+    PUBLIC. Returns how many articles have AI insights vs total.
+    Use this for a real-time progress indicator: "18 of 32 insights ready".
+    Also shows whether the background generation thread is currently running.
+    """
+    try:
+        art_docs = db.collection("articles").stream()
+        articles = [d.to_dict() for d in art_docs]
+        total    = len(articles)
+        with_ins = sum(1 for a in articles if a.get("has_insight"))
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+    try:
+        queue_docs = db.collection("insight_queue").stream()
+        queue      = [d.to_dict() for d in queue_docs]
+        pending    = sum(1 for q in queue if q.get("status") == "pending")
+        done       = sum(1 for q in queue if q.get("status") == "done")
+        failed     = sum(1 for q in queue if q.get("status") == "failed")
+        processing = sum(1 for q in queue if q.get("status") == "processing")
+    except Exception:
+        pending = done = failed = processing = 0
+
+    return {
+        "total_articles":   total,
+        "with_insight":     with_ins,
+        "without_insight":  total - with_ins,
+        "generating":       _insight_thread_running,
+        "queue_pending":    pending,
+        "queue_processing": processing,
+        "queue_done":       done,
+        "queue_failed":     failed,
+    }
+
 
 @app.delete(
     "/api/articles/{article_id}/insight",
     tags    = ["Insights"],
     summary = "Clear cached insight — requires mod/admin",
 )
-def delete_insight(
-    article_id: str,
-    payload:    dict = Depends(require_mod),
-):
+def delete_insight(article_id: str, payload: dict = Depends(require_mod)):
     """
-    Clear the cached AI insight so next POST regenerates from Gemini.
-    Also deletes the entry from the ai_insights collection.
+    Clear the cached AI insight. Also deletes from ai_insights collection
+    and removes from insight_queue so it re-queues on next refresh.
     Requires mod or admin.
     """
     doc_ref = db.collection("articles").document(article_id)
     if not doc_ref.get().exists:
         raise HTTPException(404, detail="Article not found")
 
-    # Clear insight fields on the article document
     try:
         doc_ref.update({
             "ai_insight":           None,
@@ -746,120 +890,25 @@ def delete_insight(
             "insight_generated_at": None,
         })
     except Exception as e:
-        log.warning("delete_insight: could not clear fields: %s", e)
+        log.warning("delete_insight: clear fields failed: %s", e)
 
-    # Delete from the dedicated ai_insights collection
     try:
         db.collection("ai_insights").document(article_id).delete()
     except Exception as e:
-        log.warning("delete_insight: could not delete ai_insights doc: %s", e)
+        log.warning("delete_insight: ai_insights delete failed: %s", e)
+
+    try:
+        db.collection("insight_queue").document(article_id).delete()
+    except Exception:
+        pass
 
     log.info("delete_insight: cleared %s by %s", article_id, get_uid(payload))
     return {"deleted": True, "article_id": article_id}
 
 
-@app.post(
-    "/api/articles/{article_id}/insight",
-    tags    = ["Insights"],
-    summary = "Generate AI insight — REQUIRES LOGIN",
-)
-def generate_insight(
-    article_id: str,
-    force:      bool = Query(False, description="true = skip cache and regenerate"),
-    payload:    dict = Depends(require_auth),   # any logged-in user
-):
-    """
-    **LOCKED — requires any valid login (user/mod/admin).**
-    Generate an AI insight (summary + SVG diagram) for one article on demand.
-    Searches both `articles` and `feed_articles` automatically.
-    """
-    # ── Find article in either collection ─────────────────────────────────
-    source_table = "articles"
-    doc_ref      = db.collection("articles").document(article_id)
-    doc          = doc_ref.get()
-    if not doc.exists:
-        doc_ref      = db.collection("feed_articles").document(article_id)
-        doc          = doc_ref.get()
-        source_table = "feed_articles"
-    if not doc.exists:
-        raise HTTPException(404, detail="Article not found in articles or feed_articles")
-
-    article = doc.to_dict()
-
-    # ── Cache check ────────────────────────────────────────────────────────
-    if not force:
-        cached = article.get("ai_insight")
-        if (
-            cached and isinstance(cached, dict)
-            and cached.get("summary") and not cached.get("raw")
-            and len(cached.get("summary", "")) > 50
-        ):
-            return {"article_id": article_id, "source_table": source_table,
-                    "ai_insight": cached, "cached": True}
-
-        insight_doc = db.collection("ai_insights").document(article_id).get()
-        if insight_doc.exists:
-            stored = insight_doc.to_dict().get("ai_insight", {})
-            if (isinstance(stored, dict) and stored.get("summary")
-                    and not stored.get("raw") and len(stored.get("summary", "")) > 50):
-                return {
-                    "article_id":   article_id,
-                    "source_table": insight_doc.to_dict().get("source_table", source_table),
-                    "ai_insight":   stored,
-                    "cached":       True,
-                }
-            else:
-                # Old/broken cache — delete so we can regenerate
-                try:
-                    db.collection("ai_insights").document(article_id).delete()
-                except Exception:
-                    pass
-
-    # ── Generate via Gemini ────────────────────────────────────────────────
-    try:
-        insight = generate_ai_insight(article)
-    except Exception as e:
-        log.error("generate_insight: Gemini error for %s: %s", article_id, e)
-        raise HTTPException(502, detail=str(e))
-
-    # ── Persist to article document ────────────────────────────────────────
-    try:
-        doc_ref.update({
-            "ai_insight": insight, "has_insight": True, "insight_generated_at": _now()
-        })
-    except Exception as e:
-        log.error("generate_insight: article update failed: %s", e)
-
-    # ── Persist to ai_insights collection ─────────────────────────────────
-    try:
-        db.collection("ai_insights").document(article_id).set({
-            "article_id":      article_id,
-            "source_table":    source_table,
-            "title":           article.get("title", ""),
-            "topic":           article.get("topic", ""),
-            "source":          article.get("source", ""),
-            "matched_domains": article.get("matched_domains", []),
-            "article_url":     article.get("article_url") or article.get("url", ""),
-            "ai_insight":      insight,
-            "created_at":      _now(),
-        })
-    except Exception as e:
-        log.error("generate_insight: ai_insights save failed: %s", e)
-
-    log.info("generate_insight: OK %s table=%s domain=%s words=%d by=%s",
-             article_id, source_table, insight.get("domain","?"),
-             len(insight.get("summary","").split()), get_uid(payload))
-
-    return {"article_id": article_id, "source_table": source_table,
-            "ai_insight": insight, "cached": False}
-
-
-@app.get("/api/insights", tags=["Insights"], summary="List all insights — REQUIRES LOGIN")
-def list_insights(
-    limit:   int  = Query(50, ge=1, le=200),
-    payload: dict = Depends(require_auth),
-):
-    """**LOCKED.** List all AI insights, newest first."""
+@app.get("/api/insights", tags=["Insights"], summary="List all insights — requires auth")
+def list_insights(limit: int = Query(50, ge=1, le=200), payload: dict = Depends(require_auth)):
+    """List all AI insights, newest first. Requires any valid login."""
     try:
         docs = (
             db.collection("ai_insights")
@@ -872,9 +921,9 @@ def list_insights(
 
 
 @app.get("/api/insights/{article_id}", tags=["Insights"],
-         summary="Get single insight — REQUIRES LOGIN")
+         summary="Get single insight — requires auth")
 def get_insight(article_id: str, payload: dict = Depends(require_auth)):
-    """**LOCKED.** Get a single AI insight by article ID."""
+    """Get a single AI insight by article ID. Requires any valid login."""
     doc = db.collection("ai_insights").document(article_id).get()
     if not doc.exists:
         raise HTTPException(404, detail="Insight not found")
@@ -886,7 +935,7 @@ def get_insight(article_id: str, payload: dict = Depends(require_auth)):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/pipeline", status_code=201, tags=["Articles"],
-          summary="Fetch + generate insights — requires mod/admin")
+          summary="Fetch + generate insights synchronously — requires mod/admin")
 def pipeline(body: PipelineBody, payload: dict = Depends(require_mod)):
     """Fetch articles and immediately generate AI insights. Requires mod/admin."""
     try:
@@ -904,189 +953,110 @@ def pipeline(body: PipelineBody, payload: dict = Depends(require_mod)):
         try:
             insight = generate_ai_insight(art)
             db.collection("articles").document(art["id"]).update({
-                "ai_insight": insight, "has_insight": True, "insight_generated_at": _now()
+                "ai_insight": insight, "has_insight": True,
+                "insight_generated_at": _now(),
             })
             db.collection("ai_insights").document(art["id"]).set({
                 "article_id": art["id"], "title": art.get("title", ""),
-                "topic": body.topic, "ai_insight": insight, "created_at": _now()
+                "topic": body.topic, "ai_insight": insight, "created_at": _now(),
             })
-            results.append({"id": art["id"], "title": art.get("title",""),
+            results.append({"id": art["id"], "title": art.get("title", ""),
                             "ai_insight": insight, "status": "ok"})
         except Exception as e:
             results.append({"id": art["id"], "status": "error", "error": str(e)})
 
     return {"processed": len(results), "results": results}
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# INSIGHT QUEUE — batch processor and status endpoints
+# INSIGHT QUEUE — manual retry processor and status endpoints
 # ══════════════════════════════════════════════════════════════════════════════
-
-# How the queue works:
-#   1. POST /api/articles/refresh  (admin) → saves articles + adds each to insight_queue
-#   2. POST /api/articles/insights/process (admin) → picks next batch_size pending items,
-#      generates insights one by one, marks each done/failed
-#   3. Admin calls step 2 every 5 minutes (cron job or manual clicks in admin panel)
-#
-# With batch_size=2 and 30 articles:
-#   15 batches × 5 min interval = 75 minutes total — no timeouts
-#
-# MongoDB collection: insight_queue
-# Document fields:
-#   article_id, title, matched_domains, queued_at, status, attempts, last_error
-#
-# Status values:
-#   pending    — waiting to be processed
-#   processing — currently being processed (set at start, in case of crash)
-#   done       — insight generated and saved
-#   failed     — gave up after max_attempts
-
-
-class ProcessBody(BaseModel):
-    """
-    Body for POST /api/articles/insights/process
-    batch_size: how many insights to generate in this call (default 2)
-    """
-    batch_size: int = 2   # generate this many insights per call
-
 
 @app.post(
     "/api/articles/insights/process",
     status_code = 200,
     tags        = ["Insights"],
-    summary     = "Process next batch from insight queue — ADMIN ONLY",
+    summary     = "Manually retry failed/pending insights — MOD/ADMIN ONLY",
 )
 def process_insight_queue(
     body:    ProcessBody = ProcessBody(),
-    payload: dict        = Depends(require_admin),   # ADMIN ONLY
+    payload: dict        = Depends(require_mod),
 ):
     """
-    POST /api/articles/insights/process
-    ADMIN ONLY — processes the next N articles from the insight_queue.
+    POST /api/articles/insights/process — MOD/ADMIN ONLY
 
-    Call this endpoint every 5 minutes to gradually generate insights
-    without hitting the Ollama 120-second timeout:
-      - batch_size=2 (default) → 2 insights per call
-      - 30 articles → 15 calls × 5 min = 75 minutes total
+    Manually process the next N articles from the insight_queue.
+    Use this ONLY to fix articles whose automatic background generation failed.
 
-    The endpoint:
-    1. Picks the oldest `batch_size` pending queue items
-    2. For each: generates the AI insight via Ollama Cloud
-    3. Saves insight to the article doc + ai_insights collection
-    4. Marks queue item as "done" (or "failed" on error)
-    5. Returns what was processed + how many items remain
+    Normally insights are generated automatically after POST /api/articles/refresh.
 
-    Body (optional):
-    { "batch_size": 2 }   // how many to process this call
-
-    Response:
-    {
-      "processed":    2,
-      "succeeded":    2,
-      "failed":       0,
-      "remaining":    18,   // still pending in queue
-      "results": [
-        { "article_id": "...", "title": "...", "status": "done" },
-        { "article_id": "...", "title": "...", "status": "done" }
-      ]
-    }
-
-    curl -X POST http://127.0.0.1:5000/api/articles/insights/process \\
-      -H "Authorization: Bearer <admin_token>" \\
-      -H "Content-Type: application/json" \\
-      -d '{"batch_size": 2}'
+    Body (optional): { "batch_size": 2 }
     """
-    batch_size   = max(1, min(body.batch_size, 10))  # cap at 10 per call
-    max_attempts = 3  # give up after this many failed attempts per article
+    batch_size   = max(1, min(body.batch_size, 10))
+    max_attempts = 3
     results      = []
     succeeded    = 0
-    failed       = 0
+    failed_count = 0
 
-    # ── Pick the next batch_size pending items, oldest first ──────────────
     try:
         pending_docs = (
             db.collection("insight_queue")
               .where("status", "==", "pending")
               .order_by("queued_at", direction="ASCENDING")
-              .limit(batch_size)
-              .stream()
+              .limit(batch_size).stream()
         )
         pending = [d.to_dict() for d in pending_docs]
     except Exception as e:
         raise HTTPException(500, detail=f"Could not read insight_queue: {e}")
 
     if not pending:
-        # Count how many failed/done items exist for context
         try:
-            done_docs   = db.collection("insight_queue").where("status", "==", "done").stream()
-            failed_docs = db.collection("insight_queue").where("status", "==", "failed").stream()
-            done_count   = len(done_docs)
-            failed_count = len(failed_docs)
+            done_docs   = list(db.collection("insight_queue").where("status", "==", "done").stream())
+            failed_docs = list(db.collection("insight_queue").where("status", "==", "failed").stream())
         except Exception:
-            done_count = failed_count = 0
+            done_docs = failed_docs = []
 
         return {
-            "processed":  0,
-            "succeeded":  0,
-            "failed":     0,
-            "remaining":  0,
-            "done_total": done_count,
-            "failed_total": failed_count,
-            "message":    "Queue is empty — all articles have been processed.",
-            "results":    [],
+            "processed": 0, "succeeded": 0, "failed": 0, "remaining": 0,
+            "done_total": len(done_docs), "failed_total": len(failed_docs),
+            "message": "Queue is empty — all articles have been processed.",
+            "results": [],
         }
 
-    # ── Process each item ──────────────────────────────────────────────────
     for item in pending:
         article_id = item["article_id"]
         title      = item.get("title", "")
         attempts   = item.get("attempts", 0) + 1
 
-        # Mark as processing so we don't double-pick if something goes wrong
         try:
             db.collection("insight_queue").document(article_id).update({
-                "status":   "processing",
-                "attempts": attempts,
+                "status": "processing", "attempts": attempts,
             })
         except Exception as e:
-            log.warning("process_queue: could not mark processing for %s: %s", article_id, e)
+            log.warning("process_queue: mark processing failed %s: %s", article_id, e)
 
-        # Fetch the full article from MongoDB
         try:
             art_doc = db.collection("articles").document(article_id).get()
             if not art_doc.exists:
-                raise ValueError(f"Article {article_id} not found in articles collection")
+                raise ValueError(f"Article {article_id} not found")
             article = art_doc.to_dict()
         except Exception as e:
-            log.error("process_queue: could not load article %s: %s", article_id, e)
-            try:
-                db.collection("insight_queue").document(article_id).update({
-                    "status":     "failed" if attempts >= max_attempts else "pending",
-                    "last_error": str(e),
-                })
-            except Exception:
-                pass
-            results.append({
-                "article_id": article_id,
-                "title":      title,
-                "status":     "failed",
-                "error":      str(e),
-            })
-            failed += 1
+            log.error("process_queue: load error %s: %s", article_id, e)
+            new_status = "failed" if attempts >= max_attempts else "pending"
+            _queue_mark(article_id, new_status, str(e))
+            results.append({"article_id": article_id, "title": title,
+                            "status": new_status, "error": str(e)})
+            failed_count += 1
             continue
 
-        # Generate the AI insight
         try:
             log.info("process_queue: generating insight for %s (attempt %d)", article_id, attempts)
             insight = generate_ai_insight(article)
 
-            # Save insight to the article document
             db.collection("articles").document(article_id).update({
-                "ai_insight":           insight,
-                "has_insight":          True,
+                "ai_insight": insight, "has_insight": True,
                 "insight_generated_at": _now(),
             })
-
-            # Save to the shared ai_insights collection
             db.collection("ai_insights").document(article_id).set({
                 "article_id":      article_id,
                 "source_table":    "articles",
@@ -1098,61 +1068,34 @@ def process_insight_queue(
                 "ai_insight":      insight,
                 "created_at":      _now(),
             })
-
-            # Mark queue item as done
-            db.collection("insight_queue").document(article_id).update({
-                "status":       "done",
-                "completed_at": _now(),
-                "last_error":   "",
-            })
-
-            results.append({
-                "article_id": article_id,
-                "title":      title,
-                "status":     "done",
-                "domain":     insight.get("domain", ""),
-            })
+            _queue_mark(article_id, "done", "")
+            results.append({"article_id": article_id, "title": title,
+                            "status": "done", "domain": insight.get("domain", "")})
             succeeded += 1
             log.info("process_queue: done %s (%s)", article_id, title[:50])
 
         except Exception as e:
-            log.error("process_queue: insight failed for %s (attempt %d): %s",
+            log.error("process_queue: insight failed %s (attempt %d): %s",
                       article_id, attempts, e)
-
-            # If too many attempts, mark as permanently failed
             new_status = "failed" if attempts >= max_attempts else "pending"
-            try:
-                db.collection("insight_queue").document(article_id).update({
-                    "status":     new_status,
-                    "last_error": str(e)[:500],
-                })
-            except Exception:
-                pass
+            _queue_mark(article_id, new_status, str(e))
+            results.append({"article_id": article_id, "title": title,
+                            "status": new_status, "error": str(e)[:200],
+                            "attempts": attempts})
+            failed_count += 1
 
-            results.append({
-                "article_id": article_id,
-                "title":      title,
-                "status":     new_status,
-                "error":      str(e)[:200],
-                "attempts":   attempts,
-            })
-            failed += 1
-
-    # Count remaining pending items after this batch
     try:
-        remaining_docs = db.collection("insight_queue").where("status", "==", "pending").stream()
+        remaining_docs = list(db.collection("insight_queue").where("status", "==", "pending").stream())
         remaining      = len(remaining_docs)
     except Exception:
-        remaining = -1   # unknown, don't fail the response
+        remaining = -1
 
     log.info("process_queue: batch done — succeeded=%d failed=%d remaining=%d",
-             succeeded, failed, remaining)
+             succeeded, failed_count, remaining)
     return {
-        "processed":  len(results),
-        "succeeded":  succeeded,
-        "failed":     failed,
-        "remaining":  remaining,
-        "results":    results,
+        "processed": len(results), "succeeded": succeeded,
+        "failed": failed_count, "remaining": remaining,
+        "results": results,
     }
 
 
@@ -1162,48 +1105,24 @@ def process_insight_queue(
     summary = "Check insight queue status — ADMIN ONLY",
 )
 def get_insight_queue_status(payload: dict = Depends(require_admin)):
-    """
-    GET /api/articles/insights/queue
-    ADMIN ONLY — check the current state of the insight generation queue.
-
-    Use this to monitor progress while insights are being generated.
-
-    Response:
-    {
-      "pending":    18,   // waiting to be processed
-      "done":       4,    // successfully completed
-      "failed":     1,    // gave up after 3 attempts
-      "processing": 0,    // currently mid-generation (should be 0 when idle)
-      "total":      23,
-      "items": [           // all pending items (so admin knows what's coming)
-        { "article_id": "...", "title": "...", "queued_at": "...", "attempts": 0 },
-        ...
-      ]
-    }
-
-    curl -H "Authorization: Bearer <admin_token>" \\
-      http://127.0.0.1:5000/api/articles/insights/queue
-    """
+    """ADMIN ONLY — check the current state of the insight generation queue."""
     try:
         all_docs = db.collection("insight_queue").stream()
         items    = [d.to_dict() for d in all_docs]
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
-    # Group by status
     by_status = {"pending": [], "done": [], "failed": [], "processing": []}
     for item in items:
         s = item.get("status", "pending")
-        if s in by_status:
-            by_status[s].append(item)
-        else:
-            by_status["pending"].append(item)
+        by_status.setdefault(s, []).append(item)
 
     return {
         "pending":    len(by_status["pending"]),
         "done":       len(by_status["done"]),
         "failed":     len(by_status["failed"]),
         "processing": len(by_status["processing"]),
+        "generating": _insight_thread_running,
         "total":      len(items),
         "items":      sorted(by_status["pending"], key=lambda x: x.get("queued_at", "")),
     }
@@ -1215,14 +1134,7 @@ def get_insight_queue_status(payload: dict = Depends(require_admin)):
     summary = "Clear insight queue — ADMIN ONLY",
 )
 def clear_insight_queue(payload: dict = Depends(require_admin)):
-    """
-    DELETE /api/articles/insights/queue
-    ADMIN ONLY — delete all items from the insight_queue collection.
-    Use this to reset after errors or before a fresh refresh.
-
-    curl -X DELETE http://127.0.0.1:5000/api/articles/insights/queue \\
-      -H "Authorization: Bearer <admin_token>"
-    """
+    """ADMIN ONLY — delete all items from the insight_queue. Use before a fresh refresh."""
     try:
         docs    = db.collection("insight_queue").stream()
         deleted = 0
@@ -1231,9 +1143,13 @@ def clear_insight_queue(payload: dict = Depends(require_admin)):
             deleted += 1
     except Exception as e:
         raise HTTPException(500, detail=str(e))
-    log.info("insight_queue cleared: %d items deleted by admin=%s", deleted, get_uid(payload))
+    log.info("insight_queue cleared: %d items by admin=%s", deleted, get_uid(payload))
     return {"cleared": True, "deleted": deleted}
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ARTICLES — REFRESH CHECK (read-only, any auth)
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.get(
     "/api/articles/refresh/check",
@@ -1241,47 +1157,27 @@ def clear_insight_queue(payload: dict = Depends(require_admin)):
     summary = "Check for new articles in DB — any auth (read-only)",
 )
 def refresh_check(
-    since_hours: int  = Query(24, ge=1, le=168, description="Look for articles added in the last N hours"),
-    payload:     dict = Depends(require_auth),   # any logged-in user
+    since_hours: int  = Query(24, ge=1, le=168),
+    payload:     dict = Depends(require_auth),
 ):
     """
     GET /api/articles/refresh/check?since_hours=24
-    ANY authenticated user — check if new articles have been added to the
-    database recently, without triggering any RSS fetch.
-
-    This is the user-facing "refresh" — it just reads the DB.
-    Only admins can trigger actual RSS fetching via POST /api/articles/refresh.
-
-    Response:
-    {
-      "new_articles":  5,    // articles added in the last since_hours hours
-      "since_hours":   24,
-      "articles": [ ...the new articles, newest first... ]
-    }
-
-    curl -H "Authorization: Bearer <token>" \\
-      "http://127.0.0.1:5000/api/articles/refresh/check?since_hours=24"
+    Any authenticated user — check if new articles have been added recently.
+    Does NOT trigger any RSS fetch.
     """
-    from datetime import timedelta
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+    cutoff     = datetime.now(timezone.utc) - timedelta(hours=since_hours)
     cutoff_iso = cutoff.isoformat()
 
     try:
         docs = (
             db.collection("articles")
               .order_by("fetched_at", direction="DESCENDING")
-              .limit(50)
-              .stream()
+              .limit(50).stream()
         )
         new_articles = []
         for d in docs:
             art = d.to_dict()
-            fetched_str = art.get("fetched_at", "")
-            if not fetched_str:
-                continue
-            # Keep only articles newer than the cutoff
-            if fetched_str >= cutoff_iso:
-                # Return slim fields — no heavy content/full_content
+            if art.get("fetched_at", "") >= cutoff_iso:
                 new_articles.append({
                     "id":              art.get("id"),
                     "title":           art.get("title"),

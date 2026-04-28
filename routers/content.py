@@ -1,11 +1,11 @@
 """
-routers/content.py  —  Explainers & Research Articles  v8
-===========================================================
+routers/content.py  —  Explainers, Research Articles & Blog Posts  v9
+======================================================================
 Images are stored on disk and served via FastAPI StaticFiles.
 Frontend accesses them at:  http://localhost:5000/images/explainers/quantum-dog.jpg
                              http://localhost:5000/images/research/physics.jpg
 
-THREE WAYS TO ATTACH AN IMAGE:
+THREE WAYS TO ATTACH AN IMAGE (explainers & research articles):
   A) Create via JSON + separate image upload (two requests):
        1. POST /api/explainers         { id, title, ... }   → creates doc, image=""
        2. POST /api/explainers/{id}/image  multipart file    → saves file, updates "image" in MongoDB
@@ -46,6 +46,23 @@ ENDPOINTS:
     POST   /api/research/articles/{id}/image              — upload/replace image (mod/admin)
     GET    /api/research/images                           — field → image URL map (public)
     GET    /api/research/fields                           — fields meta (public)
+
+  Blog Posts
+    POST   /api/blog/seed                                 — bulk seed from content_data (admin)
+    POST   /api/blog                                      — JSON create (mod/admin)
+    GET    /api/blog                                      — list, filter by field/type/tag (public)
+    GET    /api/blog/{id}                                 — get one (public)
+    PUT    /api/blog/{id}                                 — JSON update (mod/admin)
+    DELETE /api/blog/{id}                                 — delete (admin)
+    POST   /api/blog/{id}/cover-image                     — upload/replace cover image (mod/admin)
+
+  CMS — edit helpers (mod/admin)
+    GET    /api/cms/explainers                            — list slim for CMS table
+    GET    /api/cms/explainers/{id}                       — full doc ready for edit form
+    GET    /api/cms/research                              — list slim for CMS table
+    GET    /api/cms/research/{id}                         — full doc ready for edit form
+    GET    /api/cms/blog                                  — list slim for CMS table
+    GET    /api/cms/blog/{id}                             — full doc ready for edit form
 """
 
 import os
@@ -67,6 +84,7 @@ from content_data import (
     FIELD_ICONS_SEED,
     FIELD_COLORS_SEED,
     FIELD_IMAGES_SEED,
+    BLOG_POSTS_SEED,
 )
 
 log    = logging.getLogger(__name__)
@@ -105,6 +123,40 @@ def _ensure_dirs() -> None:
     """Create image sub-directories if they don't already exist."""
     os.makedirs(os.path.join(IMAGES_ROOT, "explainers"), exist_ok=True)
     os.makedirs(os.path.join(IMAGES_ROOT, "research"),   exist_ok=True)
+    os.makedirs(os.path.join(IMAGES_ROOT, "blog"),       exist_ok=True)
+
+
+def _delete_file(url_path: str) -> bool:
+    """
+    Delete an image from disk given its public URL path (e.g. /images/explainers/quantum-dog.jpg).
+
+    - Only deletes files that live inside IMAGES_ROOT (safe against path traversal).
+    - Silently skips external URLs (http/https), empty strings, and missing files.
+    - Returns True if the file was actually deleted, False otherwise.
+    - Never raises — failures are logged as warnings so the calling request still succeeds.
+    """
+    if not url_path or url_path.startswith(("http://", "https://")):
+        return False   # external URL — nothing to clean up on disk
+
+    # Strip leading slash and build absolute path
+    rel  = url_path.lstrip("/")            # e.g.  images/explainers/quantum-dog.jpg
+    full = os.path.normpath(os.path.join(_BASE_DIR, rel))
+
+    # Safety check — must stay inside IMAGES_ROOT
+    if not full.startswith(os.path.normpath(IMAGES_ROOT)):
+        log.warning("_delete_file: refused to delete outside IMAGES_ROOT: %s", full)
+        return False
+
+    if not os.path.isfile(full):
+        return False   # already gone or never existed
+
+    try:
+        os.remove(full)
+        log.info("_delete_file: removed %s", full)
+        return True
+    except OSError as exc:
+        log.warning("_delete_file: could not remove %s: %s", full, exc)
+        return False
 
 
 def _save_file(upload: UploadFile, folder: str, filename: str) -> str:
@@ -114,7 +166,7 @@ def _save_file(upload: UploadFile, folder: str, filename: str) -> str:
 
     Args:
         upload:   FastAPI UploadFile object from the multipart form.
-        folder:   Sub-directory — must be "explainers" or "research".
+        folder:   Sub-directory — must be "explainers", "research", or "blog".
         filename: Target filename including extension (e.g. "quantum-dog.jpg").
 
     Raises:
@@ -163,15 +215,19 @@ def _save_file(upload: UploadFile, folder: str, filename: str) -> str:
 def _fmt_explainer(ex: dict) -> dict:
     """Return a clean explainer dict safe to send to the frontend."""
     return {
-        "id":          ex.get("id"),
-        "title":       ex.get("title"),
-        "subtitle":    ex.get("subtitle"),
-        "field":       ex.get("field"),
-        "badgeColor":  ex.get("badgeColor"),
-        "readTime":    ex.get("readTime"),
-        "image":       ex.get("image", ""),     # /images/explainers/quantum-dog.jpg
-        "content":     ex.get("content", []),
-        "keyInsights": ex.get("keyInsights", []),
+        "id":              ex.get("id"),
+        "title":           ex.get("title"),
+        "subtitle":        ex.get("subtitle"),
+        "field":           ex.get("field"),
+        "badgeColor":      ex.get("badgeColor"),
+        "readTime":        ex.get("readTime"),
+        "author":          ex.get("author", ""),
+        "image":           ex.get("image", ""),
+        "content":         ex.get("content", []),
+        "keyInsights":     ex.get("keyInsights", []),
+        "context":         ex.get("context", ""),
+        "technicalDetail": ex.get("technicalDetail", ""),
+        "impact":          ex.get("impact", ""),
     }
 
 
@@ -203,27 +259,35 @@ class CreateExplainerBody(BaseModel):
     Pass image as URL returned by POST /api/images/upload, or leave empty
     and upload later via POST /api/explainers/{id}/image.
     """
-    id:          str
-    title:       str
-    subtitle:    str       = ""
-    field:       str       = ""
-    badgeColor:  str       = ""
-    readTime:    str       = ""
-    image:       str       = ""   # e.g. /images/explainers/quantum-dog.jpg
-    content:     list      = []
-    keyInsights: list      = []
+    id:              str
+    title:           str
+    subtitle:        str  = ""
+    field:           str  = ""
+    badgeColor:      str  = ""
+    readTime:        str  = ""
+    author:          str  = ""
+    image:           str  = ""   # e.g. /images/explainers/quantum-dog.jpg
+    content:         list = []
+    keyInsights:     list = []
+    context:         str  = ""
+    technicalDetail: str  = ""
+    impact:          str  = ""
 
 
 class UpdateExplainerBody(BaseModel):
     """All fields optional — only provided fields are updated."""
-    title:       Optional[str]  = None
-    subtitle:    Optional[str]  = None
-    field:       Optional[str]  = None
-    badgeColor:  Optional[str]  = None
-    readTime:    Optional[str]  = None
-    image:       Optional[str]  = None  # set to new URL to replace image
-    content:     Optional[list] = None
-    keyInsights: Optional[list] = None
+    title:           Optional[str]  = None
+    subtitle:        Optional[str]  = None
+    field:           Optional[str]  = None
+    badgeColor:      Optional[str]  = None
+    readTime:        Optional[str]  = None
+    author:          Optional[str]  = None
+    image:           Optional[str]  = None  # set to new URL to replace image
+    content:         Optional[list] = None
+    keyInsights:     Optional[list] = None
+    context:         Optional[str]  = None
+    technicalDetail: Optional[str]  = None
+    impact:          Optional[str]  = None
 
 
 class CreateResearchArticleBody(BaseModel):
@@ -342,13 +406,17 @@ async def create_explainer_with_image(
     id:          str        = Form(...,  description="Unique ID e.g. 'quantum-dog'"),
     title:       str        = Form(...,  description="Explainer title"),
     # ── Optional text fields ──────────────────────────────────────────────
-    subtitle:    str        = Form("",   description="Short subtitle / teaser"),
-    field:       str        = Form("",   description="STEM field e.g. 'QUANTUM PHYSICS'"),
-    badgeColor:  str        = Form("",   description="Badge colour name e.g. 'cyan'"),
-    readTime:    str        = Form("",   description="e.g. '8 MIN READ'"),
+    subtitle:        str        = Form("",   description="Short subtitle / teaser"),
+    field:           str        = Form("",   description="STEM field e.g. 'QUANTUM PHYSICS'"),
+    badgeColor:      str        = Form("",   description="Badge colour name e.g. 'cyan'"),
+    readTime:        str        = Form("",   description="e.g. '8 MIN READ'"),
+    author:          str        = Form("",   description="Author name"),
+    context:         str        = Form("",   description="Historical context paragraph"),
+    technicalDetail: str        = Form("",   description="Technical deep-dive paragraph"),
+    impact:          str        = Form("",   description="Real-world impact paragraph"),
     # ── JSON-encoded arrays (pass as JSON strings) ────────────────────────
-    content:     str        = Form("[]", description='JSON array of paragraph strings'),
-    keyInsights: str        = Form("[]", description='JSON array of insight strings'),
+    content:         str        = Form("[]", description='JSON array of paragraph strings'),
+    keyInsights:     str        = Form("[]", description='JSON array of insight strings'),
     # ── Auth ──────────────────────────────────────────────────────────────
     payload:     dict       = Depends(require_mod),
 ):
@@ -395,17 +463,21 @@ async def create_explainer_with_image(
 
     # Build and save the MongoDB document
     doc = {
-        "id":          id,
-        "title":       title,
-        "subtitle":    subtitle,
-        "field":       field,
-        "badgeColor":  badgeColor,
-        "readTime":    readTime,
-        "image":       image_url,       # automatically set from the upload
-        "content":     content_list,
-        "keyInsights": keyInsights_list,
-        "created_at":  _now(),
-        "updated_at":  _now(),
+        "id":              id,
+        "title":           title,
+        "subtitle":        subtitle,
+        "field":           field,
+        "badgeColor":      badgeColor,
+        "readTime":        readTime,
+        "author":          author,
+        "image":           image_url,
+        "content":         content_list,
+        "keyInsights":     keyInsights_list,
+        "context":         context,
+        "technicalDetail": technicalDetail,
+        "impact":          impact,
+        "created_at":      _now(),
+        "updated_at":      _now(),
     }
 
     try:
@@ -526,11 +598,19 @@ def delete_explainer(
       -H "Authorization: Bearer <admin_token>"
     """
     doc_ref = db.collection("explainers").document(explainer_id)
-    if not doc_ref.get().exists:
+    doc     = doc_ref.get()
+    if not doc.exists:
         raise HTTPException(404, detail="Explainer not found")
+
+    old_image_url = doc.to_dict().get("image", "")
     doc_ref.delete()
-    log.info("Explainer deleted: %s by %s", explainer_id, get_uid(payload))
-    return {"deleted": True, "id": explainer_id}
+
+    # Remove the image file from disk
+    deleted_file = _delete_file(old_image_url)
+
+    log.info("Explainer deleted: %s by %s (image deleted=%s)",
+             explainer_id, get_uid(payload), deleted_file)
+    return {"deleted": True, "id": explainer_id, "image_deleted": deleted_file}
 
 
 @router.post("/explainers/{explainer_id}/image", tags=["Explainers"])
@@ -559,14 +639,18 @@ async def upload_explainer_image(
     """
     # Verify the explainer exists before saving the file
     doc_ref = db.collection("explainers").document(explainer_id)
-    if not doc_ref.get().exists:
+    doc     = doc_ref.get()
+    if not doc.exists:
         raise HTTPException(404, detail="Explainer not found")
+
+    # Remember the current image URL so we can delete it after the new one is saved
+    old_image_url = doc.to_dict().get("image", "")
 
     # Use the explainer ID as the base filename to keep things consistent
     ext      = os.path.splitext(image.filename or "")[-1].lower() or ".jpg"
     filename = f"{explainer_id}{ext}"
 
-    # Save the file
+    # Save the new file
     image_url = _save_file(image, "explainers", filename)
 
     # Update only the image field in MongoDB
@@ -575,8 +659,20 @@ async def upload_explainer_image(
     except Exception as e:
         raise HTTPException(500, detail=f"Image saved to disk but DB update failed: {e}")
 
-    log.info("Explainer image updated: %s → %s by %s", explainer_id, image_url, get_uid(payload))
-    return {"updated": True, "id": explainer_id, "image": image_url}
+    # Delete the old file from disk — only when it differs from the new path
+    # (same-name replacement already overwrote the file, but different-ext old files must be cleaned up)
+    deleted_old = False
+    if old_image_url and old_image_url != image_url:
+        deleted_old = _delete_file(old_image_url)
+
+    log.info("Explainer image updated: %s → %s by %s (old deleted=%s)",
+             explainer_id, image_url, get_uid(payload), deleted_old)
+    return {
+        "updated":     True,
+        "id":          explainer_id,
+        "image":       image_url,
+        "deleted_old": deleted_old,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -868,11 +964,39 @@ def delete_research_article(
       -H "Authorization: Bearer <admin_token>"
     """
     doc_ref = db.collection("research_articles").document(article_id)
-    if not doc_ref.get().exists:
+    doc     = doc_ref.get()
+    if not doc.exists:
         raise HTTPException(404, detail="Research article not found")
+
+    art_data      = doc.to_dict()
+    old_image_url = art_data.get("image", "")
+    field         = art_data.get("field", "")
+
     doc_ref.delete()
-    log.info("Research article deleted: %s by %s", article_id, get_uid(payload))
-    return {"deleted": True, "id": article_id}
+
+    # Research images are shared per-field. Only delete the file from disk
+    # if no remaining article in the same field still references it.
+    deleted_file = False
+    if old_image_url:
+        try:
+            siblings = (
+                db.collection("research_articles")
+                  .where("field", "==", field)
+                  .stream()
+            )
+            still_used = any(
+                s.to_dict().get("image") == old_image_url
+                for s in siblings
+            )
+        except Exception:
+            still_used = True   # assume still in use if we can't check — safer
+
+        if not still_used:
+            deleted_file = _delete_file(old_image_url)
+
+    log.info("Research article deleted: %s by %s (image deleted=%s)",
+             article_id, get_uid(payload), deleted_file)
+    return {"deleted": True, "id": article_id, "image_deleted": deleted_file}
 
 
 @router.post("/research/articles/{article_id}/image", tags=["Research"])
@@ -907,12 +1031,15 @@ async def upload_research_image(
     if not doc.exists:
         raise HTTPException(404, detail="Research article not found")
 
-    field      = doc.to_dict().get("field", "")
+    art_data   = doc.to_dict()
+    field      = art_data.get("field", "")
+    old_image_url = art_data.get("image", "")
+
     field_slug = field.lower().replace(" & ", "-").replace(" ", "-").replace("&", "")
     ext        = os.path.splitext(image.filename or "")[-1].lower() or ".jpg"
     filename   = f"{field_slug}{ext}"
 
-    # Save to disk
+    # Save new file to disk (overwrites if same name, new file if extension changed)
     image_url = _save_file(image, "research", filename)
 
     # Update this article
@@ -921,7 +1048,7 @@ async def upload_research_image(
     except Exception as e:
         raise HTTPException(500, detail=f"Image saved but DB update failed: {e}")
 
-    # Update ALL other articles with the same field to share the image
+    # Update ALL other articles with the same field to share the new image URL
     also_updated = []
     try:
         siblings = (
@@ -939,12 +1066,481 @@ async def upload_research_image(
     except Exception as e:
         log.warning("Could not update sibling articles for field %s: %s", field, e)
 
-    log.info("Research image uploaded: field=%s → %s by %s (also updated %s)",
-             field, image_url, get_uid(payload), also_updated)
+    # Delete the old file only when the path actually changed (different extension).
+    # If it's the same filename, _save_file already overwrote it in-place — no stale file remains.
+    deleted_old = False
+    if old_image_url and old_image_url != image_url:
+        deleted_old = _delete_file(old_image_url)
+
+    log.info("Research image uploaded: field=%s → %s by %s (also updated %s, old deleted=%s)",
+             field, image_url, get_uid(payload), also_updated, deleted_old)
     return {
         "updated":      True,
         "id":           article_id,
         "image":        image_url,
         "field":        field,
         "also_updated": also_updated,
+        "deleted_old":  deleted_old,
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOG POSTS — PYDANTIC MODELS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class BlogAuthor(BaseModel):
+    name:   str = ""
+    role:   str = ""
+    avatar: str = ""
+    bio:    str = ""
+
+
+class CreateBlogPostBody(BaseModel):
+    """JSON body for POST /api/blog."""
+    id:           str
+    title:        str
+    subtitle:     str        = ""
+    description:  str        = ""
+    author:       BlogAuthor = BlogAuthor()
+    publishDate:  str        = ""
+    readingTime:  str        = ""
+    coverImage:   str        = ""   # URL — use POST /api/blog/{id}/cover-image for uploads
+    field:        str        = ""
+    badgeColor:   str        = ""
+    tags:         list       = []
+    keyInsights:  list       = []
+    type:         str        = "article"   # "explainer" | "article" | "simulation"
+    simulationUrl: str       = ""
+    content:      str        = ""          # Markdown string
+
+
+class UpdateBlogPostBody(BaseModel):
+    """All fields optional — only provided fields are updated."""
+    title:         Optional[str]        = None
+    subtitle:      Optional[str]        = None
+    description:   Optional[str]        = None
+    author:        Optional[BlogAuthor] = None
+    publishDate:   Optional[str]        = None
+    readingTime:   Optional[str]        = None
+    coverImage:    Optional[str]        = None
+    field:         Optional[str]        = None
+    badgeColor:    Optional[str]        = None
+    tags:          Optional[list]       = None
+    keyInsights:   Optional[list]       = None
+    type:          Optional[str]        = None
+    simulationUrl: Optional[str]        = None
+    content:       Optional[str]        = None
+
+
+def _fmt_blog(post: dict) -> dict:
+    """Return a clean blog post dict safe to send to the frontend."""
+    return {
+        "id":            post.get("id"),
+        "title":         post.get("title"),
+        "subtitle":      post.get("subtitle", ""),
+        "description":   post.get("description", ""),
+        "author":        post.get("author", {}),
+        "publishDate":   post.get("publishDate", ""),
+        "readingTime":   post.get("readingTime", ""),
+        "coverImage":    post.get("coverImage", ""),
+        "field":         post.get("field", ""),
+        "badgeColor":    post.get("badgeColor", ""),
+        "tags":          post.get("tags", []),
+        "keyInsights":   post.get("keyInsights", []),
+        "type":          post.get("type", "article"),
+        "simulationUrl": post.get("simulationUrl", ""),
+        "content":       post.get("content", ""),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOG POSTS — SEED
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/blog/seed", status_code=201, tags=["Blog"])
+def seed_blog_posts(payload: dict = Depends(require_admin)):
+    """
+    POST /api/blog/seed
+    ADMIN ONLY — bulk-seed all blog posts from content_data.BLOG_POSTS_SEED.
+    Safe to re-run (MongoDB upsert — never duplicates).
+
+    curl -X POST http://127.0.0.1:5000/api/blog/seed \\
+      -H "Authorization: Bearer <admin_token>"
+    """
+    seeded = []
+    for post in BLOG_POSTS_SEED:
+        doc = {**post, "created_at": _now(), "updated_at": _now()}
+        try:
+            db.collection("blog_posts").document(post["id"]).set(doc, merge=True)
+            seeded.append(post["id"])
+        except Exception as e:
+            log.error("seed_blog_posts failed for %s: %s", post["id"], e)
+    log.info("Blog posts seeded: %d", len(seeded))
+    return {"seeded": len(seeded), "ids": seeded}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOG POSTS — STANDARD JSON CRUD
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/blog", status_code=201, tags=["Blog"])
+def create_blog_post(
+    body:    CreateBlogPostBody,
+    payload: dict = Depends(require_mod),
+):
+    """
+    POST /api/blog  (JSON body)
+    Create a new blog post. Set coverImage to a URL, or leave empty and
+    upload via POST /api/blog/{id}/cover-image afterwards.
+
+    curl -X POST http://127.0.0.1:5000/api/blog \\
+      -H "Authorization: Bearer <mod_token>" \\
+      -H "Content-Type: application/json" \\
+      -d '{"id":"my-post","title":"My Post","field":"AI","type":"article"}'
+    """
+    doc = {
+        **body.model_dump(),
+        "author": body.author.model_dump(),
+        "created_at": _now(),
+        "updated_at": _now(),
+    }
+    try:
+        db.collection("blog_posts").document(body.id).set(doc, merge=True)
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+    log.info("Blog post created: %s by %s", body.id, get_uid(payload))
+    return _fmt_blog(doc)
+
+
+@router.get("/blog", tags=["Blog"])
+def list_blog_posts(
+    field: str = Query("", description="Filter by field (e.g. BIOLOGY)"),
+    type:  str = Query("", description="Filter by type: article | explainer | simulation"),
+    tag:   str = Query("", description="Filter by tag (case-insensitive)"),
+    limit: int = Query(50, ge=1, le=200, description="Max results"),
+):
+    """
+    GET /api/blog?field=BIOLOGY&type=article&tag=CRISPR
+    List all blog posts. Supports optional filtering by field, type, and tag.
+
+    curl http://127.0.0.1:5000/api/blog
+    curl "http://127.0.0.1:5000/api/blog?field=AI&type=article"
+    """
+    try:
+        q    = db.collection("blog_posts").order_by("publishDate", direction="DESCENDING")
+        docs = q.limit(limit).stream()
+        posts = []
+        for d in docs:
+            p = d.to_dict()
+            if field and p.get("field", "").upper() != field.strip().upper():
+                continue
+            if type and p.get("type", "") != type.strip():
+                continue
+            if tag:
+                tags_lower = [t.lower() for t in p.get("tags", [])]
+                if tag.strip().lower() not in tags_lower:
+                    continue
+            posts.append(_fmt_blog(p))
+    except Exception as e:
+        log.error("list_blog_posts: %s", e)
+        raise HTTPException(500, detail=str(e))
+
+    return {"posts": posts, "total": len(posts)}
+
+
+@router.get("/blog/{post_id}", tags=["Blog"])
+def get_blog_post(post_id: str):
+    """
+    GET /api/blog/{id}
+
+    curl http://127.0.0.1:5000/api/blog/the-future-of-quantum-computing
+    """
+    doc = db.collection("blog_posts").document(post_id).get()
+    if not doc.exists:
+        raise HTTPException(404, detail="Blog post not found")
+    return _fmt_blog(doc.to_dict())
+
+
+@router.put("/blog/{post_id}", tags=["Blog"])
+def update_blog_post(
+    post_id: str,
+    body:    UpdateBlogPostBody,
+    payload: dict = Depends(require_mod),
+):
+    """
+    PUT /api/blog/{id}
+    Update any fields of a blog post. Only supplied fields are changed.
+
+    curl -X PUT http://127.0.0.1:5000/api/blog/the-future-of-quantum-computing \\
+      -H "Authorization: Bearer <mod_token>" \\
+      -H "Content-Type: application/json" \\
+      -d '{"title":"Updated Title","badgeColor":"violet"}'
+    """
+    doc_ref = db.collection("blog_posts").document(post_id)
+    if not doc_ref.get().exists:
+        raise HTTPException(404, detail="Blog post not found")
+
+    updates = {}
+    for k, v in body.model_dump().items():
+        if v is None:
+            continue
+        if k == "author" and isinstance(v, dict):
+            updates["author"] = v
+        else:
+            updates[k] = v
+    updates["updated_at"] = _now()
+
+    try:
+        doc_ref.update(updates)
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+    log.info("Blog post updated: %s by %s", post_id, get_uid(payload))
+    return {"updated": True, "id": post_id}
+
+
+@router.delete("/blog/{post_id}", tags=["Blog"])
+def delete_blog_post(
+    post_id: str,
+    payload: dict = Depends(require_admin),
+):
+    """
+    DELETE /api/blog/{id}
+    ADMIN ONLY.
+
+    curl -X DELETE http://127.0.0.1:5000/api/blog/my-post \\
+      -H "Authorization: Bearer <admin_token>"
+    """
+    doc_ref = db.collection("blog_posts").document(post_id)
+    doc     = doc_ref.get()
+    if not doc.exists:
+        raise HTTPException(404, detail="Blog post not found")
+
+    old_cover_url = doc.to_dict().get("coverImage", "")
+    doc_ref.delete()
+
+    deleted_file = _delete_file(old_cover_url)
+
+    log.info("Blog post deleted: %s by %s (image deleted=%s)",
+             post_id, get_uid(payload), deleted_file)
+    return {"deleted": True, "id": post_id, "image_deleted": deleted_file}
+
+
+@router.post("/blog/{post_id}/cover-image", tags=["Blog"])
+async def upload_blog_cover_image(
+    post_id: str,
+    image:   UploadFile = File(..., description="New cover image file"),
+    payload: dict       = Depends(require_mod),
+):
+    """
+    POST /api/blog/{id}/cover-image  (multipart/form-data)
+    Upload or replace the cover image for a blog post.
+    The file is saved as  images/blog/<post_id>.<ext>
+
+    curl -X POST http://127.0.0.1:5000/api/blog/my-post/cover-image \\
+      -H "Authorization: Bearer <mod_token>" \\
+      -F "image=@/path/to/cover.jpg"
+    """
+    # _ensure_dirs() / _save_file handle directory creation automatically
+
+    doc_ref = db.collection("blog_posts").document(post_id)
+    doc     = doc_ref.get()
+    if not doc.exists:
+        raise HTTPException(404, detail="Blog post not found")
+
+    old_cover_url = doc.to_dict().get("coverImage", "")
+
+    ext      = os.path.splitext(image.filename or "")[-1].lower() or ".jpg"
+    filename = f"{post_id}{ext}"
+    img_url  = _save_file(image, "blog", filename)
+
+    try:
+        doc_ref.update({"coverImage": img_url, "updated_at": _now()})
+    except Exception as e:
+        raise HTTPException(500, detail=f"Image saved but DB update failed: {e}")
+
+    # Delete old cover image when the path changed (different extension or URL)
+    deleted_old = False
+    if old_cover_url and old_cover_url != img_url:
+        deleted_old = _delete_file(old_cover_url)
+
+    log.info("Blog cover image uploaded: %s → %s by %s (old deleted=%s)",
+             post_id, img_url, get_uid(payload), deleted_old)
+    return {
+        "updated":     True,
+        "id":          post_id,
+        "coverImage":  img_url,
+        "deleted_old": deleted_old,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CMS EDIT HELPERS — for admin / mod content management UI
+# Returns full documents ready to pre-populate edit forms.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── CMS: Explainers ───────────────────────────────────────────────────────────
+
+@router.get("/cms/explainers", tags=["CMS"])
+def cms_list_explainers(payload: dict = Depends(require_mod)):
+    """
+    GET /api/cms/explainers
+    MOD/ADMIN — slim list of all explainers for a CMS management table.
+    Returns id, title, field, badgeColor, readTime, author, image, updated_at.
+
+    curl -H "Authorization: Bearer <mod_token>" \\
+      http://127.0.0.1:5000/api/cms/explainers
+    """
+    try:
+        docs = db.collection("explainers").order_by("title").stream()
+        rows = []
+        for d in docs:
+            ex = d.to_dict()
+            rows.append({
+                "id":         ex.get("id"),
+                "title":      ex.get("title"),
+                "field":      ex.get("field"),
+                "badgeColor": ex.get("badgeColor"),
+                "readTime":   ex.get("readTime"),
+                "author":     ex.get("author", ""),
+                "image":      ex.get("image", ""),
+                "updated_at": ex.get("updated_at", ""),
+            })
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+    return {"explainers": rows, "total": len(rows)}
+
+
+@router.get("/cms/explainers/{explainer_id}", tags=["CMS"])
+def cms_get_explainer(
+    explainer_id: str,
+    payload: dict = Depends(require_mod),
+):
+    """
+    GET /api/cms/explainers/{id}
+    MOD/ADMIN — full explainer document, pre-populated for an edit form.
+    Includes all fields: content, keyInsights, context, technicalDetail, impact.
+
+    curl -H "Authorization: Bearer <mod_token>" \\
+      http://127.0.0.1:5000/api/cms/explainers/quantum-dog
+    """
+    doc = db.collection("explainers").document(explainer_id).get()
+    if not doc.exists:
+        raise HTTPException(404, detail="Explainer not found")
+    ex = doc.to_dict()
+    return {
+        **_fmt_explainer(ex),
+        "created_at": ex.get("created_at", ""),
+        "updated_at": ex.get("updated_at", ""),
+    }
+
+
+# ── CMS: Research Articles ────────────────────────────────────────────────────
+
+@router.get("/cms/research", tags=["CMS"])
+def cms_list_research(payload: dict = Depends(require_mod)):
+    """
+    GET /api/cms/research
+    MOD/ADMIN — slim list of all research articles for a CMS management table.
+    Returns id, title, field, author, date, readTime, image, updated_at.
+
+    curl -H "Authorization: Bearer <mod_token>" \\
+      http://127.0.0.1:5000/api/cms/research
+    """
+    try:
+        docs = db.collection("research_articles").order_by("date", direction="DESCENDING").stream()
+        rows = []
+        for d in docs:
+            art = d.to_dict()
+            rows.append({
+                "id":         art.get("id"),
+                "title":      art.get("title"),
+                "field":      art.get("field"),
+                "author":     art.get("author", ""),
+                "date":       art.get("date", ""),
+                "readTime":   art.get("readTime", ""),
+                "image":      art.get("image", ""),
+                "updated_at": art.get("updated_at", ""),
+            })
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+    return {"articles": rows, "total": len(rows)}
+
+
+@router.get("/cms/research/{article_id}", tags=["CMS"])
+def cms_get_research_article(
+    article_id: str,
+    payload: dict = Depends(require_mod),
+):
+    """
+    GET /api/cms/research/{id}
+    MOD/ADMIN — full research article document, pre-populated for an edit form.
+    Includes all fields: abstract, content, quotes, keyFindings, relatedTopics.
+
+    curl -H "Authorization: Bearer <mod_token>" \\
+      http://127.0.0.1:5000/api/cms/research/a1
+    """
+    doc = db.collection("research_articles").document(article_id).get()
+    if not doc.exists:
+        raise HTTPException(404, detail="Research article not found")
+    art = doc.to_dict()
+    return {
+        **_fmt_article(art),
+        "created_at": art.get("created_at", ""),
+        "updated_at": art.get("updated_at", ""),
+    }
+
+
+# ── CMS: Blog Posts ───────────────────────────────────────────────────────────
+
+@router.get("/cms/blog", tags=["CMS"])
+def cms_list_blog(payload: dict = Depends(require_mod)):
+    """
+    GET /api/cms/blog
+    MOD/ADMIN — slim list of all blog posts for a CMS management table.
+    Returns id, title, field, type, publishDate, readingTime, tags, coverImage, updated_at.
+
+    curl -H "Authorization: Bearer <mod_token>" \\
+      http://127.0.0.1:5000/api/cms/blog
+    """
+    try:
+        docs = db.collection("blog_posts").order_by("publishDate", direction="DESCENDING").stream()
+        rows = []
+        for d in docs:
+            p = d.to_dict()
+            rows.append({
+                "id":          p.get("id"),
+                "title":       p.get("title"),
+                "field":       p.get("field", ""),
+                "type":        p.get("type", "article"),
+                "publishDate": p.get("publishDate", ""),
+                "readingTime": p.get("readingTime", ""),
+                "tags":        p.get("tags", []),
+                "coverImage":  p.get("coverImage", ""),
+                "updated_at":  p.get("updated_at", ""),
+            })
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+    return {"posts": rows, "total": len(rows)}
+
+
+@router.get("/cms/blog/{post_id}", tags=["CMS"])
+def cms_get_blog_post(
+    post_id: str,
+    payload: dict = Depends(require_mod),
+):
+    """
+    GET /api/cms/blog/{id}
+    MOD/ADMIN — full blog post document, pre-populated for an edit form.
+    Includes all fields: content (markdown), author object, keyInsights, tags, etc.
+
+    curl -H "Authorization: Bearer <mod_token>" \\
+      http://127.0.0.1:5000/api/cms/blog/the-future-of-quantum-computing
+    """
+    doc = db.collection("blog_posts").document(post_id).get()
+    if not doc.exists:
+        raise HTTPException(404, detail="Blog post not found")
+    p = doc.to_dict()
+    return {
+        **_fmt_blog(p),
+        "created_at": p.get("created_at", ""),
+        "updated_at": p.get("updated_at", ""),
     }

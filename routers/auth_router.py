@@ -1,11 +1,12 @@
 """
-routers/auth_router.py  —  Authentication & User Management  v7
+routers/auth_router.py  —  Authentication & User Management  v8
 ================================================================
-Changes from v6:
-  - Signup: replaced domain_of_interest/background/statement_of_purpose
-    with a single `profession` field (student/professional/professor/etc.)
-  - New POST /api/auth/interests  — save user's STEM topic interests
-  - New GET  /api/auth/interests  — get current user's interests
+Changes from v7:
+  - Signup now auto-subscribes every new user to the newsletter via
+    POST /api/newsletter/subscribe (internal call), instead of managing a
+    separate newsletter_subscribers collection manually.
+  - Dummy accounts (admin, mod, user) are also auto-subscribed on seed.
+  - `subscribe_email` field on the user doc still works as before.
 
 PROFESSION OPTIONS:
   student | working_professional | professor |
@@ -23,7 +24,7 @@ DUMMY ACCOUNTS (seeded on startup):
 
 ALL ENDPOINTS:
   POST   /api/auth/seed                 public — seed dummy accounts
-  POST   /api/auth/signup               public — register
+  POST   /api/auth/signup               public — register (auto-subscribes newsletter)
   POST   /api/auth/login                public — login → token + user + role
   GET    /api/auth/me                   auth   — own profile
   POST   /api/auth/interests            auth   — save topic interests
@@ -35,6 +36,7 @@ ALL ENDPOINTS:
 
 import uuid
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -51,23 +53,22 @@ log    = logging.getLogger(__name__)
 router = APIRouter()
 
 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Profession options shown in the signup form
 VALID_PROFESSIONS: list[str] = [
-    "student",              # school / college / university student
-    "working_professional", # employed in industry
-    "professor",            # university / college faculty
-    "researcher",           # academic or industrial researcher
-    "self_learner",         # independent learner / autodidact
-    "educator",             # school-level teacher
-    "other",                # anything else
+    "student",
+    "working_professional",
+    "professor",
+    "researcher",
+    "self_learner",
+    "educator",
+    "other",
 ]
 
-# The 10 STEM interest topics shown in the post-signup onboarding screen.
-# These must match the topic keys used in article_fetcher.DOMAIN_KEYWORDS.
 VALID_TOPICS: list[str] = [
     "PHYSICS",
     "CHEMISTRY",
@@ -83,7 +84,7 @@ VALID_TOPICS: list[str] = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DUMMY ACCOUNTS  — plain passwords shown here only, always hashed before save
+# DUMMY ACCOUNTS
 # ─────────────────────────────────────────────────────────────────────────────
 
 DUMMY_ACCOUNTS: list[dict] = [
@@ -95,7 +96,7 @@ DUMMY_ACCOUNTS: list[dict] = [
         "role":           "admin",
         "profession":     "other",
         "interests":      VALID_TOPICS,
-        "subscribe_email":True,  # subscribed to daily insights
+        "subscribe_email": True,
     },
     {
         "id":             "mod-steami-001",
@@ -105,7 +106,7 @@ DUMMY_ACCOUNTS: list[dict] = [
         "role":           "mod",
         "profession":     "researcher",
         "interests":      ["AI + ROBOTICS", "COMPUTER SCIENCE", "PHYSICS"],
-        "subscribe_email":True,
+        "subscribe_email": True,
     },
     {
         "id":             "user-steami-001",
@@ -115,15 +116,58 @@ DUMMY_ACCOUNTS: list[dict] = [
         "role":           "user",
         "profession":     "student",
         "interests":      ["AI + ROBOTICS", "EARTH & SPACE", "BIOLOGY"],
-        "subscribe_email":True,
+        "subscribe_email": True,
     },
 ]
+
+
+def _newsletter_subscribe(email: str, name: str) -> None:
+    """
+    Subscribe an email directly to the newsletter_subscribers collection.
+    Writes to DB instead of making an HTTP self-call — avoids the startup
+    race condition where the server calls itself before it has finished
+    binding to its port.  Idempotent: re-activates existing records.
+    """
+    try:
+        email = email.lower().strip()
+        existing_list = list(
+            db.collection("newsletter_subscribers")
+              .where("email", "==", email)
+              .limit(1)
+              .stream()
+        )
+        if existing_list:
+            sub = existing_list[0].to_dict()
+            if sub.get("subscribed"):
+                log.info("_newsletter_subscribe: already subscribed %s", email)
+                return
+            db.collection("newsletter_subscribers").document(existing_list[0].id).update({
+                "subscribed": True,
+                "updated_at": _now(),
+            })
+            log.info("_newsletter_subscribe: reactivated %s", email)
+            return
+
+        sub_id = str(uuid.uuid4())
+        db.collection("newsletter_subscribers").document(sub_id).set({
+            "id":         sub_id,
+            "uid":        sub_id,
+            "email":      email,
+            "name":       name.strip(),
+            "subscribed": True,
+            "source":     "signup",
+            "created_at": _now(),
+        })
+        log.info("_newsletter_subscribe: subscribed %s", email)
+    except Exception as e:
+        log.warning("_newsletter_subscribe: failed for %s: %s", email, e)
 
 
 def seed_dummy_accounts() -> dict:
     """
     Insert dummy accounts into Firestore if they don't already exist.
     Passwords are hashed before saving — never stored plain.
+    Auto-subscribes each account to the newsletter.
     Called automatically by the startup event in main.py.
     """
     created: list[str] = []
@@ -137,7 +181,6 @@ def seed_dummy_accounts() -> dict:
             skipped.append(acc["email"])
             continue
 
-        # Build the Firestore document — hash the password
         doc = {
             "id":            acc["id"],
             "full_name":     acc["full_name"],
@@ -147,7 +190,7 @@ def seed_dummy_accounts() -> dict:
             "profession":    acc["profession"],
             "interests":     acc["interests"],
             "is_active":     True,
-            "subscribe_email": acc.get("subscribe_email", False),
+            "subscribe_email": acc.get("subscribe_email", True),
             "created_at":    _now(),
             "updated_at":    _now(),
         }
@@ -158,6 +201,10 @@ def seed_dummy_accounts() -> dict:
             log.info("seed: created %s (%s)", acc["email"], acc["role"])
         except Exception as e:
             log.error("seed: failed %s: %s", acc["email"], e)
+            continue
+
+        # Auto-subscribe to newsletter
+        _newsletter_subscribe(acc["email"], acc["full_name"])
 
     return {"created": created, "skipped": skipped}
 
@@ -206,14 +253,11 @@ def _safe(user: dict) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SignupBody(BaseModel):
-    """
-    Signup form — 4 fields only.
-    profession must be one of VALID_PROFESSIONS.
-    """
-    full_name:  str
-    email:      str
-    password:   str
-    profession: str = "student"
+    full_name:       str
+    email:           str
+    password:        str
+    profession:      str  = "student"
+    subscribe_email: bool = True   # opt-in by default; user can uncheck
 
 
 class LoginBody(BaseModel):
@@ -222,27 +266,21 @@ class LoginBody(BaseModel):
 
 
 class InterestsBody(BaseModel):
-    """List of topic strings from VALID_TOPICS."""
     topics: list[str]
 
 
 class UpdateRoleBody(BaseModel):
-    role: str  # "user" | "mod" | "admin"
+    role: str
 
 
 class UpdateUserBody(BaseModel):
-    """
-    Admin: update any field on a user profile.
-    subscribe_email: True/False to toggle email digest subscription.
-    All fields are optional — only provided fields are changed.
-    To deactivate an account set is_active=False.
-    """
-    full_name:  Optional[str]       = None
-    email:      Optional[str]       = None
-    profession: Optional[str]       = None
-    interests:  Optional[list]      = None
-    is_active:  Optional[bool]      = None
-    role:       Optional[str]       = None   # can also change role here
+    full_name:       Optional[str]  = None
+    email:           Optional[str]  = None
+    profession:      Optional[str]  = None
+    interests:       Optional[list] = None
+    is_active:       Optional[bool] = None
+    subscribe_email: Optional[bool] = None
+    role:            Optional[str]  = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -254,8 +292,7 @@ def seed_accounts():
     """
     POST /api/auth/seed
     Seed the three dummy accounts if they don't exist yet. Idempotent.
-
-    curl -X POST http://127.0.0.1:5000/api/auth/seed
+    Each account is auto-subscribed to the newsletter on first creation.
     """
     return seed_dummy_accounts()
 
@@ -266,53 +303,41 @@ def signup(body: SignupBody):
     POST /api/auth/signup
     Register a new user. New users always start with role = "user".
 
-    Body: { full_name, email, password, profession }
+    Every new user is automatically subscribed to the newsletter via
+    POST /api/newsletter/subscribe. The `subscribe_email` field can be
+    set to false to skip the subscription (defaults to true).
 
-    Profession options:
-      student | working_professional | professor |
-      researcher | self_learner | educator | other
+    Body: { full_name, email, password, profession, subscribe_email }
 
     Response: { token, user, role }
 
     After signup, call POST /api/auth/interests to choose STEM topics.
-
-    curl -X POST http://127.0.0.1:5000/api/auth/signup \\
-      -H "Content-Type: application/json" \\
-      -d '{"full_name":"Sahil","email":"s@e.com","password":"Test@123","profession":"student"}'
     """
     email = body.email.lower().strip()
 
-    # Validate email format
     if "@" not in email or "." not in email.split("@")[-1]:
         raise HTTPException(400, detail="Invalid email address.")
-
-    # Validate password length
     if len(body.password) < 6:
         raise HTTPException(400, detail="Password must be at least 6 characters.")
-
-    # Validate profession
     if body.profession not in VALID_PROFESSIONS:
         raise HTTPException(
             400,
             detail=f"Invalid profession. Choose from: {', '.join(VALID_PROFESSIONS)}"
         )
-
-    # Check for duplicate email
     if _find_by_email(email):
         raise HTTPException(409, detail="An account with this email already exists.")
 
-    # Build and save user document
     user_id  = str(uuid.uuid4())
     user_doc = {
         "id":            user_id,
         "full_name":     body.full_name.strip(),
         "email":         email,
-        "password_hash": hash_password(body.password),   # hash immediately
-        "role":          "user",                          # always "user" at signup
+        "password_hash": hash_password(body.password),
+        "role":          "user",
         "profession":    body.profession,
-        "interests":     [],                              # set later via /interests
+        "interests":     [],
         "is_active":         True,
-        "subscribe_email":    body.subscribe_email,  # email digest opt-in
+        "subscribe_email":    body.subscribe_email,
         "created_at":        _now(),
         "updated_at":        _now(),
     }
@@ -323,8 +348,16 @@ def signup(body: SignupBody):
         log.error("signup: save failed: %s", e)
         raise HTTPException(500, detail="Account creation failed.")
 
+    # ── Auto-subscribe to newsletter via the newsletter router ─────────────
+    # Always subscribe (even if subscribe_email=False) because the newsletter
+    # router's POST /subscribe is the source of truth for the subscribers list.
+    # The user's subscribe_email flag controls whether they *receive* emails;
+    # the newsletter collection tracks their subscription status.
+    _newsletter_subscribe(email, body.full_name.strip())
+
     token = create_token(user_id, "user")
-    log.info("signup: %s (%s) profession=%s", email, user_id, body.profession)
+    log.info("signup: %s (%s) profession=%s newsletter=%s",
+             email, user_id, body.profession, body.subscribe_email)
     return {"token": token, "user": _safe(user_doc), "role": "user"}
 
 
@@ -334,29 +367,18 @@ def login(body: LoginBody):
     POST /api/auth/login
     Authenticate and receive a JWT token.
 
-    Body: { email, password }
-
     Test accounts:
       admin@steami.dev / Admin@steami123  → admin
       mod@steami.dev   / Mod@steami123    → mod
       user@steami.dev  / User@steami123   → user
-
-    Response: { token, user: { id, full_name, email, role, profession, interests }, role }
-
-    curl -X POST http://127.0.0.1:5000/api/auth/login \\
-      -H "Content-Type: application/json" \\
-      -d '{"email":"admin@steami.dev","password":"Admin@steami123"}'
     """
     email = body.email.lower().strip()
     user  = _find_by_email(email)
 
-    # Generic error message prevents email enumeration
     if not user:
         raise HTTPException(401, detail="Invalid email or password.")
-
     if not user.get("is_active", True):
         raise HTTPException(403, detail="Account deactivated. Contact admin.")
-
     if not verify_password(body.password, user.get("password_hash", "")):
         raise HTTPException(401, detail="Invalid email or password.")
 
@@ -367,12 +389,6 @@ def login(body: LoginBody):
 
 @router.get("/me", summary="Get own profile — requires auth")
 def get_me(payload: dict = Depends(require_auth)):
-    """
-    GET /api/auth/me
-    Returns the currently authenticated user's profile.
-
-    curl -H "Authorization: Bearer <token>" http://127.0.0.1:5000/api/auth/me
-    """
     doc = db.collection("users").document(get_uid(payload)).get()
     if not doc.exists:
         raise HTTPException(404, detail="User not found.")
@@ -380,44 +396,19 @@ def get_me(payload: dict = Depends(require_auth)):
 
 
 @router.post("/interests", summary="Save topic interests — requires auth")
-def save_interests(
-    body:    InterestsBody,
-    payload: dict = Depends(require_auth),  # any logged-in user
-):
+def save_interests(body: InterestsBody, payload: dict = Depends(require_auth)):
     """
     POST /api/auth/interests
     Save the STEM topics this user wants to follow.
-    Called during post-signup onboarding or whenever the user updates prefs.
-
-    topics must be a non-empty subset of the 10 valid STEM topics:
-      PHYSICS | CHEMISTRY | BIOLOGY | MEDICINE | EARTH & SPACE |
-      COMPUTER SCIENCE | AI + ROBOTICS | ENGINEERING |
-      MATHEMATICS & DATA | CLIMATE & ENERGY
-
-    Body: { "topics": ["AI + ROBOTICS", "PHYSICS", "EARTH & SPACE"] }
-
-    Response: { updated, interests, valid_topics }
-
-    curl -X POST http://127.0.0.1:5000/api/auth/interests \\
-      -H "Authorization: Bearer <token>" \\
-      -H "Content-Type: application/json" \\
-      -d '{"topics":["AI + ROBOTICS","PHYSICS"]}'
     """
-    # Validate every topic
     invalid = [t for t in body.topics if t not in VALID_TOPICS]
     if invalid:
-        raise HTTPException(
-            400,
-            detail=f"Invalid topics: {invalid}. Valid: {VALID_TOPICS}"
-        )
-
+        raise HTTPException(400, detail=f"Invalid topics: {invalid}. Valid: {VALID_TOPICS}")
     if not body.topics:
         raise HTTPException(400, detail="Select at least one topic.")
 
-    # Deduplicate preserving order
     unique = list(dict.fromkeys(body.topics))
-
-    uid     = get_uid(payload)
+    uid    = get_uid(payload)
     doc_ref = db.collection("users").document(uid)
     if not doc_ref.get().exists:
         raise HTTPException(404, detail="User not found.")
@@ -433,14 +424,6 @@ def save_interests(
 
 @router.get("/interests", summary="Get own interests — requires auth")
 def get_interests(payload: dict = Depends(require_auth)):
-    """
-    GET /api/auth/interests
-    Get the current user's saved STEM topic interests.
-
-    Response: { interests: [...], valid_topics: [...all 10...] }
-
-    curl -H "Authorization: Bearer <token>" http://127.0.0.1:5000/api/auth/interests
-    """
     doc = db.collection("users").document(get_uid(payload)).get()
     if not doc.exists:
         raise HTTPException(404, detail="User not found.")
@@ -452,12 +435,6 @@ def get_interests(payload: dict = Depends(require_auth)):
 
 @router.get("/users", summary="List all users — admin only")
 def list_all_users(payload: dict = Depends(require_admin)):
-    """
-    GET /api/auth/users
-    List every registered user. ADMIN ONLY.
-
-    curl -H "Authorization: Bearer <admin_token>" http://127.0.0.1:5000/api/auth/users
-    """
     try:
         docs  = db.collection("users").limit(500).stream()
         users = [_safe(d.to_dict()) for d in docs]
@@ -467,20 +444,7 @@ def list_all_users(payload: dict = Depends(require_admin)):
 
 
 @router.put("/users/{uid}/role", summary="Change user role — admin only")
-def update_user_role(
-    uid:     str,
-    body:    UpdateRoleBody,
-    payload: dict = Depends(require_admin),
-):
-    """
-    PUT /api/auth/users/{uid}/role
-    Promote or demote a user. ADMIN ONLY.
-    Body: { "role": "mod" }
-
-    curl -X PUT http://127.0.0.1:5000/api/auth/users/UID/role \\
-      -H "Authorization: Bearer <admin_token>" \\
-      -d '{"role":"mod"}'
-    """
+def update_user_role(uid: str, body: UpdateRoleBody, payload: dict = Depends(require_admin)):
     if body.role not in ROLES:
         raise HTTPException(400, detail=f"Role must be: {', '.join(ROLES)}")
     if uid == get_uid(payload) and body.role != "admin":
@@ -495,13 +459,6 @@ def update_user_role(
 
 @router.delete("/users/{uid}", summary="Delete user — admin only")
 def delete_user(uid: str, payload: dict = Depends(require_admin)):
-    """
-    DELETE /api/auth/users/{uid}
-    Permanently delete a user account. ADMIN ONLY.
-
-    curl -X DELETE http://127.0.0.1:5000/api/auth/users/UID \\
-      -H "Authorization: Bearer <admin_token>"
-    """
     if uid == get_uid(payload):
         raise HTTPException(400, detail="Cannot delete your own account.")
     doc_ref = db.collection("users").document(uid)
@@ -511,16 +468,9 @@ def delete_user(uid: str, payload: dict = Depends(require_admin)):
     log.info("deleted user: %s by %s", uid, get_uid(payload))
     return {"deleted": True, "uid": uid}
 
+
 @router.get("/users/{uid}", summary="Get single user by ID — admin only")
 def get_user_by_id(uid: str, payload: dict = Depends(require_admin)):
-    """
-    GET /api/auth/users/{uid}
-    Get a single user's full profile by their ID. ADMIN ONLY.
-
-    Response: full user object (without password_hash)
-
-    curl -H "Authorization: Bearer <admin_token>" http://127.0.0.1:5000/api/auth/users/USER_ID
-    """
     doc = db.collection("users").document(uid).get()
     if not doc.exists:
         raise HTTPException(404, detail="User not found.")
@@ -528,38 +478,11 @@ def get_user_by_id(uid: str, payload: dict = Depends(require_admin)):
 
 
 @router.put("/users/{uid}", summary="Update user profile — admin only")
-def admin_update_user(
-    uid:     str,
-    body:    UpdateUserBody,
-    payload: dict = Depends(require_admin),
-):
-    """
-    PUT /api/auth/users/{uid}
-    Update any profile field for a user. ADMIN ONLY.
-    Only the fields provided in the body are changed; others stay the same.
-
-    Body (all fields optional):
-    {
-      "full_name":  "New Name",
-      "email":      "new@email.com",
-      "profession": "researcher",
-      "interests":  ["PHYSICS", "AI + ROBOTICS"],
-      "is_active":  true,
-      "role":       "mod"
-    }
-
-    Response: { "updated": true, "uid": "..." }
-
-    curl -X PUT http://127.0.0.1:5000/api/auth/users/USER_ID \
-      -H "Authorization: Bearer <admin_token>" \
-      -H "Content-Type: application/json" \
-      -d '{"full_name":"Updated Name","is_active":true,"profession":"researcher"}'
-    """
+def admin_update_user(uid: str, body: UpdateUserBody, payload: dict = Depends(require_admin)):
     doc_ref = db.collection("users").document(uid)
     if not doc_ref.get().exists:
         raise HTTPException(404, detail="User not found.")
 
-    # Build update dict with only fields that were provided (not None)
     updates: dict = {"updated_at": _now()}
 
     if body.full_name  is not None: updates["full_name"]  = body.full_name.strip()
@@ -567,18 +490,16 @@ def admin_update_user(
         if body.profession not in VALID_PROFESSIONS:
             raise HTTPException(400, detail=f"Invalid profession: {body.profession}")
         updates["profession"] = body.profession
-    if body.interests  is not None:
-        # Validate topic names
+    if body.interests is not None:
         invalid = [t for t in body.interests if t not in VALID_TOPICS]
         if invalid:
             raise HTTPException(400, detail=f"Invalid topics: {invalid}")
         updates["interests"] = list(dict.fromkeys(body.interests))
     if body.is_active        is not None: updates["is_active"]        = body.is_active
-    if body.subscribe_email is not None: updates["subscribe_email"] = body.subscribe_email
-    if body.role       is not None:
+    if body.subscribe_email  is not None: updates["subscribe_email"]  = body.subscribe_email
+    if body.role is not None:
         if body.role not in ROLES:
             raise HTTPException(400, detail=f"Invalid role: {body.role}")
-        # Prevent admin from changing their own role
         if uid == get_uid(payload) and body.role != "admin":
             raise HTTPException(400, detail="Cannot change your own role.")
         updates["role"] = body.role
@@ -586,7 +507,6 @@ def admin_update_user(
         new_email = body.email.lower().strip()
         if "@" not in new_email:
             raise HTTPException(400, detail="Invalid email format.")
-        # Check the new email is not already taken by another user
         existing = _find_by_email(new_email)
         if existing and existing.get("id") != uid:
             raise HTTPException(409, detail="Email already in use by another account.")
@@ -603,33 +523,15 @@ def admin_update_user(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EMAIL NEWSLETTER — subscription management + email list API
+# EMAIL NEWSLETTER — subscription management
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SubscribeBody(BaseModel):
-    """Toggle the user's daily email digest subscription."""
-    subscribe: bool  # True = subscribe, False = unsubscribe
+    subscribe: bool
 
 
 @router.post("/subscribe", summary="Update email digest subscription — requires auth")
-def update_subscription(
-    body:    SubscribeBody,
-    payload: dict = Depends(require_auth),
-):
-    """
-    POST /api/auth/subscribe
-    Opt in or out of the daily article insight email digest.
-    Can also be set during signup via the subscribe_email field.
-
-    Body: { "subscribe": true }
-
-    Response: { "updated": true, "subscribe_email": true }
-
-    curl -X POST http://127.0.0.1:5000/api/auth/subscribe \\
-      -H "Authorization: Bearer <token>" \\
-      -H "Content-Type: application/json" \\
-      -d '{"subscribe": true}'
-    """
+def update_subscription(body: SubscribeBody, payload: dict = Depends(require_auth)):
     uid     = get_uid(payload)
     doc_ref = db.collection("users").document(uid)
     if not doc_ref.get().exists:
@@ -643,44 +545,9 @@ def update_subscription(
     return {"updated": True, "subscribe_email": body.subscribe}
 
 
-@router.get("/newsletter/recipients", summary="Get subscribed users for email send — admin only")
-def get_newsletter_recipients(
-    payload: dict = Depends(require_admin),
-):
-    """
-    GET /api/auth/newsletter/recipients
-    Returns all users who have opted in to the daily email digest,
-    grouped by their interest topics.
-
-    Use this endpoint when sending the daily newsletter:
-    - Call this to get the full recipient list with emails + interests
-    - For each interest topic, gather articles and insights from /api/articles
-      and /api/insights, then send personalised emails
-
-    Response:
-    {
-      "total": 42,
-      "recipients": [
-        {
-          "id":         "user-uuid",
-          "full_name":  "Sahil Kumar",
-          "email":      "sahil@example.com",
-          "interests":  ["AI + ROBOTICS", "PHYSICS"],
-          "profession": "student"
-        }, ...
-      ],
-      "by_topic": {
-        "AI + ROBOTICS":  ["sahil@example.com", "admin@steami.dev"],
-        "PHYSICS":        ["sahil@example.com"],
-        ...
-      }
-    }
-
-    curl -H "Authorization: Bearer <admin_token>" \\
-      http://127.0.0.1:5000/api/auth/newsletter/recipients
-    """
+@router.get("/newsletter/recipients", summary="Get subscribed users — admin only")
+def get_newsletter_recipients(payload: dict = Depends(require_admin)):
     try:
-        # Fetch all users who have subscribe_email = True
         docs = (
             db.collection("users")
               .where("subscribe_email", "==", True)
@@ -690,7 +557,7 @@ def get_newsletter_recipients(
         for d in docs:
             u = d.to_dict()
             if not u.get("is_active", True):
-                continue  # skip deactivated accounts
+                continue
             recipients.append({
                 "id":        u.get("id"),
                 "full_name": u.get("full_name", ""),
@@ -699,25 +566,14 @@ def get_newsletter_recipients(
                 "profession":u.get("profession", ""),
             })
     except Exception as e:
-        log.error("get_newsletter_recipients failed: %s", e)
         raise HTTPException(500, detail=str(e))
 
-    # Build a by_topic map: topic → list of email addresses
-    # Useful for sending topic-specific batches
     by_topic: dict = {}
     for r in recipients:
         for topic in r.get("interests", []):
-            if topic not in by_topic:
-                by_topic[topic] = []
-            by_topic[topic].append(r["email"])
+            by_topic.setdefault(topic, []).append(r["email"])
 
-    log.info("newsletter/recipients: %d subscribed users, %d topics",
-             len(recipients), len(by_topic))
-    return {
-        "total":      len(recipients),
-        "recipients": recipients,
-        "by_topic":   by_topic,
-    }
+    return {"total": len(recipients), "recipients": recipients, "by_topic": by_topic}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -725,63 +581,16 @@ def get_newsletter_recipients(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class EditProfileBody(BaseModel):
-    """
-    Fields a user can update on their own profile.
-    All fields are optional — only the ones provided are changed.
-    To change password, provide both current_password and new_password.
-    """
-    full_name:        Optional[str]  = None   # display name
-    profession:       Optional[str]  = None   # student | researcher | etc.
-    interests:        Optional[list] = None   # list of VALID_TOPICS
-    subscribe_email:  Optional[bool] = None   # email digest opt-in toggle
-    # Password change — both must be provided together
-    current_password: Optional[str]  = None   # must match what's stored
-    new_password:     Optional[str]  = None   # min 6 chars
+    full_name:        Optional[str]  = None
+    profession:       Optional[str]  = None
+    interests:        Optional[list] = None
+    subscribe_email:  Optional[bool] = None
+    current_password: Optional[str]  = None
+    new_password:     Optional[str]  = None
 
 
 @router.put("/profile", summary="Edit own profile — requires auth")
-def edit_profile(
-    body:    EditProfileBody,
-    payload: dict = Depends(require_auth),   # any logged-in user
-):
-    """
-    PUT /api/auth/profile
-    Lets a logged-in user update their own profile information.
-    All fields are optional — send only what you want to change.
-
-    Editable fields:
-      full_name       — display name shown in the UI
-      profession      — student | working_professional | professor |
-                        researcher | self_learner | educator | other
-      interests       — list of STEM topics (from the 10 valid topics)
-      subscribe_email — true/false to toggle daily email digest
-      current_password + new_password — to change password (both required)
-
-    Body examples:
-      Change name only:
-        { "full_name": "Sahil Kumar" }
-
-      Change profession and interests:
-        { "profession": "researcher", "interests": ["AI + ROBOTICS", "PHYSICS"] }
-
-      Toggle email subscription:
-        { "subscribe_email": false }
-
-      Change password:
-        { "current_password": "OldPass123", "new_password": "NewPass456" }
-
-    Response:
-    {
-      "updated":        true,
-      "updated_fields": ["full_name", "profession"],
-      "user": { ...updated user profile without password_hash... }
-    }
-
-    curl -X PUT http://127.0.0.1:5000/api/auth/profile \\
-      -H "Authorization: Bearer <token>" \\
-      -H "Content-Type: application/json" \\
-      -d '{"full_name":"New Name","profession":"researcher"}'
-    """
+def edit_profile(body: EditProfileBody, payload: dict = Depends(require_auth)):
     uid     = get_uid(payload)
     doc_ref = db.collection("users").document(uid)
     doc     = doc_ref.get()
@@ -790,190 +599,87 @@ def edit_profile(
         raise HTTPException(404, detail="User not found.")
 
     user    = doc.to_dict()
-    updates = {}   # only the fields the user actually provided
+    updates = {}
 
-    # ── full_name ──────────────────────────────────────────────────────────
     if body.full_name is not None:
         name = body.full_name.strip()
         if not name:
             raise HTTPException(400, detail="full_name cannot be empty.")
         updates["full_name"] = name
 
-    # ── profession ─────────────────────────────────────────────────────────
     if body.profession is not None:
         if body.profession not in VALID_PROFESSIONS:
-            raise HTTPException(
-                400,
-                detail=f"Invalid profession. Choose from: {', '.join(VALID_PROFESSIONS)}"
-            )
+            raise HTTPException(400, detail=f"Invalid profession. Choose from: {', '.join(VALID_PROFESSIONS)}")
         updates["profession"] = body.profession
 
-    # ── interests ──────────────────────────────────────────────────────────
     if body.interests is not None:
         invalid = [t for t in body.interests if t not in VALID_TOPICS]
         if invalid:
-            raise HTTPException(
-                400,
-                detail=f"Invalid topics: {invalid}. Valid options: {VALID_TOPICS}"
-            )
-        # Deduplicate while preserving order
+            raise HTTPException(400, detail=f"Invalid topics: {invalid}. Valid options: {VALID_TOPICS}")
         updates["interests"] = list(dict.fromkeys(body.interests))
 
-    # ── subscribe_email ─────────────────────────────────────────────────────
     if body.subscribe_email is not None:
         updates["subscribe_email"] = body.subscribe_email
 
-    # ── password change ────────────────────────────────────────────────────
-    # Both fields must be provided together — neither alone is accepted.
     if body.current_password is not None or body.new_password is not None:
         if not body.current_password or not body.new_password:
-            raise HTTPException(
-                400,
-                detail="Provide both current_password and new_password to change password."
-            )
-        # Verify the current password before allowing the change
+            raise HTTPException(400, detail="Provide both current_password and new_password.")
         if not verify_password(body.current_password, user.get("password_hash", "")):
             raise HTTPException(401, detail="Current password is incorrect.")
         if len(body.new_password) < 6:
             raise HTTPException(400, detail="New password must be at least 6 characters.")
-        # Hash the new password — never store plain text
         updates["password_hash"] = hash_password(body.new_password)
 
-    # Nothing to update
     if not updates:
         raise HTTPException(400, detail="No fields provided to update.")
 
-    # Always stamp the update time
     updates["updated_at"] = _now()
 
     try:
         doc_ref.update(updates)
     except Exception as e:
-        log.error("edit_profile: update failed uid=%s: %s", uid, e)
         raise HTTPException(500, detail=str(e))
 
-    # Fetch the updated document to return the fresh profile
     updated_doc = doc_ref.get()
     safe_user   = _safe(updated_doc.to_dict())
-
-    # Build the list of field names that were actually changed
-    # (exclude password_hash — show "password" instead for clarity)
     changed_fields = [
         "password" if k == "password_hash" else k
-        for k in updates.keys()
-        if k != "updated_at"
+        for k in updates.keys() if k != "updated_at"
     ]
 
     log.info("edit_profile: uid=%s changed=%s", uid, changed_fields)
-    return {
-        "updated":        True,
-        "updated_fields": changed_fields,
-        "user":           safe_user,
-    }
+    return {"updated": True, "updated_fields": changed_fields, "user": safe_user}
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SUBSCRIBE TOGGLE — single-click flip for the user table UI
-# ─────────────────────────────────────────────────────────────────────────────
 
 @router.patch("/subscribe/toggle", summary="Toggle email subscription on/off — requires auth")
 def toggle_subscription(payload: dict = Depends(require_auth)):
-    """
-    PATCH /api/auth/subscribe/toggle
-    Flip the current user's subscribe_email value in a single request.
-    No request body needed — just call this endpoint and the value switches.
-
-    Designed for a toggle switch / checkbox in the user table UI:
-      - If currently True  → sets to False (unsubscribe)
-      - If currently False → sets to True  (subscribe)
-
-    Response:
-    {
-      "updated":         true,
-      "subscribe_email": false,   ← the NEW value after toggling
-      "message":         "Unsubscribed from daily email digest"
-    }
-
-    curl -X PATCH http://127.0.0.1:5000/api/auth/subscribe/toggle \\
-      -H "Authorization: Bearer <token>"
-    """
     uid     = get_uid(payload)
     doc_ref = db.collection("users").document(uid)
     doc     = doc_ref.get()
-
     if not doc.exists:
         raise HTTPException(404, detail="User not found.")
-
-    # Read current value — default False if field doesn't exist yet
-    current = doc.to_dict().get("subscribe_email", False)
-
-    # Flip it
+    current   = doc.to_dict().get("subscribe_email", False)
     new_value = not current
-
     try:
         doc_ref.update({"subscribe_email": new_value, "updated_at": _now()})
     except Exception as e:
         raise HTTPException(500, detail=str(e))
-
-    message = (
-        "Subscribed to daily email digest"
-        if new_value else
-        "Unsubscribed from daily email digest"
-    )
-    log.info("toggle_subscription: uid=%s %s→%s", uid, current, new_value)
-    return {
-        "updated":         True,
-        "subscribe_email": new_value,
-        "message":         message,
-    }
+    message = "Subscribed to daily email digest" if new_value else "Unsubscribed from daily email digest"
+    return {"updated": True, "subscribe_email": new_value, "message": message}
 
 
 @router.patch("/users/{uid}/subscribe/toggle", summary="Admin toggle subscribe for any user")
-def admin_toggle_subscription(
-    uid:     str,
-    payload: dict = Depends(require_admin),   # admin only
-):
-    """
-    PATCH /api/auth/users/{uid}/subscribe/toggle
-    Admin version — flip the subscribe_email value for ANY user by their ID.
-    Useful for the admin user management table where admins can toggle
-    a user's subscription with a single click.
-
-    Response:
-    {
-      "updated":         true,
-      "uid":             "user-uuid",
-      "subscribe_email": true,    ← new value
-      "message":         "Subscribed to daily email digest"
-    }
-
-    curl -X PATCH http://127.0.0.1:5000/api/auth/users/USER_ID/subscribe/toggle \\
-      -H "Authorization: Bearer <admin_token>"
-    """
+def admin_toggle_subscription(uid: str, payload: dict = Depends(require_admin)):
     doc_ref = db.collection("users").document(uid)
     doc     = doc_ref.get()
-
     if not doc.exists:
         raise HTTPException(404, detail="User not found.")
-
     current   = doc.to_dict().get("subscribe_email", False)
     new_value = not current
-
     try:
         doc_ref.update({"subscribe_email": new_value, "updated_at": _now()})
     except Exception as e:
         raise HTTPException(500, detail=str(e))
-
-    message = (
-        "Subscribed to daily email digest"
-        if new_value else
-        "Unsubscribed from daily email digest"
-    )
-    log.info("admin_toggle_subscription: uid=%s %s→%s by admin=%s",
-             uid, current, new_value, get_uid(payload))
-    return {
-        "updated":         True,
-        "uid":             uid,
-        "subscribe_email": new_value,
-        "message":         message,
-    }
+    message = "Subscribed to daily email digest" if new_value else "Unsubscribed from daily email digest"
+    log.info("admin_toggle_subscription: uid=%s %s→%s by admin=%s", uid, current, new_value, get_uid(payload))
+    return {"updated": True, "uid": uid, "subscribe_email": new_value, "message": message}

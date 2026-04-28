@@ -1,12 +1,11 @@
 """
-Article fetcher v4
-— 3 RSS sources: MIT Tech Review, BBC Tech, NYTimes Tech
-— DOMAIN_KEYWORDS map: 10 domains (Robotics, Space, AI, Finance, Physics,
-  Chemistry, Biology/Medicine, Engineering, Mathematics, Computer Science)
-— fetch_articles_by_domains(): fetches 20-25 articles, ensures every
-  active domain has ≥1 article, caps at 30-35 filtered before dedup
+Article fetcher v5
+— 4 RSS sources: MIT Tech Review, BBC Tech, NYTimes Tech, ScienceDaily
+— DOMAIN_KEYWORDS map: 10 domains
+— fetch_articles_by_domains(): fetches up to 40 articles, ensures every
+  active domain has ≥1 article
 — Each article enriched with: image_url, short_summary (30-40 words),
-  full_content (for Gemini), article_url, matched_domains list
+  full_content (for Ollama), article_url, matched_domains list
 — fetch_articles_from_url() kept for the "From Source" button
 """
 
@@ -38,7 +37,7 @@ MOBILE_HEADERS = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3 PRIMARY RSS SOURCES
+# PRIMARY RSS SOURCES  (4 sources including ScienceDaily)
 # ─────────────────────────────────────────────────────────────────────────────
 
 PRIMARY_SOURCES = [
@@ -54,6 +53,10 @@ PRIMARY_SOURCES = [
         "name": "NYTimes Tech",
         "url":  "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml",
     },
+    {
+        "name": "ScienceDaily",
+        "url":  "https://www.sciencedaily.com/rss/all.xml",
+    },
 ]
 
 # Legacy full list kept for /api/sources endpoint & fetch_articles_from_source
@@ -66,48 +69,40 @@ RSS_SOURCES = PRIMARY_SOURCES + [
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DOMAIN → KEYWORDS MAP  (canonical; used everywhere)
+# DOMAIN → KEYWORDS MAP
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Keys here MUST match the VALID_TOPICS list in routers/auth_router.py
-# so that user interests map directly to article domains.
 DOMAIN_KEYWORDS: dict[str, list[str]] = {
-    # ── 1. PHYSICS ────────────────────────────────────────────────────────
     "PHYSICS": [
         "physics", "quantum", "particle", "electron", "photon",
         "semiconductor", "superconductor", "fusion", "nuclear",
         "relativity", "dark matter", "dark energy", "hadron",
         "qubit", "topological", "fermion", "boson", "wave function",
     ],
-    # ── 2. CHEMISTRY ──────────────────────────────────────────────────────
     "CHEMISTRY": [
         "chemistry", "molecule", "compound", "polymer", "catalyst",
         "chemical", "reaction", "synthesis", "nanotechnology",
         "material science", "carbon", "hydrogen", "protein",
         "periodic table", "organic chemistry", "inorganic", "electrolyte",
     ],
-    # ── 3. BIOLOGY ────────────────────────────────────────────────────────
     "BIOLOGY": [
         "biology", "gene", "dna", "rna", "crispr", "genome",
         "cell", "bacteria", "virus", "evolution", "ecology",
         "neuroscience", "brain", "neuron", "biotech", "genomics",
         "synthetic biology", "organism", "protein folding", "alphafold",
     ],
-    # ── 4. MEDICINE ───────────────────────────────────────────────────────
     "MEDICINE": [
         "medicine", "vaccine", "cancer", "drug", "clinical trial",
         "pharmaceutical", "health", "disease", "treatment", "therapy",
         "antibiotic", "surgery", "hospital", "patient", "diagnosis",
         "mental health", "pandemic", "epidemic", "biomarker", "stem cell",
     ],
-    # ── 5. EARTH & SPACE ──────────────────────────────────────────────────
     "EARTH & SPACE": [
         "space", "nasa", "astronomy", "rocket", "satellite", "mars",
         "moon", "orbit", "telescope", "astrophysics", "spacex", "isro",
         "galaxy", "universe", "cosmos", "black hole", "exoplanet",
         "climate", "earthquake", "ocean", "atmosphere", "glacier",
     ],
-    # ── 6. COMPUTER SCIENCE ───────────────────────────────────────────────
     "COMPUTER SCIENCE": [
         "software", "programming", "cybersecurity", "cloud",
         "database", "operating system", "compiler", "open source",
@@ -115,7 +110,6 @@ DOMAIN_KEYWORDS: dict[str, list[str]] = {
         "mobile app", "internet", "network", "hack", "data science",
         "algorithm", "cryptography", "quantum computing", "blockchain",
     ],
-    # ── 7. AI + ROBOTICS ──────────────────────────────────────────────────
     "AI + ROBOTICS": [
         "artificial intelligence", "machine learning", "deep learning",
         "neural network", "large language model", "llm", "chatgpt",
@@ -124,7 +118,6 @@ DOMAIN_KEYWORDS: dict[str, list[str]] = {
         "robot", "robotics", "automation", "drone", "autonomous vehicle",
         "self-driving", "humanoid", "cobots", "industrial robot",
     ],
-    # ── 8. ENGINEERING ────────────────────────────────────────────────────
     "ENGINEERING": [
         "engineering", "infrastructure", "bridge", "circuit",
         "processor", "chip", "microchip", "3d printing",
@@ -132,14 +125,12 @@ DOMAIN_KEYWORDS: dict[str, list[str]] = {
         "solar panel", "battery", "electric vehicle", "ev",
         "semiconductor fabrication", "materials", "turbine",
     ],
-    # ── 9. MATHEMATICS & DATA ─────────────────────────────────────────────
     "MATHEMATICS & DATA": [
         "mathematics", "theorem", "statistics", "probability",
         "topology", "calculus", "graph theory", "optimization",
         "data science", "big data", "analytics", "simulation",
         "riemann", "prime", "number theory", "geometry", "algebra",
     ],
-    # ── 10. CLIMATE & ENERGY ──────────────────────────────────────────────
     "CLIMATE & ENERGY": [
         "climate change", "global warming", "carbon", "emissions",
         "renewable energy", "solar", "wind power", "nuclear energy",
@@ -149,31 +140,36 @@ DOMAIN_KEYWORDS: dict[str, list[str]] = {
     ],
 }
 
-# Flat list of all 10 domain names — used for validation and iteration
 ALL_DOMAINS: list[str] = list(DOMAIN_KEYWORDS.keys())
+
+# Hard cap on articles fetched per refresh call
+MAX_FETCH_LIMIT = 40
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN: domain-aware fetch  (called by the new /api/articles/refresh endpoint)
+# MAIN: domain-aware fetch  (called by /api/articles/refresh)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_articles_by_domains(
     active_domains: list[str] | None = None,
-    target_total: int = 25,
+    target_total: int = 40,
 ) -> list[dict]:
     """
-    Fetch articles from the 3 primary sources.
-    1. Pull ~15 entries per source (45 raw).
+    Fetch articles from the 4 primary sources (including ScienceDaily).
+    1. Pull ~15 entries per source (60 raw).
     2. Filter: keep only articles matching any keyword of any active domain.
-    3. Cap the filtered pool at 35.
+    3. Cap filtered pool at 50.
     4. Guarantee ≥1 article per active domain (fill from pool or skip).
     5. Enrich every kept article: image, short_summary, matched_domains.
-    Returns 20-25 articles (target_total).
+    Returns up to MAX_FETCH_LIMIT (40) articles.
     """
+    # Clamp target to the hard cap
+    target_total = min(target_total, MAX_FETCH_LIMIT)
+
     domains = active_domains or ALL_DOMAINS
     kw_map  = {d: [k.lower() for k in DOMAIN_KEYWORDS.get(d, [])] for d in domains}
 
-    # ── 1. Fetch raw entries from 3 primary sources ────────────────────────
+    # ── 1. Fetch raw entries from 4 primary sources ────────────────────────
     raw: list[dict] = []
     for src in PRIMARY_SOURCES:
         try:
@@ -195,22 +191,17 @@ def fetch_articles_by_domains(
         if matched:
             scored.append((len(matched), matched, art))
 
-    # Sort: most-domains-matched first
     scored.sort(key=lambda x: x[0], reverse=True)
+    pool = scored[:50]
 
-    # Cap filtered pool at 35
-    pool = scored[:35]
-
-    # ── 3. Guarantee MINIMUM 3 articles per active domain ────────────────
-    # We track how many articles each domain has so far.
-    MIN_PER_DOMAIN = 3  # minimum articles required per topic
+    # ── 3. Guarantee MINIMUM 3 articles per active domain ─────────────────
+    MIN_PER_DOMAIN = 3
 
     domain_count: dict[str, int] = {d: 0 for d in domains}
     selected: list[dict] = []
     pool_ids: set[str] = set()
 
     def _add(art: dict, matched_doms: list[str]) -> None:
-        """Add an article to selected and update domain counters."""
         art["matched_domains"] = matched_doms
         selected.append(art)
         pool_ids.add(art["id"])
@@ -218,13 +209,11 @@ def fetch_articles_by_domains(
             if d in domain_count:
                 domain_count[d] += 1
 
-    # First pass: fill each domain to MIN_PER_DOMAIN articles
-    # We iterate over the pool multiple times until all domains are satisfied
+    # First pass: fill each domain to MIN_PER_DOMAIN
     for domain in domains:
         needed = MIN_PER_DOMAIN - domain_count.get(domain, 0)
         if needed <= 0:
             continue
-        # Find articles that match this domain and haven't been selected yet
         for _, matched, art in pool:
             if needed <= 0:
                 break
@@ -241,15 +230,10 @@ def fetch_articles_by_domains(
         if art["id"] not in pool_ids:
             _add(art, matched)
 
-    log.info(
-        "domain coverage: %s",
-        {d: domain_count[d] for d in domains}
-    )
+    log.info("domain coverage: %s", {d: domain_count[d] for d in domains})
 
     # ── 4. Enrich: image + short_summary ──────────────────────────────────
-    enriched = []
-    for art in selected:
-        enriched.append(_enrich_article(art))
+    enriched = [_enrich_article(art) for art in selected]
 
     log.info(
         "fetch_articles_by_domains: raw=%d filtered=%d selected=%d enriched=%d",
@@ -263,15 +247,7 @@ def fetch_articles_by_domains(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _enrich_article(art: dict) -> dict:
-    """
-    Fetch the article page to extract:
-    - image_url   (og:image > first <img> > RSS thumbnail)
-    - short_summary (og:description or first 30-40 words up to full stop)
-    - full_content  (longest text block from the page, for Gemini)
-    """
     url = art.get("url", "")
-
-    # Start with what RSS already gave us
     image_url     = art.get("image_url", "")
     short_summary = art.get("content", "")
     full_content  = art.get("content", "")
@@ -282,7 +258,6 @@ def _enrich_article(art: dict) -> dict:
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            # Image: og:image → twitter:image → first article img
             if not image_url:
                 for prop in ["og:image", "twitter:image"]:
                     tag = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
@@ -297,13 +272,11 @@ def _enrich_article(art: dict) -> dict:
                         src = first_img["src"]
                         image_url = src if src.startswith("http") else ""
 
-            # Short summary: og:description first
             og_desc = soup.find("meta", property="og:description") or \
                       soup.find("meta", attrs={"name": "description"})
             if og_desc and og_desc.get("content"):
                 short_summary = _trim_to_sentence(og_desc["content"], max_words=40)
             else:
-                # Fall back to first paragraph text
                 paras = soup.find_all("p")
                 for p in paras:
                     txt = p.get_text(separator=" ", strip=True)
@@ -311,7 +284,6 @@ def _enrich_article(art: dict) -> dict:
                         short_summary = _trim_to_sentence(txt, max_words=40)
                         break
 
-            # Full content: main article body
             article_tag = soup.find("article") or soup.find(
                 "div", class_=re.compile(r"article|story|content|body|post", re.I)
             )
@@ -325,7 +297,6 @@ def _enrich_article(art: dict) -> dict:
         except Exception as e:
             log.debug("Enrich fetch failed for %s: %s", url, e)
 
-    # Ensure short_summary is set (fallback to truncated content)
     if not short_summary and full_content:
         short_summary = _trim_to_sentence(full_content, max_words=40)
 
@@ -337,15 +308,10 @@ def _enrich_article(art: dict) -> dict:
 
 
 def _trim_to_sentence(text: str, max_words: int = 40) -> str:
-    """
-    Return at most `max_words` words, ending at the last full stop within range.
-    If no full stop found, cut at max_words.
-    """
     words = text.split()
     if len(words) <= max_words:
         return text.strip()
     chunk = " ".join(words[:max_words])
-    # Find last sentence-ending punctuation
     last_stop = max(chunk.rfind("."), chunk.rfind("!"), chunk.rfind("?"))
     if last_stop > 20:
         return chunk[:last_stop + 1].strip()
@@ -464,7 +430,7 @@ def _extract_image(entry) -> str:
         if "image" in e.get("type", ""):
             return e.get("href", "")
     content = getattr(entry, "summary", "") or ""
-    m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', content)
+    m = re.search(r'<img[^>]+src=["\'"]([^"\']+)["\']', content)
     if m:
         return m.group(1)
     return ""
@@ -489,6 +455,7 @@ def _fetch_x(url: str, limit: int) -> list[dict]:
 
 
 def _fetch_linkedin(url: str, limit: int) -> list[dict]:
+    import json as _json
     company_slug = _extract_linkedin_company(url)
     company_name = company_slug.replace("-", " ").title() if company_slug else "LinkedIn Company"
     if company_slug:
