@@ -124,6 +124,107 @@ def get_user(uid: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# DISCOVER USERS
+# ══════════════════════════════════════════════════════════════════════════
+
+@router.get("/users/discover")
+def discover_users(
+    uid: str = Query(..., description="The current user's ID"),
+    q:   str = Query("", description="Optional username search"),
+):
+    """
+    Returns ALL users (except the current user) enriched with:
+      - unread_count  : how many unread messages they sent to you
+      - last_message  : their most recent message exchanged with you (or null)
+      - has_chatted   : True if you've exchanged at least one message
+
+    Sorted: users you've chatted with come first (by last message timestamp),
+    then the rest alphabetically — ready to render a full People/Discover list.
+    """
+    current_uid = uid.strip()
+    if not current_uid:
+        raise HTTPException(400, detail="uid is required")
+    search_q = q.strip().lower()
+
+    # -- 1. Fetch all users except self --
+    try:
+        user_docs = db.collection("chat_users").limit(200).stream()
+        all_users = {}
+        for d in user_docs:
+            u = d.to_dict()
+            if u.get("id") == current_uid:
+                continue
+            if search_q and search_q not in u.get("username", "").lower():
+                continue
+            all_users[u["id"]] = {
+                "id":           u.get("id"),
+                "username":     u.get("username"),
+                "avatar":       u.get("avatar", ""),
+                "online":       u.get("online", False),
+                "last_seen":    u.get("last_seen", ""),
+                "unread_count": 0,
+                "last_message": None,
+                "has_chatted":  False,
+            }
+    except Exception as e:
+        log.error("discover_users — user fetch failed: %s", e)
+        raise HTTPException(500, detail=str(e))
+
+    # -- 2. Walk messages once to build unread + last_message per peer --
+    try:
+        msg_docs = (
+            db.collection("messages")
+              .order_by("timestamp", direction="ASCENDING")
+              .limit(1000)
+              .stream()
+        )
+        for d in msg_docs:
+            m        = d.to_dict()
+            sender   = m.get("senderId", "")
+            receiver = m.get("receiverId", "")
+
+            # Only care about messages involving the current user
+            if sender != current_uid and receiver != current_uid:
+                continue
+
+            other_uid = receiver if sender == current_uid else sender
+
+            # The other person might not be in our filtered list (search filter)
+            if other_uid not in all_users:
+                continue
+
+            # Track last message (list is ascending so last write wins = newest)
+            all_users[other_uid]["last_message"] = {
+                "text":      m.get("text", ""),
+                "timestamp": m.get("timestamp", 0),
+                "senderId":  sender,
+            }
+            all_users[other_uid]["has_chatted"] = True
+
+            # Count unread messages sent TO the current user
+            if receiver == current_uid and m.get("status") != "seen":
+                all_users[other_uid]["unread_count"] += 1
+
+    except Exception as e:
+        log.error("discover_users — message fetch failed: %s", e)
+        raise HTTPException(500, detail=str(e))
+
+    # -- 3. Sort: chatted users first (newest first), then rest alphabetically --
+    chatted     = [u for u in all_users.values() if u["has_chatted"]]
+    not_chatted = [u for u in all_users.values() if not u["has_chatted"]]
+
+    chatted.sort(
+        key=lambda u: u["last_message"]["timestamp"] if u["last_message"] else 0,
+        reverse=True,
+    )
+    not_chatted.sort(key=lambda u: (u.get("username") or "").lower())
+
+    users = chatted + not_chatted
+
+    return {"users": users, "count": len(users)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # MESSAGES
 # ══════════════════════════════════════════════════════════════════════════
 

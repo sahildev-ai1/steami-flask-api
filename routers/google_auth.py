@@ -232,7 +232,7 @@ def google_sign_in(body: GoogleSignInBody):
     user = _get_or_create_google_user(google_payload)
 
     # 3. Issue STEAMI JWT (same mechanism as email/password login)
-    token = create_jwt(uid=user["uid"], role=user.get("role", "user"))
+    token = create_jwt(user_id=user["uid"], role=user.get("role", "user"))
 
     log.info(
         "google_sign_in: uid=%s email=%s new=%s",

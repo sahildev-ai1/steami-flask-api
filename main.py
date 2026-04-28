@@ -147,6 +147,8 @@ from routers.dashboard     import router as dashboard_router
 from routers.google_auth   import router as google_auth_router
 from routers.newsletter    import router as newsletter_router
 from routers.public_ai     import router as public_ai_router
+from routers.insight_router import router as insight_router
+
 
 # ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -233,6 +235,7 @@ app.include_router(chat.router,         prefix="/api/chat",        tags=["Chat"]
 app.include_router(feed.router,         prefix="/api/feed",        tags=["Feed"])
 app.include_router(diary_router,        prefix="/api/diary",       tags=["Diary"])
 app.include_router(dashboard_router,    prefix="/api/dashboard",   tags=["Dashboard"])
+app.include_router(insight_router, prefix="/api/articles", tags=["Insights"])
 
 # content.router handles multiple tag groups — registered without a top-level tag
 # so each route's own tags= kwarg controls the Swagger UI grouping:
