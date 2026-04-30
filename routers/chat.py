@@ -107,24 +107,8 @@ def get_users(
     return {"users": users}
 
 
-@router.get("/users/{uid}")
-def get_user(uid: str):
-    """Get a single user profile."""
-    doc = db.collection("chat_users").document(uid).get()
-    if not doc.exists:
-        raise HTTPException(404, detail="User not found")
-    u = doc.to_dict()
-    return {
-        "id":        u.get("id"),
-        "username":  u.get("username"),
-        "avatar":    u.get("avatar", ""),
-        "online":    u.get("online", False),
-        "last_seen": u.get("last_seen", ""),
-    }
-
-
 # ══════════════════════════════════════════════════════════════════════════
-# DISCOVER USERS
+# DISCOVER USERS  (must be registered BEFORE /users/{uid} wildcard)
 # ══════════════════════════════════════════════════════════════════════════
 
 @router.get("/users/discover")
@@ -224,6 +208,22 @@ def discover_users(
     return {"users": users, "count": len(users)}
 
 
+@router.get("/users/{uid}")
+def get_user(uid: str):
+    """Get a single user profile."""
+    doc = db.collection("chat_users").document(uid).get()
+    if not doc.exists:
+        raise HTTPException(404, detail="User not found")
+    u = doc.to_dict()
+    return {
+        "id":        u.get("id"),
+        "username":  u.get("username"),
+        "avatar":    u.get("avatar", ""),
+        "online":    u.get("online", False),
+        "last_seen": u.get("last_seen", ""),
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # MESSAGES
 # ══════════════════════════════════════════════════════════════════════════
@@ -264,16 +264,17 @@ def send_message(body: SendMessageBody):
 
 @router.get("/messages")
 def get_messages(
-    u1:    str = Query(...),
-    u2:    str = Query(...),
-    after: int = Query(0),
-    limit: int = Query(50, le=200),
+    senderId:   str = Query(...),
+    receiverId: str = Query(...),
+    after:      int = Query(0),
+    limit:      int = Query(50, le=200),
 ):
     """
     Poll messages between two users.
     Pass after=<timestamp_ms> to get only new messages since last poll.
     Auto-marks received messages as seen.
     """
+    u1, u2 = senderId, receiverId
     try:
         docs = (
             db.collection("messages")

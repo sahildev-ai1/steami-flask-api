@@ -4,6 +4,13 @@ STEAMI FastAPI  v11 — MongoDB Atlas backend
 Run:   uvicorn main:app --host 0.0.0.0 --port 5000 --reload
 Docs:  http://127.0.0.1:5000/docs
 
+  ── Daily Cleanup (auto + manual) ────────────────────────────────────────────
+  - Runs once on startup (30 s delay) then every 24 h automatically.
+  - Deletes articles, feed_articles, ai_insights, insight_queue entries
+    that are older than EXPIRY_DAYS (25 days).
+  - POST /api/admin/cleanup        — trigger immediately (admin)
+  - GET  /api/admin/cleanup/status — scheduler / in-progress status (admin)
+
 CHANGES IN v11:
   ── Blog Posts ────────────────────────────────────────────────────────────────
   - POST /api/blog/seed              — bulk seed from content_data.py (admin)
@@ -148,6 +155,8 @@ from routers.google_auth   import router as google_auth_router
 from routers.newsletter    import router as newsletter_router
 from routers.public_ai     import router as public_ai_router
 from routers.insight_router import router as insight_router
+from routers.profile_router import router as profile_router
+from daily_cleanup import start_cleanup_scheduler, cleanup_router
 
 
 # ── Logging ────────────────────────────────────────────────────────────────
@@ -224,6 +233,8 @@ def on_startup():
     log.info("=== STEAMI v11 starting ===")
     result = seed_dummy_accounts()
     log.info("Accounts seeded=%s skipped=%s", result["created"], result["skipped"])
+    start_cleanup_scheduler()
+    log.info("Daily cleanup scheduler started — expires articles/feed older than %d days", EXPIRY_DAYS)
 
 
 # ── Routers ────────────────────────────────────────────────────────────────
@@ -236,6 +247,8 @@ app.include_router(feed.router,         prefix="/api/feed",        tags=["Feed"]
 app.include_router(diary_router,        prefix="/api/diary",       tags=["Diary"])
 app.include_router(dashboard_router,    prefix="/api/dashboard",   tags=["Dashboard"])
 app.include_router(insight_router, prefix="/api/articles", tags=["Insights"])
+app.include_router(profile_router, prefix="/api/profile", tags=["Profile"])
+app.include_router(cleanup_router, prefix="/api/admin",   tags=["Admin"])
 
 # content.router handles multiple tag groups — registered without a top-level tag
 # so each route's own tags= kwarg controls the Swagger UI grouping:
