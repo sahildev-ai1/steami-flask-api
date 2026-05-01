@@ -159,9 +159,54 @@ def _delete_file(url_path: str) -> bool:
         return False
 
 
+def _file_hash(data: bytes) -> str:
+    """Return the SHA-256 hex digest of *data*."""
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+def _find_duplicate(data: bytes, skip_path: str = "") -> "str | None":
+    """
+    Scan all image sub-directories for a file whose content matches *data*.
+    Returns the public URL path of the first match found, or None.
+
+    Allows mods to upload the same image for explainers, research articles,
+    or blog posts without creating redundant copies on disk.
+
+    Args:
+        data:      Raw bytes of the uploaded image.
+        skip_path: Absolute path to skip (e.g. the intended destination,
+                   so we don't match the file we're about to overwrite).
+    """
+    target_hash = _file_hash(data)
+    for sub in ("explainers", "research", "blog"):
+        folder_path = os.path.join(IMAGES_ROOT, sub)
+        if not os.path.isdir(folder_path):
+            continue
+        for fname in os.listdir(folder_path):
+            fpath = os.path.join(folder_path, fname)
+            if not os.path.isfile(fpath):
+                continue
+            if skip_path and os.path.normpath(fpath) == os.path.normpath(skip_path):
+                continue
+            try:
+                with open(fpath, "rb") as fh:
+                    if _file_hash(fh.read()) == target_hash:
+                        return f"/images/{sub}/{fname}"
+            except OSError:
+                continue
+    return None
+
+
 def _save_file(upload: UploadFile, folder: str, filename: str) -> str:
     """
     Save an UploadFile to disk at images/<folder>/<filename>.
+
+    Deduplication: before writing, the file bytes are hashed and compared
+    against every existing image on disk (across explainers/, research/, and
+    blog/).  If an identical file already exists anywhere, its existing URL
+    is returned immediately — no new file is written.
+
     Returns the public URL path: /images/<folder>/<filename>
 
     Args:
@@ -196,13 +241,31 @@ def _save_file(upload: UploadFile, folder: str, filename: str) -> str:
                 detail=f"Invalid image extension '{ext}'. Allowed: {', '.join(ALLOWED_EXT)}"
             )
 
-    # Build the full disk path and write the file
+    # Read all bytes so we can hash for deduplication
+    try:
+        data = upload.file.read()
+    except Exception as e:
+        raise HTTPException(500, detail=f"Failed to read uploaded file: {e}")
+
+    # Build the full disk path for the intended destination
     dest_dir  = os.path.join(IMAGES_ROOT, folder)
     dest_path = os.path.join(dest_dir, filename)
 
+    # ── Deduplication check ─────────────────────────────────────────────────────────
+    # Skip dest_path so we don't match the file we're replacing.
+    existing_url = _find_duplicate(data, skip_path=dest_path)
+    if existing_url:
+        log.info(
+            "Image deduplication: '%s' matches existing file → reusing %s",
+            upload.filename, existing_url,
+        )
+        return existing_url
+    # ───────────────────────────────────────────────────────────────────────────
+
+    # Write the new file to disk
     try:
         with open(dest_path, "wb") as f:
-            shutil.copyfileobj(upload.file, f)
+            f.write(data)
         log.info("Image saved: %s → %s", upload.filename, dest_path)
     except Exception as e:
         log.error("Image save failed for %s: %s", dest_path, e)
@@ -338,7 +401,9 @@ async def upload_image(
     The returned `url` value is what you store in the MongoDB `image` field
     and use as the `<img src>` value in the frontend.
 
-    Allowed folders: research | explainers
+    Allowed folders: research | explainers | blog
+    Deduplication: if the uploaded bytes match an existing file anywhere on disk,
+    the existing URL is returned without creating a new file.
     Allowed types:   JPEG, PNG, WebP, GIF
 
     Response:
@@ -352,8 +417,8 @@ async def upload_image(
       -H "Authorization: Bearer <mod_token>" \\
       -F "file=@/path/to/image.jpg"
     """
-    if folder not in ("research", "explainers"):
-        raise HTTPException(400, detail="folder must be 'research' or 'explainers'")
+    if folder not in ("research", "explainers", "blog"):
+        raise HTTPException(400, detail="folder must be 'research', 'explainers', or 'blog'")
 
     # Use the original filename from the upload, strip path separators for safety
     safe_name = os.path.basename(file.filename or "upload.jpg")
@@ -775,9 +840,9 @@ async def create_research_with_image(
     POST /api/research/articles/create-with-image  (multipart/form-data)
     Create a new research article AND upload its image in one request.
 
-    For research articles, images are shared per field.
-    The image is saved as  images/research/<field-slug>.<ext>
-    where field-slug converts "EARTH & SPACE" → "earth-space".
+    Each research article gets its own image file.
+    The image is saved as  images/research/<id>.<ext>
+    Deduplication is applied — identical bytes reuse the existing file.
 
     Form fields:
       image          — file upload (required)
@@ -815,11 +880,9 @@ async def create_research_with_image(
     except json.JSONDecodeError as e:
         raise HTTPException(400, detail=f"Invalid JSON in array field: {e}")
 
-    # Build a URL-safe filename from the field name
-    # "EARTH & SPACE" → "earth-space"
-    field_slug = field.lower().replace(" & ", "-").replace(" ", "-").replace("&", "")
-    ext        = os.path.splitext(image.filename or "")[-1].lower() or ".jpg"
-    filename   = f"{field_slug}{ext}"
+    # Save image with the article ID as filename (one image per article)
+    ext      = os.path.splitext(image.filename or "")[-1].lower() or ".jpg"
+    filename = f"{id}{ext}"
 
     # Save image to disk
     image_url = _save_file(image, "research", filename)
@@ -974,19 +1037,15 @@ def delete_research_article(
 
     doc_ref.delete()
 
-    # Research images are shared per-field. Only delete the file from disk
-    # if no remaining article in the same field still references it.
+    # Each research article owns its own image. Only delete the file from disk
+    # if no other article still references the same URL (e.g. via deduplication).
     deleted_file = False
     if old_image_url:
         try:
-            siblings = (
-                db.collection("research_articles")
-                  .where("field", "==", field)
-                  .stream()
-            )
+            remaining = db.collection("research_articles").stream()
             still_used = any(
-                s.to_dict().get("image") == old_image_url
-                for s in siblings
+                r.to_dict().get("image") == old_image_url
+                for r in remaining
             )
         except Exception:
             still_used = True   # assume still in use if we can't check — safer
@@ -1007,80 +1066,66 @@ async def upload_research_image(
 ):
     """
     POST /api/research/articles/{id}/image  (multipart/form-data)
-    Upload or replace the image for a research article.
+    Upload or replace the image for a specific research article.
 
-    Research images are shared per field — when you upload a new image for
-    article a1 (field=PHYSICS), all other PHYSICS articles get the same image URL.
-    The file is saved as  images/research/<field-slug>.<ext>
+    Each research article has its own image (saved as images/research/<id>.<ext>).
+    Uploading the same image bytes that already exist anywhere on disk will reuse
+    the existing file — no duplicate is created.
 
     Response:
     {
       "updated":     true,
       "id":          "a1",
-      "image":       "/images/research/physics.jpg",
-      "field":       "PHYSICS",
-      "also_updated": ["a6"]
+      "image":       "/images/research/a1.jpg",
+      "deleted_old": false
     }
 
     curl -X POST http://127.0.0.1:5000/api/research/articles/a1/image \\
       -H "Authorization: Bearer <mod_token>" \\
-      -F "image=@/path/to/physics.jpg"
+      -F "image=@/path/to/a1.jpg"
     """
     doc_ref = db.collection("research_articles").document(article_id)
     doc     = doc_ref.get()
     if not doc.exists:
         raise HTTPException(404, detail="Research article not found")
 
-    art_data   = doc.to_dict()
-    field      = art_data.get("field", "")
+    art_data      = doc.to_dict()
     old_image_url = art_data.get("image", "")
 
-    field_slug = field.lower().replace(" & ", "-").replace(" ", "-").replace("&", "")
-    ext        = os.path.splitext(image.filename or "")[-1].lower() or ".jpg"
-    filename   = f"{field_slug}{ext}"
+    # Each research article gets its own image file (named by article ID)
+    ext      = os.path.splitext(image.filename or "")[-1].lower() or ".jpg"
+    filename = f"{article_id}{ext}"
 
-    # Save new file to disk (overwrites if same name, new file if extension changed)
+    # Save new file to disk (deduplication applies automatically)
     image_url = _save_file(image, "research", filename)
 
-    # Update this article
+    # Update this article's image field in the DB
     try:
         doc_ref.update({"image": image_url, "updated_at": _now()})
     except Exception as e:
         raise HTTPException(500, detail=f"Image saved but DB update failed: {e}")
 
-    # Update ALL other articles with the same field to share the new image URL
-    also_updated = []
-    try:
-        siblings = (
-            db.collection("research_articles")
-              .where("field", "==", field)
-              .stream()
-        )
-        for s in siblings:
-            if s.id != article_id:
-                db.collection("research_articles").document(s.id).update({
-                    "image":      image_url,
-                    "updated_at": _now(),
-                })
-                also_updated.append(s.id)
-    except Exception as e:
-        log.warning("Could not update sibling articles for field %s: %s", field, e)
-
-    # Delete the old file only when the path actually changed (different extension).
-    # If it's the same filename, _save_file already overwrote it in-place — no stale file remains.
+    # Delete the old file only if the path changed AND no other document still references it
     deleted_old = False
     if old_image_url and old_image_url != image_url:
-        deleted_old = _delete_file(old_image_url)
+        try:
+            others = db.collection("research_articles").stream()
+            still_used = any(
+                o.to_dict().get("image") == old_image_url
+                for o in others
+            )
+        except Exception:
+            still_used = True   # assume in use if we can't check
+        if not still_used:
+            deleted_old = _delete_file(old_image_url)
 
-    log.info("Research image uploaded: field=%s → %s by %s (also updated %s, old deleted=%s)",
-             field, image_url, get_uid(payload), also_updated, deleted_old)
+    log.info("Research image uploaded: %s → %s by %s (old deleted=%s)",
+             article_id, image_url, get_uid(payload), deleted_old)
     return {
-        "updated":      True,
-        "id":           article_id,
-        "image":        image_url,
-        "field":        field,
-        "also_updated": also_updated,
-        "deleted_old":  deleted_old,
+        "updated":     True,
+        "id":          article_id,
+        "image":       image_url,
+        "deleted_old": deleted_old,
     }
 
 # ══════════════════════════════════════════════════════════════════════════════

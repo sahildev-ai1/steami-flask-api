@@ -82,24 +82,44 @@ def get_users(
     uid: str = Query(""),
     q:   str = Query(""),
 ):
-    """Get all users except the current user. Optional ?q= username search."""
+    """Get all users except the current user. Optional ?q= username search.
+    Reads directly from MongoDB `users` collection so every registered user
+    is always visible — no Firestore chat_users sync required.
+    """
     current_uid = uid.strip()
     search_q    = q.strip().lower()
     try:
-        docs  = db.collection("chat_users").limit(200).stream()
+        # Read online/last_seen status from chat_users (best-effort)
+        online_map: dict = {}
+        try:
+            for d in db.collection("chat_users").limit(500).stream():
+                cu = d.to_dict()
+                cid = cu.get("id", "")
+                if cid:
+                    online_map[cid] = {
+                        "online":    cu.get("online", False),
+                        "last_seen": cu.get("last_seen", ""),
+                    }
+        except Exception:
+            pass  # online status is non-critical
+
+        docs  = db.collection("users").limit(500).stream()
         users = []
         for d in docs:
             u = d.to_dict()
-            if u.get("id") == current_uid:
+            uid_val = u.get("id", "")
+            if uid_val == current_uid:
                 continue
-            if search_q and search_q not in u.get("username", "").lower():
+            username = (u.get("full_name") or u.get("username") or "").strip()
+            if search_q and search_q not in username.lower():
                 continue
+            status = online_map.get(uid_val, {})
             users.append({
-                "id":        u.get("id"),
-                "username":  u.get("username"),
-                "avatar":    u.get("avatar", ""),
-                "online":    u.get("online", False),
-                "last_seen": u.get("last_seen", ""),
+                "id":        uid_val,
+                "username":  username,
+                "avatar":    u.get("avatar") or f"https://i.pravatar.cc/150?u={uid_val}",
+                "online":    status.get("online", False),
+                "last_seen": status.get("last_seen", u.get("updated_at", "")),
             })
     except Exception as e:
         log.error("get_users failed: %s", e)
@@ -130,22 +150,39 @@ def discover_users(
         raise HTTPException(400, detail="uid is required")
     search_q = q.strip().lower()
 
-    # -- 1. Fetch all users except self --
+    # -- 1. Fetch all users except self (source of truth: MongoDB `users`) --
     try:
-        user_docs = db.collection("chat_users").limit(200).stream()
+        # Best-effort: grab online/last_seen from chat_users
+        online_map: dict = {}
+        try:
+            for d in db.collection("chat_users").limit(500).stream():
+                cu = d.to_dict()
+                cid = cu.get("id", "")
+                if cid:
+                    online_map[cid] = {
+                        "online":    cu.get("online", False),
+                        "last_seen": cu.get("last_seen", ""),
+                    }
+        except Exception:
+            pass  # online status is non-critical
+
+        user_docs = db.collection("users").limit(500).stream()
         all_users = {}
         for d in user_docs:
             u = d.to_dict()
-            if u.get("id") == current_uid:
+            uid_val = u.get("id", "")
+            if not uid_val or uid_val == current_uid:
                 continue
-            if search_q and search_q not in u.get("username", "").lower():
+            username = (u.get("full_name") or u.get("username") or "").strip()
+            if search_q and search_q not in username.lower():
                 continue
-            all_users[u["id"]] = {
-                "id":           u.get("id"),
-                "username":     u.get("username"),
-                "avatar":       u.get("avatar", ""),
-                "online":       u.get("online", False),
-                "last_seen":    u.get("last_seen", ""),
+            status = online_map.get(uid_val, {})
+            all_users[uid_val] = {
+                "id":           uid_val,
+                "username":     username,
+                "avatar":       u.get("avatar") or f"https://i.pravatar.cc/150?u={uid_val}",
+                "online":       status.get("online", False),
+                "last_seen":    status.get("last_seen", u.get("updated_at", "")),
                 "unread_count": 0,
                 "last_message": None,
                 "has_chatted":  False,
@@ -210,17 +247,31 @@ def discover_users(
 
 @router.get("/users/{uid}")
 def get_user(uid: str):
-    """Get a single user profile."""
-    doc = db.collection("chat_users").document(uid).get()
-    if not doc.exists:
+    """Get a single user profile. Checks chat_users for online status,
+    falls back to MongoDB `users` as the authoritative source."""
+    # Try chat_users first (has online/last_seen)
+    chat_doc = db.collection("chat_users").document(uid).get()
+    if chat_doc.exists:
+        u = chat_doc.to_dict()
+        return {
+            "id":        u.get("id"),
+            "username":  u.get("username"),
+            "avatar":    u.get("avatar", ""),
+            "online":    u.get("online", False),
+            "last_seen": u.get("last_seen", ""),
+        }
+    # Fallback: look up in MongoDB users collection
+    mongo_doc = db.collection("users").document(uid).get()
+    if not mongo_doc.exists:
         raise HTTPException(404, detail="User not found")
-    u = doc.to_dict()
+    u = mongo_doc.to_dict()
+    username = (u.get("full_name") or u.get("username") or uid[:8]).strip()
     return {
-        "id":        u.get("id"),
-        "username":  u.get("username"),
-        "avatar":    u.get("avatar", ""),
-        "online":    u.get("online", False),
-        "last_seen": u.get("last_seen", ""),
+        "id":        uid,
+        "username":  username,
+        "avatar":    u.get("avatar") or f"https://i.pravatar.cc/150?u={uid}",
+        "online":    False,
+        "last_seen": u.get("updated_at", ""),
     }
 
 

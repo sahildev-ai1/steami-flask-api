@@ -1,14 +1,15 @@
 """
 daily_cleanup.py — Daily auto-cleanup for STEAMI
 ==================================================
-Deletes articles, feed_articles, and their associated ai_insights
-that are older than EXPIRY_DAYS (25) days.
+Deletes articles and their associated ai_insights that are older than
+ARTICLE_EXPIRY_DAYS (15) days, and feed_articles (+ their ai_insights)
+that are older than FEED_EXPIRY_DAYS (15) days.
 
 HOW IT WORKS:
   - A background daemon thread wakes up every 24 hours.
   - On each run it scans `articles`, `feed_articles`, and `ai_insights`
     collections and deletes documents whose `fetched_at` (or `created_at`
-    for ai_insights) timestamp is older than 25 days.
+    for ai_insights) timestamp is older than 15 days.
   - The thread is started automatically when you call `start_cleanup_scheduler()`
     from your startup hook.
   - A manual trigger is also available via the admin endpoint:
@@ -41,8 +42,9 @@ from auth import require_admin, get_uid
 log = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-EXPIRY_DAYS        = 25
-CLEANUP_INTERVAL_S = 24 * 60 * 60   # run once every 24 hours
+ARTICLE_EXPIRY_DAYS = 15             # articles + ai_insights
+FEED_EXPIRY_DAYS    = 15             # feed_articles + their ai_insights
+CLEANUP_INTERVAL_S  = 24 * 60 * 60  # run once every 24 hours
 
 # ── Thread guard ───────────────────────────────────────────────────────────────
 _cleanup_lock    = threading.Lock()
@@ -53,9 +55,9 @@ _cleanup_running = False             # True only while a cleanup pass is executi
 # CORE CLEANUP LOGIC
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _cutoff_iso() -> str:
-    """ISO-8601 timestamp for exactly EXPIRY_DAYS ago (UTC)."""
-    return (datetime.now(timezone.utc) - timedelta(days=EXPIRY_DAYS)).isoformat()
+def _cutoff_iso(days: int) -> str:
+    """ISO-8601 timestamp for exactly `days` ago (UTC)."""
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
 
 def _delete_collection_docs(collection: str, field: str, cutoff: str) -> dict:
@@ -105,20 +107,24 @@ def run_cleanup_now() -> dict:
             return {"skipped": True, "reason": "cleanup already in progress"}
         _cleanup_running = True
 
-    started_at = datetime.now(timezone.utc).isoformat()
-    cutoff     = _cutoff_iso()
-    log.info("cleanup: starting — cutoff=%s (>%d days old)", cutoff, EXPIRY_DAYS)
+    started_at      = datetime.now(timezone.utc).isoformat()
+    article_cutoff  = _cutoff_iso(ARTICLE_EXPIRY_DAYS)
+    feed_cutoff     = _cutoff_iso(FEED_EXPIRY_DAYS)
+    log.info(
+        "cleanup: starting — article_cutoff=%s (>%dd) feed_cutoff=%s (>%dd)",
+        article_cutoff, ARTICLE_EXPIRY_DAYS, feed_cutoff, FEED_EXPIRY_DAYS,
+    )
 
     try:
         # ── 1. articles ───────────────────────────────────────────────────────
-        art_result = _delete_collection_docs("articles", "fetched_at", cutoff)
+        art_result = _delete_collection_docs("articles", "fetched_at", article_cutoff)
         log.info(
             "cleanup: articles — deleted=%d errors=%d",
             art_result["deleted"], art_result["errors"],
         )
 
         # ── 2. feed_articles ──────────────────────────────────────────────────
-        feed_result = _delete_collection_docs("feed_articles", "fetched_at", cutoff)
+        feed_result = _delete_collection_docs("feed_articles", "fetched_at", feed_cutoff)
         log.info(
             "cleanup: feed_articles — deleted=%d errors=%d",
             feed_result["deleted"], feed_result["errors"],
@@ -126,9 +132,9 @@ def run_cleanup_now() -> dict:
 
         # ── 3. ai_insights ────────────────────────────────────────────────────
         # ai_insights documents use `created_at`.
-        # We also explicitly sweep the IDs collected above to catch any that
-        # slipped through the date query (e.g. missing created_at field).
-        insight_result = _delete_collection_docs("ai_insights", "created_at", cutoff)
+        # Use the shorter of the two cutoffs so we don't leave orphaned insights.
+        insight_cutoff = min(article_cutoff, feed_cutoff)
+        insight_result = _delete_collection_docs("ai_insights", "created_at", insight_cutoff)
 
         # Sweep by known article / feed IDs that were just deleted
         all_deleted_ids = set(art_result["ids"]) | set(feed_result["ids"])
@@ -158,7 +164,7 @@ def run_cleanup_now() -> dict:
                 q_docs = (
                     db.collection("insight_queue")
                       .where("status",     "==", status)
-                      .where("queued_at",  "<",  cutoff)
+                      .where("queued_at",  "<",  insight_cutoff)
                       .stream()
                 )
                 for doc in q_docs:
@@ -173,15 +179,17 @@ def run_cleanup_now() -> dict:
         log.info("cleanup: insight_queue — deleted=%d", queue_deleted)
 
         summary = {
-            "skipped":     False,
-            "started_at":  started_at,
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-            "expiry_days": EXPIRY_DAYS,
-            "cutoff":      cutoff,
-            "articles":    {"deleted": art_result["deleted"],    "errors": art_result["errors"]},
-            "feed":        {"deleted": feed_result["deleted"],   "errors": feed_result["errors"]},
-            "ai_insights": {"deleted": insight_result["deleted"],"errors": insight_result["errors"]},
-            "insight_queue": {"deleted": queue_deleted},
+            "skipped":            False,
+            "started_at":         started_at,
+            "finished_at":        datetime.now(timezone.utc).isoformat(),
+            "article_expiry_days": ARTICLE_EXPIRY_DAYS,
+            "feed_expiry_days":    FEED_EXPIRY_DAYS,
+            "article_cutoff":     article_cutoff,
+            "feed_cutoff":        feed_cutoff,
+            "articles":           {"deleted": art_result["deleted"],    "errors": art_result["errors"]},
+            "feed":               {"deleted": feed_result["deleted"],   "errors": feed_result["errors"]},
+            "ai_insights":        {"deleted": insight_result["deleted"],"errors": insight_result["errors"]},
+            "insight_queue":      {"deleted": queue_deleted},
             "total_deleted": (
                 art_result["deleted"]
                 + feed_result["deleted"]
@@ -272,8 +280,8 @@ def trigger_cleanup(payload: dict = Depends(require_admin)):
     ADMIN ONLY — immediately run one cleanup pass without waiting for
     the next scheduled 24-hour window.
 
-    Deletes articles, feed items, and their AI insights that are older
-    than 25 days.
+    Deletes articles and their AI insights older than 15 days, and
+    feed items and their AI insights older than 15 days.
     """
     log.info("cleanup: manual trigger by admin=%s", get_uid(payload))
     result = run_cleanup_now()
@@ -288,8 +296,9 @@ def trigger_cleanup(payload: dict = Depends(require_admin)):
 def cleanup_status(payload: dict = Depends(require_admin)):
     """ADMIN ONLY — check whether the cleanup scheduler is running."""
     return {
-        "scheduler_started": _scheduler_started,
-        "cleanup_in_progress": _cleanup_running,
-        "expiry_days": EXPIRY_DAYS,
-        "interval_hours": CLEANUP_INTERVAL_S // 3600,
+        "scheduler_started":    _scheduler_started,
+        "cleanup_in_progress":  _cleanup_running,
+        "article_expiry_days":  ARTICLE_EXPIRY_DAYS,
+        "feed_expiry_days":     FEED_EXPIRY_DAYS,
+        "interval_hours":       CLEANUP_INTERVAL_S // 3600,
     }

@@ -319,7 +319,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Sarah Chen",
         "date": "2025-03-15",
         "readTime": "12 min",
-        "image": "/images/research/physics.jpg",
+        "image": "/images/research/a1.jpg",
         "content": [
             "Topological quantum computing has long been considered the holy grail of quantum information science. Unlike conventional qubits that are fragile and error-prone, topological qubits encode information in the global properties of a quantum system, making them inherently resistant to local noise and perturbation.",
             "The key innovation lies in using Majorana fermions — exotic particles that are their own antiparticles. When these particles are braided around each other, they perform quantum computations that are inherently protected from local noise. This braiding operation is topologically protected, meaning small perturbations cannot corrupt the computation.",
@@ -343,7 +343,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Elena Volkov",
         "date": "2025-02-28",
         "readTime": "11 min",
-        "image": "/images/research/physics.jpg",
+        "image": "/images/research/a6.jpg",
         "content": [
             "Three independent laboratories — MIT, Max Planck Institute, and RIKEN — have confirmed that a new copper-doped lead apatite derivative exhibits true superconductivity at room temperature and ambient pressure.",
             "The material, developed by a team at Seoul National University, builds on the controversial LK-99 announcement of 2023. Years of refinement to the synthesis process eliminated the impurities that caused earlier samples to fail.",
@@ -367,7 +367,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. James Liu",
         "date": "2025-03-10",
         "readTime": "9 min",
-        "image": "/images/research/medicine.jpg",
+        "image": "/images/research/a2.jpg",
         "content": [
             "For the first time in over 60 years, scientists have discovered an entirely new class of antibiotics — and artificial intelligence made it possible.",
             "A deep learning model trained on molecular structures and antibiotic activity screened over 1.2 billion candidate molecules in three days — a task that would have taken centuries using traditional methods.",
@@ -391,7 +391,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Priya Nair",
         "date": "2025-03-05",
         "readTime": "8 min",
-        "image": "/images/research/robotics.jpg",
+        "image": "/images/research/a3.jpg",
         "content": [
             "Boston Dynamics' Atlas robots have achieved a landmark milestone: completing four-hour autonomous construction tasks at real job sites with no human supervision.",
             "The robots performed structural framing, drywall installation, and material transport — tasks requiring dynamic balance, tool manipulation, and adaptive decision-making in unpredictable environments.",
@@ -415,7 +415,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Ana Torres",
         "date": "2025-03-01",
         "readTime": "10 min",
-        "image": "/images/research/biology.jpg",
+        "image": "/images/research/a7.jpg",
         "content": [
             "DeepMind's AlphaFold 4 has solved one of biology's grand challenges: predicting how multiple proteins interact and assemble into functional complexes with near-experimental accuracy.",
             "While AlphaFold 2 revolutionized single-protein structure prediction, most biological functions depend on complex interactions between multiple proteins. AlphaFold 4 predicts these assemblies with 95% accuracy.",
@@ -439,7 +439,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Kim Novak",
         "date": "2025-02-05",
         "readTime": "12 min",
-        "image": "/images/research/biology.jpg",
+        "image": "/images/research/a16.jpg",
         "content": [
             "Scientists at the Craig Venter Institute have created the first truly self-replicating artificial cell — a synthetic organism built from scratch that can grow, divide, and even evolve over multiple generations.",
             "The organism, JCVI-syn3.1, contains only 473 genes — the minimal set needed for independent life. Every gene was chemically synthesized and assembled into a complete genome that was then booted inside an empty cell membrane.",
@@ -463,7 +463,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Yuki Tanaka",
         "date": "2025-03-18",
         "readTime": "7 min",
-        "image": "/images/research/engineering.jpg",
+        "image": "/images/research/a8.jpg",
         "content": [
             "Toyota has begun mass production of solid-state batteries at its Himeji facility, marking the beginning of a new era for electric vehicles and energy storage technology worldwide.",
             "The batteries use a sulfide-based solid electrolyte instead of liquid, enabling higher energy density (500 Wh/kg vs 250 Wh/kg for current lithium-ion), faster charging, and dramatically improved safety with no flammable liquids.",
@@ -487,7 +487,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Michael Torres",
         "date": "2025-02-20",
         "readTime": "13 min",
-        "image": "/images/research/mathematics.jpg",
+        "image": "/images/research/a9.jpg",
         "content": [
             "The mathematical community has formally accepted a proof of the Riemann Hypothesis, one of the seven Millennium Prize Problems and arguably the most important unsolved problem in mathematics for over a century.",
             "Dr. Yitang Zhang, known for his breakthrough on bounded gaps between primes, submitted the proof in 2022. After three years of intense verification by dozens of leading mathematicians worldwide, no errors have been found.",
@@ -511,7 +511,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Clara Novak",
         "date": "2025-03-20",
         "readTime": "8 min",
-        "image": "/images/research/earth-space.jpg",
+        "image": "/images/research/a10.jpg",
         "content": [
             "In a historic achievement for space exploration, the first samples of Martian soil have safely landed on Earth, completing a mission that took over a decade of planning and flawless execution.",
             "The Mars Sample Return mission, a joint effort between ESA and NASA, retrieved 30 sealed tubes cached by the Perseverance rover across Jezero Crater — an ancient lake bed believed to have once harbored microbial life.",
@@ -535,7 +535,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Amara Osei",
         "date": "2025-03-14",
         "readTime": "9 min",
-        "image": "/images/research/chemistry.jpg",
+        "image": "/images/research/a11.jpg",
         "content": [
             "Carbon Engineering has achieved a breakthrough that could transform the fight against climate change: converting atmospheric CO2 into synthetic jet fuel at costs competitive with fossil fuel extraction.",
             "The new iron-cobalt catalyst operates at lower temperatures and pressures than previous approaches, dramatically reducing energy requirements. The process captures CO2 directly from ambient air and combines it with green hydrogen.",
@@ -559,7 +559,7 @@ RESEARCH_ARTICLES_SEED = [
         "author": "Dr. Anil Gupta",
         "date": "2025-03-28",
         "readTime": "8 min",
-        "image": "/images/research/computer-science.jpg",
+        "image": "/images/research/a17.jpg",
         "content": [
             "All major web browsers have completed the rollout of post-quantum cryptographic algorithms, protecting an estimated 80% of global internet traffic against attacks from future quantum computers.",
             "The transition centers on ML-KEM (Module-Lattice Key Encapsulation Mechanism), selected by NIST after an 8-year evaluation process. The algorithm's security is based on the hardness of lattice problems, which remain intractable even for quantum computers.",

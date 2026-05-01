@@ -26,6 +26,8 @@ ENDPOINTS:
   GET    /api/feed/items/{id}             — single feed article (public)
   DELETE /api/feed/items/{id}             — delete (requires auth)
   POST   /api/feed/items/{id}/insight     — get/generate insight (mod/admin only)
+  DELETE /api/feed/cleanup                — delete feed articles + insights older than
+                                            N days (default 15); mod/admin only
 """
 
 import uuid
@@ -34,7 +36,7 @@ import time
 import random
 import threading
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Depends
@@ -596,6 +598,112 @@ def delete_feed_item(item_id: str, payload: dict = Depends(require_auth)):
         raise HTTPException(500, detail=str(e))
     log.info("feed deleted: %s by %s", item_id, get_uid(payload))
     return {"deleted": True, "article_id": item_id}
+
+
+def _cleanup_old_feed(older_than_days: int = 15) -> dict:
+    """
+    Core cleanup logic — callable from the endpoint or a scheduler.
+
+    Scans `feed_articles` for documents whose `fetched_at` timestamp is older
+    than `older_than_days` days, then deletes:
+      • the `feed_articles` document
+      • the matching `ai_insights` document (same ID)
+
+    Returns a summary dict with counts of deleted and failed documents.
+    """
+    cutoff: datetime = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+    cutoff_iso: str  = cutoff.isoformat()
+
+    log.info("feed_cleanup: scanning for articles fetched before %s", cutoff_iso)
+
+    try:
+        docs = (
+            db.collection("feed_articles")
+              .where("fetched_at", "<", cutoff_iso)
+              .stream()
+        )
+        old_docs = list(docs)
+    except Exception as e:
+        log.error("feed_cleanup: query failed: %s", e)
+        raise
+
+    if not old_docs:
+        log.info("feed_cleanup: nothing to delete (cutoff=%s)", cutoff_iso)
+        return {"deleted": 0, "failed": 0, "cutoff": cutoff_iso}
+
+    log.info("feed_cleanup: found %d stale articles to delete", len(old_docs))
+
+    deleted = 0
+    failed  = 0
+
+    for doc in old_docs:
+        article_id = doc.id
+        try:
+            db.collection("feed_articles").document(article_id).delete()
+            # Always attempt insight deletion — fails silently if absent
+            db.collection("ai_insights").document(article_id).delete()
+            log.info("feed_cleanup: deleted %s", article_id)
+            deleted += 1
+        except Exception as e:
+            log.error("feed_cleanup: failed to delete %s: %s", article_id, e)
+            failed += 1
+
+    log.info(
+        "feed_cleanup: done — deleted=%d failed=%d older_than_days=%d",
+        deleted, failed, older_than_days,
+    )
+    return {"deleted": deleted, "failed": failed, "cutoff": cutoff_iso}
+
+
+@router.delete(
+    "/cleanup",
+    summary="Delete feed articles and their insights older than N days — MOD/ADMIN ONLY",
+)
+def cleanup_old_feed_items(
+    days:    int  = Query(15, ge=1, le=365, description="Delete articles older than this many days"),
+    dry_run: bool = Query(False,            description="true = count matches without deleting"),
+    payload: dict = Depends(require_mod),
+):
+    """
+    DELETE /api/feed/cleanup  — **MOD/ADMIN ONLY**
+
+    Removes stale feed articles and their corresponding AI insights.
+
+    - `days`    — age threshold in days (default 15, min 1, max 365).
+    - `dry_run` — when `true`, returns the count of articles that *would* be
+                  deleted without touching the database.
+
+    Both `feed_articles` and `ai_insights` documents are removed for each
+    matched article so no orphaned insights are left behind.
+    """
+    cutoff     = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff_iso = cutoff.isoformat()
+
+    if dry_run:
+        try:
+            docs  = db.collection("feed_articles").where("fetched_at", "<", cutoff_iso).stream()
+            count = sum(1 for _ in docs)
+        except Exception as e:
+            raise HTTPException(500, detail=str(e))
+        log.info(
+            "feed_cleanup dry_run: %d articles would be deleted (days=%d) by %s",
+            count, days, get_uid(payload),
+        )
+        return {"dry_run": True, "would_delete": count, "cutoff": cutoff_iso}
+
+    try:
+        result = _cleanup_old_feed(older_than_days=days)
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+    log.info("feed_cleanup: triggered by mod/admin=%s", get_uid(payload))
+    return {
+        "dry_run":          False,
+        "deleted":          result["deleted"],
+        "failed":           result["failed"],
+        "cutoff":           result["cutoff"],
+        "older_than_days":  days,
+    }
 
 
 @router.post(
