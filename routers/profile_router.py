@@ -363,12 +363,7 @@ def update_profile(body: UpdateProfileBody, payload: dict = Depends(require_auth
         updates["website"] = body.website
 
     if body.profession is not None:
-        if body.profession not in VALID_PROFESSIONS:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid profession. Valid options: {', '.join(VALID_PROFESSIONS)}"
-            )
-        updates["profession"] = body.profession
+        updates["profession"] = body.profession.strip()
 
     if body.interests is not None:
         invalid = [t for t in body.interests if t not in VALID_TOPICS]
@@ -430,6 +425,13 @@ def change_email(body: ChangeEmailBody, payload: dict = Depends(require_auth)):
 
     user = doc.to_dict()
 
+    # Block Google/OAuth users — they authenticate via OAuth and have no password
+    if user.get("auth_provider") in ("google", "github", "apple"):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="Your account uses Google sign-in. Password management is not available for OAuth accounts."
+        )
+
     # Verify current password
     if not verify_password(body.current_password, user.get("password_hash", "")):
         raise HTTPException(
@@ -490,6 +492,13 @@ def change_password(body: ChangePasswordBody, payload: dict = Depends(require_au
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="User not found.")
 
     user = doc.to_dict()
+
+    # Block Google/OAuth users — they authenticate via OAuth and have no password
+    if user.get("auth_provider") in ("google", "github", "apple"):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="Your account uses Google sign-in. Password management is not available for OAuth accounts."
+        )
 
     # Verify current password
     if not verify_password(body.current_password, user.get("password_hash", "")):
@@ -586,19 +595,24 @@ def remove_avatar(payload: dict = Depends(require_auth)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.delete("/me", summary="Delete own account — requires auth + password")
-def delete_my_account(body: DeleteAccountBody, payload: dict = Depends(require_auth)):
+def delete_my_account(
+    payload:          dict                       = Depends(require_auth),
+    body:             Optional[DeleteAccountBody] = None,
+    current_password: Optional[str]              = None,
+):
     """
     Permanently delete the authenticated user's account.
-    This is irreversible. Requires password confirmation.
-
-    Note: Does NOT delete the user's newsletter subscription record.
-    That can be cleaned up by an admin or a scheduled job.
-
-    Frontend usage:
-      DELETE /api/profile/me
-      Authorization: Bearer <token>
-      { "current_password": "MyPass123" }
+    Accepts password as JSON body { "current_password": "..." }
+    OR as query param ?current_password=... (fallback for clients that strip DELETE bodies).
     """
+    # Accept password from JSON body OR query param
+    password = (body.current_password if body else None) or current_password
+    if not password:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="current_password is required (send as JSON body or ?current_password= query param)."
+        )
+
     uid     = get_uid(payload)
     doc_ref = db.collection("users").document(uid)
     doc     = doc_ref.get()
@@ -608,8 +622,14 @@ def delete_my_account(body: DeleteAccountBody, payload: dict = Depends(require_a
 
     user = doc.to_dict()
 
-    # Verify password before allowing destructive action
-    if not verify_password(body.current_password, user.get("password_hash", "")):
+    # Block Google/OAuth users — they have no password_hash
+    if user.get("auth_provider") in ("google", "github", "apple"):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="Your account uses Google sign-in. To delete your account, please contact support."
+        )
+
+    if not verify_password(password, user.get("password_hash", "")):
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
             detail="Password is incorrect. Account deletion cancelled."

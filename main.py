@@ -156,6 +156,7 @@ from routers.newsletter    import router as newsletter_router
 from routers.public_ai     import router as public_ai_router
 from routers.insight_router import router as insight_router
 from routers.profile_router import router as profile_router
+from routers.notifications import router as notifications_router
 from daily_cleanup import start_cleanup_scheduler, cleanup_router
 
 
@@ -246,6 +247,7 @@ app.include_router(chat.router,         prefix="/api/chat",        tags=["Chat"]
 app.include_router(feed.router,         prefix="/api/feed",        tags=["Feed"])
 app.include_router(diary_router,        prefix="/api/diary",       tags=["Diary"])
 app.include_router(dashboard_router,    prefix="/api/dashboard",   tags=["Dashboard"])
+app.include_router(notifications_router, prefix="/api/notifications", tags=["Notifications"])
 app.include_router(insight_router, prefix="/api/articles", tags=["Insights"])
 app.include_router(profile_router, prefix="/api/profile", tags=["Profile"])
 app.include_router(cleanup_router, prefix="/api/admin",   tags=["Admin"])

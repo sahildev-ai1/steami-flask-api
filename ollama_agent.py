@@ -42,6 +42,18 @@ KEY DIFFERENCE FROM GEMINI:
   - Ollama uses format="json" (standard across all Ollama models)
   - Response is in data["message"]["content"] (not data["candidates"][0]...)
   - The 4-layer JSON parser is kept identical — same robustness
+
+OUTPUT SCHEMA (returned dict):
+  summary          — 150–200 word prose insight
+  key_points       — list of 3 one-sentence highlights
+  sentiment        — "positive" | "neutral" | "negative"  (raw polarity)
+  sentiment_label  — "good_news" | "bad_news" | "neutral_news"  (frontend-friendly)
+  emoji            — single emoji character matching the article's tone + domain
+  confidence       — float 0.0–1.0
+  tags             — list of topic tags
+  domain           — article domain / topic category
+  reading_time_min — estimated reading time in minutes
+  article_url      — source URL
 """
 
 import os
@@ -112,33 +124,38 @@ Return this exact JSON structure (fill in ALL values):
     "One sentence about what comes next, max 15 words."
   ],
   "sentiment": "positive",
+  "sentiment_label": "good_news",
+  "emoji": "🚀",
   "confidence": 0.85,
   "tags": ["tag1", "tag2", "tag3", "tag4"],
   "domain": "{domain}",
   "reading_time_min": 4,
-  "article_url": "{article_url}",
-  "svg": "WRITE_FULL_SVG_HERE"
+  "article_url": "{article_url}"
 }}
 
-For the svg field — replace WRITE_FULL_SVG_HERE with a complete inline SVG:
-- Use width='400' height='400' (single quotes ONLY inside SVG — never double quotes)
-- Dark background rect fill '#0f0f1a'
-- Colors: #6366f1 #818cf8 #a5b4fc #f59e0b #34d399 #f87171
-- Draw a diagram that visually explains the article concept:
-    AI / machine learning  → neural network nodes and weighted edges
-    Space / astronomy      → planets, orbits, or star field diagram
-    Biology / Medicine     → cell structure or DNA double helix
-    Robotics               → robot arm with joints labeled
-    Physics                → wave diagram or particle collision
-    Chemistry              → molecule with atoms and bonds labeled
-    Engineering            → circuit schematic or gear system
-    Mathematics            → graph with curve or geometric proof diagram
-    Computer Science       → flowchart boxes with arrows
-    Climate / Energy       → earth diagram or energy flow chart
-- Add domain label text near top in color #818cf8 font-size='11'
-- Add STEAMI text at bottom right in color #6366f1 font-size='10'
-- Keep SVG under 2500 characters total
-- CRITICAL: Use ONLY single quotes inside the SVG. Zero double quotes anywhere inside the SVG string."""
+Rules for each field:
+
+sentiment — pick exactly one of: "positive", "neutral", "negative"
+  positive = broadly beneficial, breakthrough, hopeful, promising progress
+  neutral  = factual update, mixed implications, no clear valence
+  negative = setback, risk, harm, controversy, failure, threat
+
+sentiment_label — pick exactly one of: "good_news", "neutral_news", "bad_news"
+  Maps directly to sentiment: positive → good_news, neutral → neutral_news, negative → bad_news
+
+emoji — a single emoji character that best captures the article's tone AND domain together.
+  Guidelines by domain (adjust for actual sentiment):
+    AI / Machine Learning  → 🤖 🧠 ⚡ (positive) / 🤖 (neutral) / ⚠️ (negative)
+    Space / Astronomy      → 🚀 🌌 🛸 (positive) / 🔭 (neutral) / ☄️ (negative)
+    Biology / Medicine     → 💊 🧬 🩺 (positive) / 🔬 (neutral) / 🦠 (negative)
+    Climate / Environment  → 🌱 ☀️ 🌊 (positive) / 🌍 (neutral) / 🔥 🌪️ (negative)
+    Physics / Engineering  → ⚛️ 🔋 🏗️ (positive) / ⚙️ (neutral) / 💥 (negative)
+    Computer Science       → 💻 🔐 📡 (positive) / 🖥️ (neutral) / 🐛 (negative)
+    Robotics               → 🦾 🤖 🔩 (positive) / ⚙️ (neutral) / 🚨 (negative)
+    Mathematics            → 📐 ♾️ 🎯 (positive) / 📊 (neutral) / ❌ (negative)
+    Economics / Finance    → 📈 💰 🏦 (positive) / 💹 (neutral) / 📉 (negative)
+    General Technology     → ✨ 💡 🔬 (positive) / 🔧 (neutral) / ⚠️ (negative)
+  Pick the single most fitting emoji — one character only, no combinations."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,8 +171,8 @@ def generate_ai_insight(article: dict) -> dict:
                  article_url/url, matched_domains/topic
 
     Returns:
-        dict with keys: summary, key_points, sentiment, confidence, tags,
-                        domain, reading_time_min, article_url, svg
+        dict with keys: summary, key_points, sentiment, sentiment_label, emoji,
+                        confidence, tags, domain, reading_time_min, article_url
 
     Raises:
         RuntimeError: if the API call fails or times out
@@ -297,15 +314,19 @@ def generate_ai_insight(article: dict) -> dict:
     result.setdefault("domain", domain)
     result.setdefault("reading_time_min", _reading_time(content))
 
-    # Fallback SVG if missing or malformed
-    if not result.get("svg") or len(str(result.get("svg", ""))) < 60:
-        result["svg"] = _fallback_svg(title, domain)
+    # Normalise sentiment_label to ensure it always matches sentiment
+    result["sentiment_label"] = _sentiment_to_label(result.get("sentiment", "neutral"))
+
+    # Fallback emoji if model didn't return one or returned garbage
+    if not result.get("emoji") or len(str(result.get("emoji", ""))) > 8:
+        result["emoji"] = _fallback_emoji(result.get("sentiment", "neutral"), domain)
 
     log.info(
-        "Insight ready — model=%s summary=%d words svg=%d chars domain=%s",
+        "Insight ready — model=%s summary=%d words sentiment=%s emoji=%s domain=%s",
         model,
         len(result.get("summary", "").split()),
-        len(str(result.get("svg", ""))),
+        result.get("sentiment", "?"),
+        result.get("emoji", "?"),
         result.get("domain", "?"),
     )
 
@@ -346,24 +367,7 @@ def _parse(raw: str, title: str, article_url: str, domain: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # ── Layer 3: Isolate SVG, parse the rest, re-attach ───────────────────
-    try:
-        svg_pat = re.search(
-            r'"svg"\s*:\s*"(<svg[\s\S]*?</svg>)"',
-            cleaned, re.IGNORECASE
-        )
-        if svg_pat:
-            svg_content = svg_pat.group(1)
-            safe = cleaned[:svg_pat.start()] + '"svg":"__SVG__"' + cleaned[svg_pat.end():]
-            safe = re.sub(r",\s*([}\]])", r"\1", safe)   # strip trailing commas
-            obj  = json.loads(safe)
-            obj["svg"] = svg_content
-            log.info("Parse L3 OK (svg isolated)")
-            return _fill_defaults(obj, title, article_url, domain)
-    except Exception:
-        pass
-
-    # ── Layer 4: Regex field extraction — last resort ─────────────────────
+    # ── Layer 3: Regex field extraction — last resort ─────────────────────
     log.warning("All JSON parse layers failed — using field extraction")
     return _extract(cleaned, title, article_url, domain)
 
@@ -378,7 +382,16 @@ def _fill_defaults(obj: dict, title: str, article_url: str, domain: str) -> dict
     obj.setdefault("domain",           domain)
     obj.setdefault("reading_time_min", 3)
     obj.setdefault("article_url",      article_url)
-    obj.setdefault("svg",              "")
+
+    # sentiment_label — always derived from sentiment so they stay in sync
+    obj["sentiment_label"] = _sentiment_to_label(obj["sentiment"])
+
+    # emoji — use model-provided value if valid (single char / short), else fallback
+    raw_emoji = obj.get("emoji", "")
+    if not raw_emoji or len(str(raw_emoji)) > 8:
+        obj["emoji"] = _fallback_emoji(obj["sentiment"], domain)
+    else:
+        obj["emoji"] = raw_emoji
 
     # Type coercions — model might return numbers as strings
     if not isinstance(obj["key_points"], list):  obj["key_points"] = []
@@ -412,33 +425,30 @@ def _extract(text: str, title: str, article_url: str, domain: str) -> dict:
         if not m: return []
         return re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1))
 
-    def get_svg() -> str:
-        m = re.search(r'"svg"\s*:\s*"(<svg[\s\S]*?</svg>)"', text, re.IGNORECASE)
-        if m: return m.group(1)
-        m = re.search(r'(<svg[\s\S]*?</svg>)', text, re.IGNORECASE)
-        if m: return m.group(1)
-        return ""
-
-    summary    = get_str("summary")
-    svg        = get_svg() or get_str("svg")
-    sentiment  = get_str("sentiment") or "neutral"
-    art_url    = get_str("article_url") or article_url
-    dom        = get_str("domain") or domain
-    key_points = get_arr("key_points")
-    tags       = get_arr("tags")
+    summary         = get_str("summary")
+    sentiment       = get_str("sentiment") or "neutral"
+    raw_emoji       = get_str("emoji")
+    art_url         = get_str("article_url") or article_url
+    dom             = get_str("domain") or domain
+    key_points      = get_arr("key_points")
+    tags            = get_arr("tags")
 
     if not summary or summary.strip().startswith("{") or len(summary) > 2000:
         summary = f"Analysis of: {title}"
 
+    sentiment = sentiment if sentiment in ("positive", "neutral", "negative") else "neutral"
+    emoji     = raw_emoji if raw_emoji and len(raw_emoji) <= 8 else _fallback_emoji(sentiment, dom)
+
     return {
         "summary":          summary,
-        "svg":              svg or _fallback_svg(title, domain),
         "key_points":       key_points or [
             "Key finding identified in this article.",
             "This development has significant implications.",
             "Further monitoring and research are expected.",
         ],
-        "sentiment":        sentiment if sentiment in ("positive", "neutral", "negative") else "neutral",
+        "sentiment":        sentiment,
+        "sentiment_label":  _sentiment_to_label(sentiment),
+        "emoji":            emoji,
         "confidence":       get_num("confidence", 0.6),
         "tags":             tags,
         "domain":           dom,
@@ -448,52 +458,86 @@ def _extract(text: str, title: str, article_url: str, domain: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FALLBACK SVG  (single quotes only — safe to embed in JSON)
+# SENTIMENT HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fallback_svg(title: str, domain: str = "Technology") -> str:
-    """Generate a minimal SVG diagram when the AI fails to produce one."""
-    safe     = (title[:40].replace("'","").replace("<","").replace(">","")
-                          .replace("&","and").replace('"',""))
-    ellipsis = "..." if len(title) > 40 else ""
-    dom_lbl  = domain.upper()[:24]
+def _sentiment_to_label(sentiment: str) -> str:
+    """Convert raw sentiment polarity to a frontend-friendly label."""
+    return {
+        "positive": "good_news",
+        "negative": "bad_news",
+        "neutral":  "neutral_news",
+    }.get(sentiment, "neutral_news")
 
-    return (
-        "<svg xmlns='http://www.w3.org/2000/svg' width='400' height='400'>"
-        "<defs>"
-        "<linearGradient id='bg' x1='0' y1='0' x2='0' y2='1'>"
-        "<stop offset='0%' stop-color='#0f0f1a'/>"
-        "<stop offset='100%' stop-color='#1a1a3e'/>"
-        "</linearGradient>"
-        "<radialGradient id='glow' cx='50%' cy='45%' r='40%'>"
-        "<stop offset='0%' stop-color='#6366f1' stop-opacity='0.5'/>"
-        "<stop offset='100%' stop-color='#0f0f1a' stop-opacity='0'/>"
-        "</radialGradient>"
-        "</defs>"
-        "<rect width='400' height='400' fill='url(#bg)' rx='12'/>"
-        "<rect width='400' height='400' fill='url(#glow)'/>"
-        f"<text x='200' y='36' text-anchor='middle' fill='#818cf8' "
-        f"font-size='11' font-family='system-ui,sans-serif' letter-spacing='2' font-weight='600'>{dom_lbl}</text>"
-        "<circle cx='200' cy='180' r='72' fill='none' stroke='#6366f1' stroke-width='1.5' opacity='0.4'/>"
-        "<circle cx='200' cy='180' r='50' fill='#6366f1' opacity='0.12'/>"
-        "<circle cx='200' cy='180' r='30' fill='#6366f1' opacity='0.65'/>"
-        "<circle cx='200' cy='180' r='14' fill='#a5b4fc'/>"
-        "<circle cx='272' cy='180' r='7' fill='#f59e0b'/>"
-        "<circle cx='128' cy='180' r='7' fill='#34d399'/>"
-        "<circle cx='200' cy='108' r='7' fill='#f87171'/>"
-        "<circle cx='200' cy='252' r='7' fill='#818cf8'/>"
-        "<line x1='200' y1='166' x2='272' y2='180' stroke='#6366f1' stroke-width='1' opacity='0.5'/>"
-        "<line x1='200' y1='166' x2='128' y2='180' stroke='#6366f1' stroke-width='1' opacity='0.5'/>"
-        "<line x1='200' y1='166' x2='200' y2='108' stroke='#6366f1' stroke-width='1' opacity='0.5'/>"
-        "<line x1='200' y1='194' x2='200' y2='252' stroke='#6366f1' stroke-width='1' opacity='0.5'/>"
-        f"<text x='200' y='308' text-anchor='middle' fill='#e2e8f0' "
-        f"font-size='12' font-family='system-ui,sans-serif' font-weight='600'>{safe}{ellipsis}</text>"
-        "<rect x='0' y='362' width='400' height='38' fill='#0a0a14'/>"
-        "<text x='14' y='386' fill='#475569' font-size='10' font-family='system-ui,sans-serif'>STEAMI AI Insight</text>"
-        "<text x='386' y='386' text-anchor='end' fill='#6366f1' font-size='10' "
-        "font-family='system-ui,sans-serif' font-weight='700'>STEAMI</text>"
-        "</svg>"
-    )
+
+# Default emoji per (sentiment, domain-keyword) — used when model omits the field
+_EMOJI_MAP: dict[tuple[str, str], str] = {
+    # ── positive ──────────────────────────────────────────────────────────
+    ("positive", "ai"):          "🤖",
+    ("positive", "machine"):     "🧠",
+    ("positive", "space"):       "🚀",
+    ("positive", "astro"):       "🌌",
+    ("positive", "bio"):         "🧬",
+    ("positive", "medicine"):    "💊",
+    ("positive", "health"):      "🩺",
+    ("positive", "climate"):     "🌱",
+    ("positive", "energy"):      "⚡",
+    ("positive", "physics"):     "⚛️",
+    ("positive", "engineer"):    "🔋",
+    ("positive", "robotics"):    "🦾",
+    ("positive", "computer"):    "💻",
+    ("positive", "cyber"):       "🔐",
+    ("positive", "math"):        "📐",
+    ("positive", "finance"):     "📈",
+    ("positive", "econom"):      "💰",
+    # ── neutral ───────────────────────────────────────────────────────────
+    ("neutral",  "ai"):          "🤖",
+    ("neutral",  "space"):       "🔭",
+    ("neutral",  "bio"):         "🔬",
+    ("neutral",  "medicine"):    "🔬",
+    ("neutral",  "health"):      "🏥",
+    ("neutral",  "climate"):     "🌍",
+    ("neutral",  "energy"):      "⚙️",
+    ("neutral",  "physics"):     "⚙️",
+    ("neutral",  "engineer"):    "🔧",
+    ("neutral",  "robotics"):    "⚙️",
+    ("neutral",  "computer"):    "🖥️",
+    ("neutral",  "math"):        "📊",
+    ("neutral",  "finance"):     "💹",
+    ("neutral",  "econom"):      "📊",
+    # ── negative ──────────────────────────────────────────────────────────
+    ("negative", "ai"):          "⚠️",
+    ("negative", "space"):       "☄️",
+    ("negative", "bio"):         "🦠",
+    ("negative", "medicine"):    "🦠",
+    ("negative", "health"):      "🚨",
+    ("negative", "climate"):     "🔥",
+    ("negative", "energy"):      "💥",
+    ("negative", "physics"):     "💥",
+    ("negative", "engineer"):    "🚨",
+    ("negative", "robotics"):    "🚨",
+    ("negative", "computer"):    "🐛",
+    ("negative", "cyber"):       "🔓",
+    ("negative", "math"):        "❌",
+    ("negative", "finance"):     "📉",
+    ("negative", "econom"):      "📉",
+}
+
+# Generic fallbacks per sentiment when no domain keyword matches
+_SENTIMENT_DEFAULT_EMOJI: dict[str, str] = {
+    "positive": "✨",
+    "neutral":  "🔬",
+    "negative": "⚠️",
+}
+
+
+def _fallback_emoji(sentiment: str, domain: str) -> str:
+    """Return the best-matching emoji for a given sentiment + domain string."""
+    domain_lc = domain.lower()
+    for (sent, kw), emoji in _EMOJI_MAP.items():
+        if sent == sentiment and kw in domain_lc:
+            return emoji
+    return _SENTIMENT_DEFAULT_EMOJI.get(sentiment, "🔬")
 
 
 def _reading_time(content: str) -> int:
@@ -521,13 +565,14 @@ def _mock_insight(title: str, article_url: str = "", domain: str = "Technology")
             "and government are expected to respond with new investments and updated guidelines. "
             "Set OLLAMA_API_KEY in your .env to enable real AI-generated insights using Gemma 4 (gemma4:31b-cloud)."
         ),
-        "svg":              _fallback_svg(title, domain),
         "key_points": [
             "A major development has been identified in this domain.",
             "Multiple stakeholders across research and industry are affected.",
             "Policy implications and long-term impact are still being assessed.",
         ],
         "sentiment":        "neutral",
+        "sentiment_label":  "neutral_news",
+        "emoji":            _fallback_emoji("neutral", domain),
         "confidence":       0.5,
         "tags":             ["steami", "demo", domain.lower().replace("/", "-")],
         "domain":           domain,

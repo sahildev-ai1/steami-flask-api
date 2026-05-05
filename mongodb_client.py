@@ -256,17 +256,27 @@ class _DocRef:
 
         if merge:
             # merge=True → update only the provided fields; create if absent
-            self._col.update_one(
+            result = self._col.update_one(
                 {"id": self.doc_id},
                 {"$set": doc},
                 upsert=True,  # create the document if it doesn't exist
             )
+            log.info(
+                "MongoDB set(merge=True) col=%s id=%s matched=%d modified=%d upserted=%s",
+                self._col_name, self.doc_id,
+                result.matched_count, result.modified_count, result.upserted_id,
+            )
         else:
             # merge=False → replace the entire document
-            self._col.replace_one(
+            result = self._col.replace_one(
                 {"id": self.doc_id},
                 doc,
                 upsert=True,  # create if not exists
+            )
+            log.info(
+                "MongoDB set(merge=False) col=%s id=%s matched=%d modified=%d upserted=%s",
+                self._col_name, self.doc_id,
+                result.matched_count, result.modified_count, result.upserted_id,
             )
 
     def update(self, data: dict) -> None:
@@ -276,9 +286,14 @@ class _DocRef:
 
         Equivalent to Firestore: doc_ref.update(data)
         """
-        self._col.update_one(
+        result = self._col.update_one(
             {"id": self.doc_id},
             {"$set": data},
+        )
+        log.info(
+            "MongoDB update() col=%s id=%s matched=%d modified=%d",
+            self._col_name, self.doc_id,
+            result.matched_count, result.modified_count,
         )
 
     def delete(self) -> None:

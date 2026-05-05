@@ -17,15 +17,22 @@ DESIGN:
   - Users can only read/delete their own entries
   - Admins can read all entries
 
-Firestore collection: `diary`
+MongoDB collections:
+  diary        — personal diary entries (one per save action)
+  ai_insights  — shared AI insight documents (read-only from here)
+  feed_articles — feed articles with embedded insights (read-only from here)
+  research_articles — research articles (read-only from here)
+  explainers   — explainer articles (read-only from here)
+
 Fields: id, uid, popup_type, popup_id, title, selected_text, note,
+        source_doc (optional snapshot of source at time of save),
         created_at, updated_at
 
 ENDPOINTS:
   POST   /api/diary              — save a diary entry (requires auth)
   GET    /api/diary              — list own entries, newest first (requires auth)
   GET    /api/diary/{entry_id}   — get single entry (requires auth)
-  PUT    /api/diary/{entry_id}   — update note (requires auth)
+  PUT    /api/diary/{entry_id}   — update note/title (requires auth)
   DELETE /api/diary/{entry_id}   — delete own entry (requires auth)
 """
 
@@ -58,6 +65,14 @@ VALID_POPUP_TYPES: list[str] = [
     "simulation",        # from a 3D Simulation (future feature)
 ]
 
+# Maps popup_type → MongoDB collection where the source document lives
+POPUP_TYPE_COLLECTION: dict[str, str] = {
+    "research_article": "research_articles",
+    "ai_insight":       "ai_insights",
+    "explainer":        "explainers",
+    "simulation":       "simulations",   # collection may not exist yet — handled gracefully
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -77,6 +92,44 @@ def _check_owner(entry: dict, uid: str, role: str) -> None:
         raise HTTPException(403, detail="Access denied. This is not your diary entry.")
 
 
+def _fetch_source_doc(popup_type: str, popup_id: str) -> Optional[dict]:
+    """
+    Fetch the source document from MongoDB for the given popup_type + popup_id.
+
+    For ai_insight: checks ai_insights first, then falls back to feed_articles
+    (because feed.py stores the insight embedded in feed_articles too).
+
+    Returns the document dict or None if not found.
+    """
+    collection_name = POPUP_TYPE_COLLECTION.get(popup_type)
+    if not collection_name:
+        return None
+
+    try:
+        doc = db.collection(collection_name).document(popup_id).get()
+        if doc.exists:
+            return doc.to_dict()
+    except Exception as e:
+        log.warning("_fetch_source_doc: primary lookup failed type=%s id=%s: %s",
+                    popup_type, popup_id, e)
+
+    # Fallback for ai_insight: the insight may be embedded in feed_articles
+    if popup_type == "ai_insight":
+        try:
+            feed_doc = db.collection("feed_articles").document(popup_id).get()
+            if feed_doc.exists:
+                data = feed_doc.to_dict()
+                # Only return if this article actually has an insight
+                if data.get("has_insight") and data.get("ai_insight"):
+                    log.info("_fetch_source_doc: ai_insight found in feed_articles fallback id=%s",
+                             popup_id)
+                    return data
+        except Exception as e:
+            log.warning("_fetch_source_doc: feed_articles fallback failed id=%s: %s", popup_id, e)
+
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # REQUEST MODELS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -85,21 +138,21 @@ class CreateDiaryBody(BaseModel):
     """
     Save a piece of content to the diary.
 
-    popup_type   — type of popup where the content was saved from
-    popup_id     — the ID of the source item (research article ID, insight ID, etc.)
-    title        — short label for this entry (e.g. article title)
+    popup_type    — type of popup where the content was saved from
+    popup_id      — the ID of the source item (research article ID, insight ID, etc.)
+    title         — short label for this entry (e.g. article title)
     selected_text — the actual text the user highlighted / wants to save
-    note         — optional personal note the user adds
+    note          — optional personal note the user adds
     """
-    popup_type:    str            # one of VALID_POPUP_TYPES
-    popup_id:      str            # ID of the source (article_id, explainer_id, etc.)
-    title:         str            # display title for the diary entry
-    selected_text: str            # the content being saved
-    note:          str  = ""      # optional personal annotation
+    popup_type:    str       # one of VALID_POPUP_TYPES
+    popup_id:      str       # ID of the source (article_id, explainer_id, etc.)
+    title:         str       # display title for the diary entry
+    selected_text: str       # the content being saved
+    note:          str = ""  # optional personal annotation
 
 
 class UpdateDiaryBody(BaseModel):
-    """Only the personal note can be updated after creation."""
+    """Only the personal note and title can be updated after creation."""
     note:  Optional[str] = None
     title: Optional[str] = None
 
@@ -120,6 +173,9 @@ def create_diary_entry(
     """
     POST /api/diary
     Save selected content from any popup to the personal diary.
+    The source document is fetched from MongoDB at save time and embedded
+    as `source_doc` so the diary entry is self-contained even if the
+    original is later deleted.
 
     Body:
     {
@@ -142,6 +198,7 @@ def create_diary_entry(
       "title":         "AI Health Tools Article",
       "selected_text": "...",
       "note":          "Interesting point...",
+      "source_doc":    { ...snapshot of the source document... },
       "created_at":    "2026-04-09T...",
       "updated_at":    "2026-04-09T..."
     }
@@ -165,14 +222,23 @@ def create_diary_entry(
     uid      = get_uid(payload)
     entry_id = str(uuid.uuid4())
 
+    # Fetch the source document from MongoDB so we can embed a snapshot
+    source_doc = _fetch_source_doc(body.popup_type, body.popup_id.strip())
+    if source_doc is None:
+        log.warning(
+            "create_diary_entry: source doc not found type=%s id=%s — saving entry without snapshot",
+            body.popup_type, body.popup_id,
+        )
+
     entry = {
         "id":            entry_id,
         "uid":           uid,                         # owner of this entry
         "popup_type":    body.popup_type,             # what type of popup it came from
-        "popup_id":      body.popup_id.strip(),       # source item ID
+        "popup_id":      body.popup_id.strip(),       # source item ID in MongoDB
         "title":         body.title.strip(),
         "selected_text": body.selected_text.strip(),  # the saved content
         "note":          body.note.strip(),            # personal annotation
+        "source_doc":    source_doc,                  # MongoDB snapshot (may be None)
         "created_at":    _now(),
         "updated_at":    _now(),
     }
@@ -183,7 +249,8 @@ def create_diary_entry(
         log.error("create_diary_entry failed uid=%s: %s", uid, e)
         raise HTTPException(500, detail=str(e))
 
-    log.info("diary saved: uid=%s type=%s popup_id=%s", uid, body.popup_type, body.popup_id)
+    log.info("diary saved: uid=%s type=%s popup_id=%s source_found=%s",
+             uid, body.popup_type, body.popup_id, source_doc is not None)
     return entry
 
 
@@ -213,19 +280,23 @@ def list_diary_entries(
     uid = get_uid(payload)
 
     try:
-        # Filter by uid — each user only sees their own entries
+        # Build query — filter by uid so each user only sees their own entries
         q = (
             db.collection("diary")
               .where("uid", "==", uid)
               .order_by("created_at", direction="DESCENDING")
               .limit(limit)
         )
+
+        # Apply popup_type filter at DB level if provided (avoids in-memory filter)
+        if popup_type.strip() and popup_type.strip() in VALID_POPUP_TYPES:
+            q = q.where("popup_type", "==", popup_type.strip())
+
         docs    = q.stream()
         entries = [d.to_dict() for d in docs]
 
-        # Optional in-memory filter by popup_type (Firestore REST doesn't support
-        # compound indexes on where+where without pre-built indexes)
-        if popup_type.strip():
+        # Fallback in-memory filter for invalid/unknown popup_type values
+        if popup_type.strip() and popup_type.strip() not in VALID_POPUP_TYPES:
             entries = [e for e in entries if e.get("popup_type") == popup_type.strip()]
 
     except Exception as e:
@@ -247,6 +318,10 @@ def get_diary_entry(
     GET /api/diary/{entry_id}
     Get a specific diary entry. Only the owner (or admin) can access it.
 
+    If the entry's source_doc snapshot is stale or missing, a fresh copy
+    is fetched from MongoDB and returned alongside the entry under
+    `live_source_doc` (the stored entry is not mutated).
+
     curl -H "Authorization: Bearer <token>" http://127.0.0.1:5000/api/diary/ENTRY_ID
     """
     doc = db.collection("diary").document(entry_id).get()
@@ -255,6 +330,13 @@ def get_diary_entry(
 
     entry = doc.to_dict()
     _check_owner(entry, get_uid(payload), payload.get("role", "user"))
+
+    # Optionally enrich with a live fetch of the source doc (non-blocking)
+    if not entry.get("source_doc"):
+        live = _fetch_source_doc(entry.get("popup_type", ""), entry.get("popup_id", ""))
+        if live:
+            entry["live_source_doc"] = live
+
     return entry
 
 

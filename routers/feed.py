@@ -736,24 +736,38 @@ def feed_item_insight(
     if not force:
         cached = _get_cached_insight(article)
         if cached:
+            # Insight exists but feed_articles may be out of sync (has_insight=False).
+            # Repair now so GET /api/feed/items returns has_insight=True consistently.
+            if not article.get("has_insight"):
+                log.info("feed_item_insight: repairing out-of-sync has_insight for %s", item_id)
+                try:
+                    doc_ref.set({
+                        "ai_insight": cached, "has_insight": True,
+                        "insight_generated_at": _now(),
+                    }, merge=True)
+                except Exception as e:
+                    log.error("feed_item_insight: repair save failed %s: %s", item_id, e)
             return {"article_id": item_id, "ai_insight": cached, "cached": True}
 
-    # Generate insight synchronously (small batch, admin initiated)
+    # Generate insight synchronously (admin initiated)
     try:
         insight = generate_ai_insight(article)
     except Exception as e:
         log.error("feed_item_insight: generate failed %s: %s", item_id, e)
         raise HTTPException(502, detail=str(e))
 
-    # Save
+    # Save to feed_articles
     try:
-        doc_ref.update({
+        doc_ref.set({
             "ai_insight": insight, "has_insight": True,
             "insight_generated_at": _now(),
-        })
+        }, merge=True)
+        log.info("feed_item_insight: saved to feed_articles %s", item_id)
     except Exception as e:
-        log.error("feed_item_insight: update failed %s: %s", item_id, e)
+        log.error("feed_item_insight: feed_articles save failed %s: %s", item_id, e)
+        raise HTTPException(500, detail=f"Insight generated but failed to save: {e}")
 
+    # Save to ai_insights collection
     try:
         db.collection("ai_insights").document(item_id).set({
             "article_id":      item_id,

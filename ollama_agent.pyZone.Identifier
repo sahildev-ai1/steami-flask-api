@@ -1,0 +1,4 @@
+[ZoneTransfer]
+ZoneId=3
+ReferrerUrl=https://claude.ai/chat/a454d564-bdcc-4e68-8f56-dc8ead00eba4
+HostUrl=https://claude.ai/api/organizations/30a367bd-1417-4986-9cbc-bf9b16b2539d/conversations/a454d564-bdcc-4e68-8f56-dc8ead00eba4/wiggle/download-file?path=%2Fmnt%2Fuser-data%2Foutputs%2Follama_agent.py
