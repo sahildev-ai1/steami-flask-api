@@ -291,6 +291,7 @@ def _fmt_explainer(ex: dict) -> dict:
         "context":         ex.get("context", ""),
         "technicalDetail": ex.get("technicalDetail", ""),
         "impact":          ex.get("impact", ""),
+        "references":      ex.get("references", []),
     }
 
 
@@ -335,6 +336,7 @@ class CreateExplainerBody(BaseModel):
     context:         str  = ""
     technicalDetail: str  = ""
     impact:          str  = ""
+    references:      list = []   # list of {title, url?, author?, type?}
 
 
 class UpdateExplainerBody(BaseModel):
@@ -351,6 +353,7 @@ class UpdateExplainerBody(BaseModel):
     context:         Optional[str]  = None
     technicalDetail: Optional[str]  = None
     impact:          Optional[str]  = None
+    references:      Optional[list] = None   # list of {title, url?, author?, type?}
 
 
 class CreateResearchArticleBody(BaseModel):
@@ -482,6 +485,7 @@ async def create_explainer_with_image(
     # ── JSON-encoded arrays (pass as JSON strings) ────────────────────────
     content:         str        = Form("[]", description='JSON array of paragraph strings'),
     keyInsights:     str        = Form("[]", description='JSON array of insight strings'),
+    references:      str        = Form("[]", description='JSON array of reference objects [{title, url?, author?, type?}]'),
     # ── Auth ──────────────────────────────────────────────────────────────
     payload:     dict       = Depends(require_mod),
 ):
@@ -516,6 +520,7 @@ async def create_explainer_with_image(
     try:
         content_list     = json.loads(content)
         keyInsights_list = json.loads(keyInsights)
+        references_list  = json.loads(references)
     except json.JSONDecodeError as e:
         raise HTTPException(400, detail=f"Invalid JSON in content or keyInsights: {e}")
 
@@ -541,6 +546,7 @@ async def create_explainer_with_image(
         "context":         context,
         "technicalDetail": technicalDetail,
         "impact":          impact,
+        "references":      references_list,
         "created_at":      _now(),
         "updated_at":      _now(),
     }
