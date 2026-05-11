@@ -65,6 +65,9 @@ BREVO_SENDER_NAME  = os.getenv("BREVO_SENDER_NAME", "STEAMI Newsletter")
 BREVO_API_BASE     = "https://api.brevo.com/v3"
 SITE_URL           = os.getenv("SITE_URL",  "https://steami.com")
 SITE_NAME          = os.getenv("SITE_NAME", "STEAMI")
+# Base URL of this FastAPI backend — used to resolve relative image paths in emails.
+# e.g. https://steami-flask-api.onrender.com
+API_BASE_URL       = os.getenv("API_BASE_URL", "").rstrip("/")
 
 DRAFT_DOC_ID = "current"   # We only ever keep one active draft in MongoDB
 
@@ -278,49 +281,86 @@ def _linkify(text: str) -> str:
         text
     )
 
+def _resolve_chart_url(chart_url: str) -> str:
+    """
+    Ensure chart_url is an absolute URL.
+
+    If chart_url is already absolute (starts with http/https), return it as-is.
+    If it is a relative path (e.g. /images/newsletter/charts/xxx.png), prepend
+    API_BASE_URL (from the .env API_BASE_URL variable) so the email server can
+    fetch it.  Falls back to SITE_URL if API_BASE_URL is not set.
+    """
+    if not chart_url:
+        return chart_url
+    if chart_url.startswith("http://") or chart_url.startswith("https://"):
+        return chart_url
+    base = API_BASE_URL or SITE_URL
+    return f"{base}/{chart_url.lstrip('/')}"
+
+
 def _chart_url_to_img_src(chart_url: str) -> str:
     """
-    Convert a chart URL to an email-safe <img> src.
+    Convert a chart URL to an email-safe base64 data URI.
 
-    Email clients (Gmail, Outlook) block SVG served from URLs and strip inline
-    <svg> tags. The only universally-safe approach is a base64 data URI.
+    Email clients (Gmail, Outlook, Apple Mail) either block remote images or
+    proxy them through their own servers, which can cause images to appear
+    broken.  The only universally-reliable approach is to embed the image as a
+    base64 data URI directly in the HTML so no external fetch is required.
 
     Strategy:
-      1. If the URL points to our own /api/newsletter/chart/<id>, look up the
-         SVG file directly on disk and base64-encode it.
-      2. If the file is not found locally, try to fetch the URL over HTTP and
-         base64-encode the response body.
-      3. If both fail, return the original URL as a last resort (PNG will still
-         work in most clients, SVG won't but at least it's not broken HTML).
+      1. Resolve relative paths → absolute URL using API_BASE_URL from .env.
+      2. If the URL points to our own /api/newsletter/chart/<id>, try to read
+         the file directly from CHART_STORE_DIR on disk (fastest, no HTTP).
+      3. Fetch the URL over HTTP and base64-encode the response body.
+         Works for any public PNG/JPEG/GIF URL, including Render-hosted files
+         like https://steami-flask-api.onrender.com/images/newsletter/charts/*.
+      4. Last resort: return the (absolute) URL as-is.  PNG remote URLs still
+         render in most clients; this is better than a broken image tag.
+
+    NOTE: SVG remote URLs are silently stripped by Gmail — always convert them.
     """
     if not chart_url:
         return chart_url
 
-    # ── 1. Try to read SVG/PNG from disk via CHART_STORE_DIR ─────────────────
+    # ── 0. Ensure the URL is absolute ────────────────────────────────────────
+    chart_url = _resolve_chart_url(chart_url)
+
+    # ── 1. Try to read file directly from disk via CHART_STORE_DIR ───────────
     m = re.search(r'/api/newsletter/chart/([^/?#]+)', chart_url)
     if m:
         safe_id = re.sub(r'[^a-zA-Z0-9_\-]', '', m.group(1))
-        for ext, mime in [("svg", "image/svg+xml"), ("png", "image/png")]:
+        for ext, mime in [("png", "image/png"), ("svg", "image/svg+xml")]:
             fpath = CHART_STORE_DIR / f"{safe_id}.{ext}"
             if fpath.exists():
                 try:
                     raw = fpath.read_bytes()
                     b64 = base64.b64encode(raw).decode("ascii")
+                    log.info("Chart: base64-encoded from disk (%s)", fpath)
                     return f"data:{mime};base64,{b64}"
                 except Exception as e:
                     log.warning("Could not base64-encode chart file %s: %s", fpath, e)
 
-    # ── 2. Fallback: fetch over HTTP ──────────────────────────────────────────
+    # ── 2. Fetch over HTTP and base64-encode ──────────────────────────────────
+    # This handles /images/newsletter/charts/*.png served by FastAPI StaticFiles
+    # as well as any other publicly accessible image URL.
     try:
-        resp = http.get(chart_url, timeout=10)
+        resp = http.get(chart_url, timeout=15)
         if resp.status_code == 200:
-            ct   = resp.headers.get("content-type", "image/png").split(";")[0].strip()
-            b64  = base64.b64encode(resp.content).decode("ascii")
+            ct = resp.headers.get("content-type", "image/png").split(";")[0].strip()
+            # Normalise content-type — some servers omit it or return text/plain
+            if not ct.startswith("image/"):
+                ct = "image/png"
+            b64 = base64.b64encode(resp.content).decode("ascii")
+            log.info("Chart: fetched and base64-encoded from %s (mime: %s, %d bytes)",
+                     chart_url, ct, len(resp.content))
             return f"data:{ct};base64,{b64}"
+        else:
+            log.warning("Chart fetch returned HTTP %d for %s", resp.status_code, chart_url)
     except Exception as e:
         log.warning("Could not fetch chart URL %s for base64 embedding: %s", chart_url, e)
 
-    # ── 3. Last resort: return URL as-is (SVG may not show, but won't break) ──
+    # ── 3. Last resort: return absolute URL as-is ────────────────────────────
+    log.warning("Chart: falling back to raw URL (may not display in Gmail): %s", chart_url)
     return chart_url
 
 # Month name → abbreviation map for radar parsing
@@ -429,44 +469,30 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
         img_src = png_b64
         log.info("Chart: using pre-rendered PNG base64 (QuickChart)")
 
-    # Priority 2: publicly-served PNG URL — only useful when API_BASE_URL is a
-    # real public hostname (e.g. https://api.steami.com), NOT localhost.
-    # Gmail's servers fetch images remotely; localhost is unreachable from them.
-    if not img_src:
-        chart_image_url = draft.get("cover_chart_image_url", "")
-        _is_public_url = (
-            chart_image_url.startswith("https://")
-            or (chart_image_url.startswith("http://")
-                and "localhost" not in chart_image_url
-                and "127.0.0.1" not in chart_image_url)
-        )
-        if chart_image_url and _is_public_url:
-            img_src = chart_image_url
-            log.info("Chart: using public disk URL → %s", chart_image_url)
+    # Priority 2: PNG/image served by our backend via FastAPI StaticFiles
+    # (e.g. /images/newsletter/charts/<uuid>.png stored on disk by ollama_agent).
+    #
+    # We ALWAYS fetch and base64-embed the image — never use the URL directly —
+    # because Brevo/Gmail/Outlook either block remote images or proxy them in
+    # ways that can cause them to appear broken.
+    #
+    # _chart_url_to_img_src handles:
+    #   • Relative paths  → resolved with API_BASE_URL from .env
+    #   • Disk files      → read directly from CHART_STORE_DIR (no HTTP needed)
+    #   • Any public URL  → fetched over HTTP and base64-encoded
+    #   • Last resort     → absolute URL returned as-is if all else fails
+    if not img_src and chart_url:
+        img_src = _chart_url_to_img_src(chart_url)
+        if img_src and img_src.startswith("data:"):
+            log.info("Chart: base64-embedded via _chart_url_to_img_src")
+        else:
+            log.warning("Chart: could not embed as base64, using URL as-is")
 
     # Priority 3: convert stored SVG string → PNG base64
     if not img_src and svg_data and svg_data.strip().startswith("<svg"):
         img_src = _svg_to_png_base64(svg_data)
         if img_src:
-            log.info("Chart: SVG converted to PNG base64 for email")
-
-    # Priority 4: fetch SVG from URL, then convert to PNG base64
-    if not img_src and chart_url:
-        try:
-            resp = http.get(chart_url, timeout=10)
-            if resp.status_code == 200:
-                fetched_svg = resp.text
-                if fetched_svg.strip().startswith("<svg"):
-                    img_src = _svg_to_png_base64(fetched_svg)
-                    if img_src:
-                        log.info("Chart: fetched SVG from URL and converted to PNG base64")
-        except Exception as e:
-            log.warning("Could not fetch chart URL for PNG conversion: %s", e)
-
-    # Priority 5: use URL directly (last resort — PNG URLs work, SVG URLs won't)
-    if not img_src and chart_url:
-        img_src = chart_url
-        log.warning("Chart: using raw URL as last resort — image may not show in Gmail")
+            log.info("Chart: SVG string converted to PNG base64 for email")
 
     if img_src:
         cover_chart = f"""
@@ -495,8 +521,6 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
                         font-weight:800;color:#0f2651;line-height:1.25;">
               {draft['cover_article_title']}
             </h2>
-            <p style="margin:0 0 16px;font-family:'JetBrains Mono',monospace;
-                      font-size:11px;color:#7a9dc8;">{cover_date}</p>
             {cover_chart}
             <p style="margin:0 0 20px;font-size:14px;color:#2a3f5a;line-height:1.7;">
               {cover_body}

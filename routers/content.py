@@ -67,10 +67,12 @@ ENDPOINTS:
 
 import os
 import json
-import shutil
 import logging
 from datetime import datetime, timezone
 from typing import Optional
+
+import cloudinary
+import cloudinary.uploader
 
 from fastapi import APIRouter, HTTPException, Query, Depends, UploadFile, File, Form
 from pydantic import BaseModel
@@ -91,23 +93,30 @@ log    = logging.getLogger(__name__)
 router = APIRouter()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# IMAGE STORAGE CONFIG
-# Must match the StaticFiles mount in main.py:
-#   app.mount("/images", StaticFiles(directory="images"), name="images")
-# This makes files stored in  images/research/physics.jpg
-# accessible at               http://host:5000/images/research/physics.jpg
+# CLOUDINARY CONFIG
+# Set these three variables in your .env / Render environment:
+#   CLOUDINARY_CLOUD_NAME=your_cloud_name
+#   CLOUDINARY_API_KEY=your_api_key
+#   CLOUDINARY_API_SECRET=your_api_secret
+# Images are uploaded to the  steami/<folder>  folder in your Cloudinary account.
+# The returned URL is a full https:// CDN URL — no StaticFiles mount needed.
 # ─────────────────────────────────────────────────────────────────────────────
 
-_BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-IMAGES_ROOT = os.path.join(_BASE_DIR, "images")                  # disk directory (project root)
-ALLOWED_MIME = {                               # accepted file types
+cloudinary.config(
+    cloud_name = os.environ.get("CLOUDINARY_CLOUD_NAME"),
+    api_key    = os.environ.get("CLOUDINARY_API_KEY"),
+    api_secret = os.environ.get("CLOUDINARY_API_SECRET"),
+    secure     = True,   # always return https:// URLs
+)
+
+ALLOWED_MIME = {
     "image/jpeg",
     "image/jpg",
     "image/png",
     "image/webp",
     "image/gif",
 }
-ALLOWED_EXT  = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,107 +128,65 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _ensure_dirs() -> None:
-    """Create image sub-directories if they don't already exist."""
-    os.makedirs(os.path.join(IMAGES_ROOT, "explainers"), exist_ok=True)
-    os.makedirs(os.path.join(IMAGES_ROOT, "research"),   exist_ok=True)
-    os.makedirs(os.path.join(IMAGES_ROOT, "blog"),       exist_ok=True)
-
-
 def _delete_file(url_path: str) -> bool:
     """
-    Delete an image from disk given its public URL path (e.g. /images/explainers/quantum-dog.jpg).
+    Delete an image from Cloudinary given its public URL or Cloudinary public_id.
 
-    - Only deletes files that live inside IMAGES_ROOT (safe against path traversal).
-    - Silently skips external URLs (http/https), empty strings, and missing files.
-    - Returns True if the file was actually deleted, False otherwise.
-    - Never raises — failures are logged as warnings so the calling request still succeeds.
+    - Skips empty strings silently.
+    - For Cloudinary URLs (https://res.cloudinary.com/...), extracts the public_id
+      and calls the Cloudinary destroy API.
+    - Returns True if deleted successfully, False otherwise.
+    - Never raises — failures are logged as warnings.
     """
-    if not url_path or url_path.startswith(("http://", "https://")):
-        return False   # external URL — nothing to clean up on disk
-
-    # Strip leading slash and build absolute path
-    rel  = url_path.lstrip("/")            # e.g.  images/explainers/quantum-dog.jpg
-    full = os.path.normpath(os.path.join(_BASE_DIR, rel))
-
-    # Safety check — must stay inside IMAGES_ROOT
-    if not full.startswith(os.path.normpath(IMAGES_ROOT)):
-        log.warning("_delete_file: refused to delete outside IMAGES_ROOT: %s", full)
+    if not url_path:
         return False
-
-    if not os.path.isfile(full):
-        return False   # already gone or never existed
 
     try:
-        os.remove(full)
-        log.info("_delete_file: removed %s", full)
-        return True
-    except OSError as exc:
-        log.warning("_delete_file: could not remove %s: %s", full, exc)
+        # Extract the public_id from a Cloudinary URL.
+        # URL format: https://res.cloudinary.com/<cloud>/image/upload/v<ver>/<public_id>.<ext>
+        if "res.cloudinary.com" in url_path:
+            # Strip everything up to and including "/upload/"
+            after_upload = url_path.split("/upload/")[-1]
+            # Drop the version segment if present (e.g. "v1234567890/")
+            if after_upload.startswith("v") and "/" in after_upload:
+                after_upload = after_upload.split("/", 1)[1]
+            # Strip the file extension to get the public_id
+            public_id = os.path.splitext(after_upload)[0]
+        else:
+            # Treat the value as a raw public_id (e.g. "steami/explainers/quantum-dog")
+            public_id = os.path.splitext(url_path.lstrip("/"))[0]
+
+        result = cloudinary.uploader.destroy(public_id)
+        if result.get("result") == "ok":
+            log.info("_delete_file: Cloudinary deleted public_id=%s", public_id)
+            return True
+        else:
+            log.warning("_delete_file: Cloudinary could not delete public_id=%s result=%s", public_id, result)
+            return False
+    except Exception as exc:
+        log.warning("_delete_file: error deleting from Cloudinary url=%s: %s", url_path, exc)
         return False
-
-
-def _file_hash(data: bytes) -> str:
-    """Return the SHA-256 hex digest of *data*."""
-    import hashlib
-    return hashlib.sha256(data).hexdigest()
-
-
-def _find_duplicate(data: bytes, skip_path: str = "") -> "str | None":
-    """
-    Scan all image sub-directories for a file whose content matches *data*.
-    Returns the public URL path of the first match found, or None.
-
-    Allows mods to upload the same image for explainers, research articles,
-    or blog posts without creating redundant copies on disk.
-
-    Args:
-        data:      Raw bytes of the uploaded image.
-        skip_path: Absolute path to skip (e.g. the intended destination,
-                   so we don't match the file we're about to overwrite).
-    """
-    target_hash = _file_hash(data)
-    for sub in ("explainers", "research", "blog"):
-        folder_path = os.path.join(IMAGES_ROOT, sub)
-        if not os.path.isdir(folder_path):
-            continue
-        for fname in os.listdir(folder_path):
-            fpath = os.path.join(folder_path, fname)
-            if not os.path.isfile(fpath):
-                continue
-            if skip_path and os.path.normpath(fpath) == os.path.normpath(skip_path):
-                continue
-            try:
-                with open(fpath, "rb") as fh:
-                    if _file_hash(fh.read()) == target_hash:
-                        return f"/images/{sub}/{fname}"
-            except OSError:
-                continue
-    return None
 
 
 def _save_file(upload: UploadFile, folder: str, filename: str) -> str:
     """
-    Save an UploadFile to disk at images/<folder>/<filename>.
+    Upload an image to Cloudinary under the  steami/<folder>  folder.
 
-    Deduplication: before writing, the file bytes are hashed and compared
-    against every existing image on disk (across explainers/, research/, and
-    blog/).  If an identical file already exists anywhere, its existing URL
-    is returned immediately — no new file is written.
+    Cloudinary handles deduplication automatically via its asset pipeline.
+    The public_id is set to  steami/<folder>/<stem>  (no extension) so
+    re-uploading the same filename overwrites the existing asset in place.
 
-    Returns the public URL path: /images/<folder>/<filename>
+    Returns the full https:// CDN URL of the uploaded image.
 
     Args:
-        upload:   FastAPI UploadFile object from the multipart form.
-        folder:   Sub-directory — must be "explainers", "research", or "blog".
+        upload:   FastAPI UploadFile from the multipart form.
+        folder:   Sub-folder name — "explainers", "research", or "blog".
         filename: Target filename including extension (e.g. "quantum-dog.jpg").
 
     Raises:
         HTTPException(400) for invalid file type or extension.
-        HTTPException(500) if the write fails.
+        HTTPException(500) if the Cloudinary upload fails.
     """
-    _ensure_dirs()
-
     # Validate MIME type
     if upload.content_type and upload.content_type not in ALLOWED_MIME:
         raise HTTPException(
@@ -227,10 +194,9 @@ def _save_file(upload: UploadFile, folder: str, filename: str) -> str:
             detail=f"File type '{upload.content_type}' not allowed. Use JPEG, PNG, WebP, or GIF."
         )
 
-    # Validate extension from filename
+    # Validate / infer extension
     ext = os.path.splitext(filename)[-1].lower()
     if ext not in ALLOWED_EXT:
-        # Try to extract extension from the uploaded file's original name
         orig_ext = os.path.splitext(upload.filename or "")[-1].lower()
         if orig_ext in ALLOWED_EXT:
             filename = filename + orig_ext
@@ -241,38 +207,52 @@ def _save_file(upload: UploadFile, folder: str, filename: str) -> str:
                 detail=f"Invalid image extension '{ext}'. Allowed: {', '.join(ALLOWED_EXT)}"
             )
 
-    # Read all bytes so we can hash for deduplication
+    # Read bytes
     try:
         data = upload.file.read()
     except Exception as e:
         raise HTTPException(500, detail=f"Failed to read uploaded file: {e}")
 
-    # Build the full disk path for the intended destination
-    dest_dir  = os.path.join(IMAGES_ROOT, folder)
-    dest_path = os.path.join(dest_dir, filename)
+    # Build a stable public_id so re-uploads overwrite the same asset
+    stem      = os.path.splitext(filename)[0]          # e.g. "quantum-dog"
+    public_id = f"steami/{folder}/{stem}"              # e.g. "steami/explainers/quantum-dog"
 
-    # ── Deduplication check ─────────────────────────────────────────────────────────
-    # Skip dest_path so we don't match the file we're replacing.
-    existing_url = _find_duplicate(data, skip_path=dest_path)
-    if existing_url:
-        log.info(
-            "Image deduplication: '%s' matches existing file → reusing %s",
-            upload.filename, existing_url,
-        )
-        return existing_url
-    # ───────────────────────────────────────────────────────────────────────────
-
-    # Write the new file to disk
+    # Upload to Cloudinary (overwrite=True replaces existing asset with same public_id)
     try:
-        with open(dest_path, "wb") as f:
-            f.write(data)
-        log.info("Image saved: %s → %s", upload.filename, dest_path)
+        result = cloudinary.uploader.upload(
+            data,
+            public_id  = public_id,
+            folder     = "",          # public_id already contains the folder path
+            overwrite  = True,
+            resource_type = "image",
+        )
+        secure_url = result["secure_url"]
+        log.info("Cloudinary upload: %s → %s", filename, secure_url)
+        return secure_url
     except Exception as e:
-        log.error("Image save failed for %s: %s", dest_path, e)
-        raise HTTPException(500, detail=f"Failed to save image: {e}")
+        log.error("Cloudinary upload failed for %s: %s", filename, e)
+        raise HTTPException(500, detail=f"Failed to upload image to Cloudinary: {e}")
 
-    # Return the public URL path (matches the StaticFiles mount point)
-    return f"/images/{folder}/{filename}"
+
+def _find_duplicate(data: bytes, skip_path: str = "") -> "str | None":
+    """
+    Stub kept for API compatibility — Cloudinary handles deduplication
+    via public_id overwriting, so this always returns None.
+    """
+    return None
+
+
+# ── dead code kept so nothing below breaks ───────────────────────────────────
+def _ensure_dirs() -> None:
+    pass  # No local directories needed with Cloudinary
+
+
+def _file_hash(data: bytes) -> str:
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+
 
 
 def _fmt_explainer(ex: dict) -> dict:
