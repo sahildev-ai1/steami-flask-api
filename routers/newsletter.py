@@ -52,8 +52,10 @@ from auth import require_admin, require_mod, get_uid
 from ollama_agent import (
     generate_cover_story,
     generate_newsletter_chart,
-    CHART_STORE_DIR,
+    CHART_IMAGE_DIR,          # images/newsletter/charts/ — where PNGs are actually saved
 )
+# Alias so the rest of this file uses a consistent name
+CHART_STORE_DIR = CHART_IMAGE_DIR
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -945,7 +947,8 @@ def save_draft(draft: NewsletterDraft, payload: dict = Depends(require_mod)):
     doc = draft.model_dump()
 
     # Preserve chart blobs that the frontend may not carry
-    _PRESERVE_IF_EMPTY = ("cover_chart_png_b64", "cover_chart_config", "cover_chart_svg_data")
+    _PRESERVE_IF_EMPTY = ("cover_chart_png_b64", "cover_chart_config", "cover_chart_svg_data",
+                           "cover_chart_image_url", "cover_chart_explanation")
     preserve_needed = any(not doc.get(f) for f in _PRESERVE_IF_EMPTY)
     if preserve_needed:
         try:
@@ -1179,6 +1182,19 @@ def generate_cover_story_chart_endpoint(req: CoverStoryRequest, payload: dict = 
         raise HTTPException(500, detail=f"Chart generation failed: {e}")
 
     chart_url  = result.get("chart_image_url", "")   # public URL built from API_BASE_URL
+    # Sanitise: if ollama_agent was running on a dev server (0.0.0.0, localhost)
+    # the URL it built is unreachable from Render / email clients.  Replace the
+    # host with API_BASE_URL so the stored URL is always publicly accessible.
+    if chart_url and API_BASE_URL:
+        from urllib.parse import urlparse, urlunparse
+        _p = urlparse(chart_url)
+        _is_local = _p.hostname in ("0.0.0.0", "localhost", "127.0.0.1") or (
+            _p.hostname and _p.hostname.startswith("192.168.")
+        )
+        if _is_local:
+            _api = urlparse(API_BASE_URL)
+            chart_url = urlunparse(_api._replace(path=_p.path, query=_p.query, fragment=""))
+            log.info("Chart URL sanitised from local → %s", chart_url)
     svg_data   = ""
     png_b64    = result.get("chart_png_b64", "")
 
@@ -1192,6 +1208,19 @@ def generate_cover_story_chart_endpoint(req: CoverStoryRequest, payload: dict = 
             svg_data = chart_path_obj.read_text(encoding="utf-8")
         except Exception as e:
             log.warning("Could not read SVG for inline storage: %s", e)
+
+    # ── Delete old chart PNG(s) from disk to keep the folder clean ──────────────
+    # Each newsletter generation produces a new UUID-named file.  Without cleanup
+    # the folder grows indefinitely.  We delete every PNG in CHART_STORE_DIR that
+    # is NOT the one we just generated for this article.
+    new_chart_filename = f"{req.article_id}.png"
+    try:
+        for old_png in CHART_STORE_DIR.glob("*.png"):
+            if old_png.name != new_chart_filename:
+                old_png.unlink(missing_ok=True)
+                log.info("Deleted old chart PNG: %s", old_png.name)
+    except Exception as e:
+        log.warning("Could not clean up old chart PNGs: %s", e)
 
     # ── Persist everything to MongoDB draft (always, for both paths) ──────────
     # IMPORTANT: always use merge=True so a subsequent save_draft (merge=False)
@@ -1224,6 +1253,46 @@ def generate_cover_story_chart_endpoint(req: CoverStoryRequest, payload: dict = 
     }
 
 
+
+# Fields that are set by backend endpoints (chart generation, AI pipeline) and
+# are NOT carried by the frontend when it POSTs a draft — they must be restored
+# from MongoDB before building the email HTML.
+_BLOB_FIELDS = ("cover_chart_png_b64", "cover_chart_config",
+                "cover_chart_svg_data", "cover_chart_image_url",
+                "cover_chart_explanation")
+
+
+def _merge_blobs_from_db(draft_dict: dict) -> dict:
+    """
+    Restore large blob fields that the frontend does not carry.
+
+    When the frontend calls /preview-draft or /send-custom it serialises the
+    draft from its own React state.  Fields like cover_chart_png_b64 (a multi-
+    KB base64 string) are never loaded into the frontend — they are written
+    directly to MongoDB by the chart-generation endpoint.  So the frontend
+    always sends them as empty strings, and they get lost.
+
+    This helper reads the current MongoDB draft and copies any of _BLOB_FIELDS
+    that are non-empty in the DB but empty in the incoming dict.
+    """
+    missing = [f for f in _BLOB_FIELDS if not draft_dict.get(f)]
+    if not missing:
+        return draft_dict  # nothing to restore
+
+    try:
+        doc = db.collection("newsletter_draft").document(DRAFT_DOC_ID).get()
+        if doc.exists:
+            saved = doc.to_dict() or {}
+            for field in missing:
+                if saved.get(field):
+                    draft_dict[field] = saved[field]
+                    log.info("_merge_blobs_from_db: restored %s from MongoDB", field)
+    except Exception as e:
+        log.warning("_merge_blobs_from_db: could not read MongoDB draft: %s", e)
+
+    return draft_dict
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # ENDPOINTS — PREVIEW & SEND  (mod preview, admin send)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1233,8 +1302,10 @@ def generate_cover_story_chart_endpoint(req: CoverStoryRequest, payload: dict = 
              tags=["Newsletter"])
 def preview_draft(draft: NewsletterDraft, payload: dict = Depends(require_mod)):
     """Renders the draft to HTML for in-browser preview (no email sent)."""
+    # Restore blob fields (chart PNG etc.) that the frontend does not carry
+    draft_dict = _merge_blobs_from_db(draft.model_dump())
     signal_articles = _fetch_signal_articles(draft.signal_brief_ids)
-    html = _build_custom_html(draft.model_dump(), signal_articles)
+    html = _build_custom_html(draft_dict, signal_articles)
     return {
         "html":    html,
         "subject": _build_subject(draft),
@@ -1251,6 +1322,8 @@ def send_custom_newsletter(draft: NewsletterDraft, payload: dict = Depends(requi
     Replaces the old send-daily endpoint for custom newsletters.
     Old draft is deleted after successful send.
     """
+    # Restore blob fields (chart PNG etc.) that the frontend does not carry
+    draft_dict      = _merge_blobs_from_db(draft.model_dump())
     signal_articles = _fetch_signal_articles(draft.signal_brief_ids)
     subscribers     = _get_subscriber_emails()
     if not subscribers:
@@ -1264,7 +1337,7 @@ def send_custom_newsletter(draft: NewsletterDraft, payload: dict = Depends(requi
     for sub in subscribers:
         email     = sub["email"]
         name      = sub.get("name", "")
-        html_body = _build_custom_html(draft.model_dump(), signal_articles, recipient_name=name)
+        html_body = _build_custom_html(draft_dict, signal_articles, recipient_name=name)
 
         if _send_one_via_brevo(email, name, subject, html_body):
             sent += 1
