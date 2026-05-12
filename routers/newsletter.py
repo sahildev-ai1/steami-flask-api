@@ -121,6 +121,7 @@ class NewsletterDraft(BaseModel):
     cover_article_date:     str = ""
     cover_insight_summary:  str = ""
     cover_chart_image_url:  str = ""
+    cover_chart_filename:   str = ""   # just the filename e.g. "abb2ac38-....png" — for disk lookup
     cover_chart_explanation:str = ""
     cover_chart_svg_data:   str = ""   # legacy SVG string
     # V5: Chart.js + QuickChart fields
@@ -458,37 +459,36 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
     # ── 1. Cover Signal ──────────────────────────────────────────────────────
     cover_chart = ""
 
-    png_b64   = draft.get("cover_chart_png_b64", "")   # V5: pre-rendered PNG from QuickChart.io
-    svg_data  = draft.get("cover_chart_svg_data", "")  # legacy SVG string
-    chart_url = draft.get("cover_chart_image_url", "") # legacy URL
+    png_b64        = draft.get("cover_chart_png_b64", "")    # V5: pre-rendered PNG from QuickChart.io
+    svg_data       = draft.get("cover_chart_svg_data", "")   # legacy SVG string
+    chart_url      = draft.get("cover_chart_image_url", "")  # public URL
+    chart_filename = draft.get("cover_chart_filename", "")   # just the filename e.g. "abc123.png"
+
+    # If we have a filename, try reading directly from disk — fastest path,
+    # no dependency on whether the stored URL is still valid.
+    if not chart_url and chart_filename:
+        disk_path = CHART_STORE_DIR / chart_filename
+        if disk_path.exists():
+            chart_url = f"{API_BASE_URL}/images/newsletter/charts/{chart_filename}"
+            log.info("Chart: resolved URL from stored filename → %s", chart_url)
 
     img_src = ""
 
-    # Priority 1: pre-rendered PNG base64 from QuickChart.io — best for email.
-    # Self-contained in the HTML, works in Gmail/Outlook/Apple Mail with zero
-    # external fetches. This should always win when available.
-    if png_b64 and png_b64.startswith("data:image/png;base64,"):
-        img_src = png_b64
-        log.info("Chart: using pre-rendered PNG base64 (QuickChart)")
+    # Priority 1: public URL — use directly if available.
+    # Brevo's sending infrastructure rewrites <img src="..."> to proxy images
+    # through its own CDN (click-tracking), so the recipient's Gmail actually
+    # loads the image from Brevo's CDN — not from our server — which bypasses
+    # Gmail's "block external images" for unknown senders.
+    # This is the most reliable path: small email size, no base64 bloat.
+    if chart_url and chart_url.startswith("https://"):
+        img_src = chart_url
+        log.info("Chart: using public URL directly → %s", chart_url)
 
-    # Priority 2: PNG/image served by our backend via FastAPI StaticFiles
-    # (e.g. /images/newsletter/charts/<uuid>.png stored on disk by ollama_agent).
-    #
-    # We ALWAYS fetch and base64-embed the image — never use the URL directly —
-    # because Brevo/Gmail/Outlook either block remote images or proxy them in
-    # ways that can cause them to appear broken.
-    #
-    # _chart_url_to_img_src handles:
-    #   • Relative paths  → resolved with API_BASE_URL from .env
-    #   • Disk files      → read directly from CHART_STORE_DIR (no HTTP needed)
-    #   • Any public URL  → fetched over HTTP and base64-encoded
-    #   • Last resort     → absolute URL returned as-is if all else fails
-    if not img_src and chart_url:
-        img_src = _chart_url_to_img_src(chart_url)
-        if img_src and img_src.startswith("data:"):
-            log.info("Chart: base64-embedded via _chart_url_to_img_src")
-        else:
-            log.warning("Chart: could not embed as base64, using URL as-is")
+    # Priority 2: base64 fallback — used when no public URL is stored
+    # (e.g. API_BASE_URL was not set during chart generation).
+    if not img_src and png_b64 and png_b64.startswith("data:image/png;base64,"):
+        img_src = png_b64
+        log.info("Chart: using pre-rendered PNG base64 (QuickChart) as fallback")
 
     # Priority 3: convert stored SVG string → PNG base64
     if not img_src and svg_data and svg_data.strip().startswith("<svg"):
@@ -954,7 +954,7 @@ def save_draft(draft: NewsletterDraft, payload: dict = Depends(require_mod)):
     # them, then delete any that are not the primary DRAFT_DOC_ID doc.
     _BLOB_FIELDS_SAVE = ("cover_chart_png_b64", "cover_chart_config",
                          "cover_chart_svg_data", "cover_chart_image_url",
-                         "cover_chart_explanation")
+                         "cover_chart_filename", "cover_chart_explanation")
     try:
         all_docs = list(db.collection("newsletter_draft").stream())
         orphan_ids = []
@@ -1247,9 +1247,13 @@ def generate_cover_story_chart_endpoint(req: CoverStoryRequest, payload: dict = 
     # IMPORTANT: always use merge=True so a subsequent save_draft (merge=False)
     # from the frontend still finds cover_chart_png_b64 in its own draft state.
     if png_b64 or chart_url:
+        # Derive the filename from the URL so it can be looked up on disk
+        # independently of whether the full URL stays valid.
+        _chart_filename = Path(chart_url).name if chart_url else ""
         patch = {
             "cover_chart_png_b64":     png_b64,
             "cover_chart_image_url":   chart_url,
+            "cover_chart_filename":    _chart_filename,
             "cover_chart_explanation": result.get("explanation", ""),
         }
         if svg_data:
@@ -1280,7 +1284,7 @@ def generate_cover_story_chart_endpoint(req: CoverStoryRequest, payload: dict = 
 # from MongoDB before building the email HTML.
 _BLOB_FIELDS = ("cover_chart_png_b64", "cover_chart_config",
                 "cover_chart_svg_data", "cover_chart_image_url",
-                "cover_chart_explanation")
+                "cover_chart_filename", "cover_chart_explanation")
 
 
 def _merge_blobs_from_db(draft_dict: dict) -> dict:
