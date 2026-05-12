@@ -791,7 +791,7 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
               </td>
               <td style="text-align:right;font-family:'JetBrains Mono',monospace;
                           font-size:11px;color:#7a9dc8;line-height:1.6;">
-                {issue_label}<br>{_today_str()}
+                {issue_label + ('<br>' + _today_str()) if issue_number else issue_label}
               </td>
             </tr>
           </table>
@@ -938,29 +938,41 @@ def save_draft(draft: NewsletterDraft, payload: dict = Depends(require_mod)):
     Saves (upserts) the single active newsletter draft.
     Old draft is replaced — only one draft is ever kept.
 
-    IMPORTANT: cover_chart_png_b64 and cover_chart_config are large blobs that
-    the frontend may not carry in its draft state (they're set by the chart
-    endpoint, not by user input).  If the incoming draft has empty values for
-    these fields, we restore them from the existing MongoDB document so the
-    chart image is not lost on every save.
+    IMPORTANT: cover_chart_png_b64 and cover_chart_config are large blobs set
+    by the chart-generation endpoint (not by the frontend).  The chart endpoint
+    uses merge=True which can create a SECOND MongoDB document when the primary
+    doc_id="current" document does not exist yet at that moment.  This means
+    save_draft must scan ALL documents in the collection to find the blobs —
+    not just the primary document — and then delete any orphan docs so the
+    collection stays clean (one doc only).
     """
     doc = draft.model_dump()
 
-    # Preserve chart blobs that the frontend may not carry
-    _PRESERVE_IF_EMPTY = ("cover_chart_png_b64", "cover_chart_config", "cover_chart_svg_data",
-                           "cover_chart_image_url", "cover_chart_explanation")
-    preserve_needed = any(not doc.get(f) for f in _PRESERVE_IF_EMPTY)
-    if preserve_needed:
-        try:
-            existing = db.collection("newsletter_draft").document(DRAFT_DOC_ID).get()
-            if existing.exists:
-                existing_data = existing.to_dict() or {}
-                for field in _PRESERVE_IF_EMPTY:
-                    if not doc.get(field) and existing_data.get(field):
-                        doc[field] = existing_data[field]
-                        log.info("save_draft: preserved %s from existing draft", field)
-        except Exception as e:
-            log.warning("save_draft: could not read existing draft to preserve blobs: %s", e)
+    # ── Scan ALL docs in newsletter_draft for blob fields ─────────────────────
+    # The chart endpoint's merge=True can create a second document (orphan) that
+    # holds the png_b64 / image_url.  We read every doc, merge blobs from all of
+    # them, then delete any that are not the primary DRAFT_DOC_ID doc.
+    _BLOB_FIELDS_SAVE = ("cover_chart_png_b64", "cover_chart_config",
+                         "cover_chart_svg_data", "cover_chart_image_url",
+                         "cover_chart_explanation")
+    try:
+        all_docs = list(db.collection("newsletter_draft").stream())
+        orphan_ids = []
+        for d in all_docs:
+            d_data = d.to_dict() or {}
+            d_id   = d.id  # MongoDB document _id / Firestore doc id
+            is_primary = (d_id == DRAFT_DOC_ID or d_data.get("doc_id") == DRAFT_DOC_ID)
+            # Merge any non-empty blob fields from this doc
+            for field in _BLOB_FIELDS_SAVE:
+                if not doc.get(field) and d_data.get(field):
+                    doc[field] = d_data[field]
+                    log.info("save_draft: merged %s from doc %s", field, d_id)
+            # Mark non-primary docs for deletion
+            if not is_primary:
+                orphan_ids.append(d_id)
+    except Exception as e:
+        log.warning("save_draft: could not scan newsletter_draft collection: %s", e)
+        orphan_ids = []
 
     doc.update({
         "saved_at":  _now(),
@@ -971,6 +983,15 @@ def save_draft(draft: NewsletterDraft, payload: dict = Depends(require_mod)):
         db.collection("newsletter_draft").document(DRAFT_DOC_ID).set(doc)
     except Exception as e:
         raise HTTPException(500, detail=f"Failed to save draft: {e}")
+
+    # ── Delete orphan docs created by merge=True upserts ─────────────────────
+    for oid in orphan_ids:
+        try:
+            db.collection("newsletter_draft").document(oid).delete()
+            log.info("save_draft: deleted orphan draft doc %s", oid)
+        except Exception as e:
+            log.warning("save_draft: could not delete orphan doc %s: %s", oid, e)
+
     return {"saved": True, "doc_id": DRAFT_DOC_ID}
 
 
@@ -1266,29 +1287,30 @@ def _merge_blobs_from_db(draft_dict: dict) -> dict:
     """
     Restore large blob fields that the frontend does not carry.
 
-    When the frontend calls /preview-draft or /send-custom it serialises the
-    draft from its own React state.  Fields like cover_chart_png_b64 (a multi-
-    KB base64 string) are never loaded into the frontend — they are written
-    directly to MongoDB by the chart-generation endpoint.  So the frontend
-    always sends them as empty strings, and they get lost.
-
-    This helper reads the current MongoDB draft and copies any of _BLOB_FIELDS
-    that are non-empty in the DB but empty in the incoming dict.
+    Scans ALL documents in the newsletter_draft collection so blobs are found
+    even when the chart endpoint's merge=True upsert created an orphan document
+    instead of updating the primary doc_id="current" document.
     """
     missing = [f for f in _BLOB_FIELDS if not draft_dict.get(f)]
     if not missing:
         return draft_dict  # nothing to restore
 
     try:
-        doc = db.collection("newsletter_draft").document(DRAFT_DOC_ID).get()
-        if doc.exists:
-            saved = doc.to_dict() or {}
+        all_docs = list(db.collection("newsletter_draft").stream())
+        for d in all_docs:
+            if not missing:
+                break  # all blobs found
+            d_data = d.to_dict() or {}
+            still_missing = []
             for field in missing:
-                if saved.get(field):
-                    draft_dict[field] = saved[field]
-                    log.info("_merge_blobs_from_db: restored %s from MongoDB", field)
+                if d_data.get(field):
+                    draft_dict[field] = d_data[field]
+                    log.info("_merge_blobs_from_db: restored %s from doc %s", field, d.id)
+                else:
+                    still_missing.append(field)
+            missing = still_missing
     except Exception as e:
-        log.warning("_merge_blobs_from_db: could not read MongoDB draft: %s", e)
+        log.warning("_merge_blobs_from_db: could not scan newsletter_draft: %s", e)
 
     return draft_dict
 
