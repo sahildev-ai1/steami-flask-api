@@ -498,12 +498,13 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
 
     if img_src:
         cover_chart = f"""
-        <div style="margin:20px 0;">
-          <img src="{img_src}" alt="Signal Chart" class="ci"
-               style="width:100%;max-width:100%;height:auto;max-height:250px;
-                      object-fit:contain;border-radius:10px;display:block;
-                      border:1px solid rgba(80,130,210,0.2);background:#fff;">
-          {f'<p style="margin:10px 0 0;font-size:12px;color:#5a7fa8;font-style:italic;">{draft["cover_chart_explanation"]}</p>'
+        <div style="margin:20px 0;line-height:0;">
+          <img src="{img_src}" alt="Signal Chart"
+               width="560" height="auto"
+               style="width:100%;max-width:560px;height:auto;display:block;
+                      border-radius:10px;border:1px solid rgba(80,130,210,0.2);
+                      background:#fff;">
+          {f'<p style="margin:8px 0 0;font-size:12px;color:#5a7fa8;font-style:italic;line-height:1.5;">{draft["cover_chart_explanation"]}</p>'
            if draft.get("cover_chart_explanation") else ""}
         </div>"""
 
@@ -662,68 +663,95 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
         </table>"""
 
     # ── 7. On the Radar ───────────────────────────────────────────────────────
-    radar_section = ""
-    on_the_radar = draft.get("on_the_radar", "")
-    if on_the_radar:
-        radar_items = _parse_radar_events(on_the_radar)
-        if radar_items:
-            items_html = ""
-            for item in radar_items:
-                day_html   = f'<div style="font-family:\'Syne\',sans-serif;font-size:26px;font-weight:800;color:#1d4ed8;line-height:1;">{item["day"]}</div>' if item.get("day") else ""
-                month_html = f'<div style="font-family:\'JetBrains Mono\',monospace;font-size:9px;letter-spacing:2px;text-transform:uppercase;color:#5a7fa8;margin-top:2px;">{item["month"]}</div>' if item.get("month") else ""
-                heading_txt = item.get("heading", "")
-                desc_txt    = item.get("text", "")
-                heading_html = (
-                    f'<p style="margin:0 0 4px;font-family:\'Syne\',sans-serif;font-size:14px;'
-                    f'font-weight:700;color:#0f2651;line-height:1.3;">{heading_txt}</p>'
-                ) if heading_txt else ""
-                desc_html = (
-                    f'<p style="margin:0;font-size:13px;color:#2a3f5a;line-height:1.65;">'
-                    f'{_linkify(desc_txt.replace(chr(10), "<br>"))}</p>'
-                ) if desc_txt else ""
-                items_html += f"""
+    # Priority 1: radar_events structured list [{date, title, description}]
+    # Priority 2: parse on_the_radar plain text
+    # Priority 3: render on_the_radar as free-form text
+    radar_section     = ""
+    radar_events_list = draft.get("radar_events") or []
+    on_the_radar      = draft.get("on_the_radar", "")
+
+    def _radar_date_cells(date_str):
+        """Split 'May 14' / '14 May' / '14\nMay' into (day, month)."""
+        if not date_str:
+            return ("", "")
+        s = date_str.strip()
+        m = re.match(r'(\d{1,2})\s+([A-Za-z]{3,9})', s)
+        if m: return (m.group(1), m.group(2)[:3].capitalize())
+        m = re.match(r'([A-Za-z]{3,9})\s+(\d{1,2})', s)
+        if m: return (m.group(2), m.group(1)[:3].capitalize())
+        parts = [p.strip() for p in s.splitlines() if p.strip()]
+        if len(parts) >= 2 and re.match(r'\d{1,2}$', parts[0]):
+            return (parts[0], parts[1][:3].capitalize())
+        return (s, "")
+
+    def _radar_item_html(day, month, heading, desc):
+        day_html   = (f'<div style="font-family:Syne,sans-serif;font-size:24px;'
+                      f'font-weight:800;color:#1d4ed8;line-height:1;">{day}</div>') if day else ""
+        month_html = (f'<div style="font-family:monospace;font-size:9px;letter-spacing:2px;'
+                      f'text-transform:uppercase;color:#5a7fa8;margin-top:2px;">{month}</div>') if month else ""
+        head_html  = (f'<p style="margin:0 0 4px;font-family:Syne,sans-serif;font-size:14px;'
+                      f'font-weight:700;color:#0f2651;line-height:1.3;">{heading}</p>') if heading else ""
+        desc_html  = (f'<p style="margin:0;font-size:13px;color:#2a3f5a;line-height:1.65;">'
+                      f'{_linkify(desc.replace(chr(10),"<br>"))}</p>') if desc else ""
+        return f"""
                 <tr>
-                  <td style="padding:16px 0;border-bottom:1px solid rgba(80,130,210,0.10);vertical-align:top;">
+                  <td style="padding:14px 0;border-bottom:1px solid rgba(80,130,210,0.10);vertical-align:top;">
                     <table width="100%" cellpadding="0" cellspacing="0"><tr>
-                      <td class="rdc" style="width:50px;vertical-align:top;padding-right:12px;text-align:center;">
+                      <td style="width:50px;vertical-align:top;padding-right:12px;text-align:center;">
                         {day_html}{month_html}
                       </td>
-                      <td style="vertical-align:middle;">
-                        {heading_html}{desc_html}
-                      </td>
+                      <td style="vertical-align:middle;">{head_html}{desc_html}</td>
                     </tr></table>
                   </td>
                 </tr>"""
-            radar_section = f"""
+
+    def _radar_wrap(rows_html):
+        return f"""
             <table width="100%" cellpadding="0" cellspacing="0"
                    style="background:#fff;border-radius:12px;margin-bottom:24px;
                           border:1px solid rgba(80,130,210,0.15);overflow:hidden;">
-              <tr><td style="padding:24px 28px;">
+              <tr><td style="padding:22px 22px;">
                 <p style="margin:0 0 16px;font-family:'JetBrains Mono',monospace;
                           font-size:10px;letter-spacing:2px;text-transform:uppercase;
                           color:#3b72c8;font-weight:500;">📻 ON THE RADAR</p>
-                <table width="100%" cellpadding="0" cellspacing="0">
-                  {items_html}
-                </table>
+                <table width="100%" cellpadding="0" cellspacing="0">{rows_html}</table>
               </td></tr>
             </table>"""
+
+    if radar_events_list:
+        rows = ""
+        for ev in radar_events_list:
+            day, month = _radar_date_cells(ev.get("date", ""))
+            rows += _radar_item_html(
+                day, month,
+                ev.get("title", "") or ev.get("heading", ""),
+                ev.get("description", "") or ev.get("text", ""),
+            )
+        radar_section = _radar_wrap(rows)
+
+    elif on_the_radar:
+        radar_items = _parse_radar_events(on_the_radar)
+        if radar_items:
+            rows = ""
+            for item in radar_items:
+                rows += _radar_item_html(
+                    item.get("day",""), item.get("month",""),
+                    item.get("heading",""), item.get("text",""),
+                )
+            radar_section = _radar_wrap(rows)
         else:
-            # Fallback: free-form text with linkify
             radar_html = _linkify(on_the_radar.replace("\n", "<br>"))
             radar_section = f"""
             <table width="100%" cellpadding="0" cellspacing="0"
                    style="background:#fff;border-radius:12px;margin-bottom:24px;
                           border:1px solid rgba(80,130,210,0.15);overflow:hidden;">
-              <tr><td style="padding:24px 28px;">
+              <tr><td style="padding:22px 22px;">
                 <p style="margin:0 0 14px;font-family:'JetBrains Mono',monospace;
                           font-size:10px;letter-spacing:2px;text-transform:uppercase;
                           color:#3b72c8;font-weight:500;">📻 ON THE RADAR</p>
-                <div style="font-size:14px;color:#2a3f5a;line-height:1.75;">
-                  {radar_html}
-                </div>
+                <div style="font-size:14px;color:#2a3f5a;line-height:1.75;">{radar_html}</div>
               </td></tr>
             </table>"""
-
     # ── Footer ────────────────────────────────────────────────────────────────
     footer = f"""
     <table width="100%" cellpadding="0" cellspacing="0"
