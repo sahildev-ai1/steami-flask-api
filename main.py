@@ -158,6 +158,7 @@ from routers.insight_router import router as insight_router
 from routers.profile_router import router as profile_router
 from routers.notifications import router as notifications_router
 from daily_cleanup import start_cleanup_scheduler, cleanup_router
+from routers.syswatch import router as syswatch_router
 
 
 # ── Logging ────────────────────────────────────────────────────────────────
@@ -226,6 +227,7 @@ os.makedirs(os.path.join(IMAGES_DIR, "research"),   exist_ok=True)
 os.makedirs(os.path.join(IMAGES_DIR, "explainers"), exist_ok=True)
 os.makedirs(os.path.join(IMAGES_DIR, "blog"),       exist_ok=True)
 app.mount("/images", StaticFiles(directory=IMAGES_DIR), name="images")
+app.mount("/syswatch", StaticFiles(directory="static/syswatch", html=True), name="syswatch-ui")
 
 
 # ── Startup ────────────────────────────────────────────────────────────────
@@ -251,6 +253,7 @@ app.include_router(notifications_router, prefix="/api/notifications", tags=["Not
 app.include_router(insight_router, prefix="/api/articles", tags=["Insights"])
 app.include_router(profile_router, prefix="/api/profile", tags=["Profile"])
 app.include_router(cleanup_router, prefix="/api/admin",   tags=["Admin"])
+app.include_router(syswatch_router)
 
 # content.router handles multiple tag groups — registered without a top-level tag
 # so each route's own tags= kwarg controls the Swagger UI grouping:

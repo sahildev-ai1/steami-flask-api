@@ -499,9 +499,10 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
     if img_src:
         cover_chart = f"""
         <div style="margin:20px 0;">
-          <img src="{img_src}" alt="Signal Chart" width="596"
-               style="width:100%;max-height:280px;object-fit:contain;border-radius:10px;
-                      border:1px solid rgba(80,130,210,0.2);display:block;background:#fff;">
+          <img src="{img_src}" alt="Signal Chart" class="ci"
+               style="width:100%;max-width:100%;height:auto;max-height:250px;
+                      object-fit:contain;border-radius:10px;display:block;
+                      border:1px solid rgba(80,130,210,0.2);background:#fff;">
           {f'<p style="margin:10px 0 0;font-size:12px;color:#5a7fa8;font-style:italic;">{draft["cover_chart_explanation"]}</p>'
            if draft.get("cover_chart_explanation") else ""}
         </div>"""
@@ -515,21 +516,21 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
         <table width="100%" cellpadding="0" cellspacing="0"
                style="background:#eef5ff;border-radius:12px;margin-bottom:24px;
                       border:1px solid rgba(80,130,210,0.18);overflow:hidden;">
-          <tr><td style="padding:28px 32px;">
+          <tr><td class="cc" style="padding:20px 20px;">
             <p style="margin:0 0 8px;font-family:'JetBrains Mono',monospace;
                       font-size:10px;letter-spacing:2px;text-transform:uppercase;
                       color:#3b72c8;font-weight:500;">📡 SIGNAL — COVER STORY</p>
-            <h2 style="margin:0 0 8px;font-family:'Syne',sans-serif;font-size:22px;
-                        font-weight:800;color:#0f2651;line-height:1.25;">
+            <h2 class="ct" style="margin:0 0 10px;font-family:'Syne',sans-serif;font-size:20px;
+                        font-weight:800;color:#0f2651;line-height:1.28;">
               {draft['cover_article_title']}
             </h2>
             {cover_chart}
             <p style="margin:0 0 20px;font-size:14px;color:#2a3f5a;line-height:1.7;">
               {cover_body}
             </p>
-            <a href="{cover_url}" target="_blank" rel="noopener"
+            <a href="{cover_url}" target="_blank" rel="noopener" class="rb"
                style="display:inline-block;background:#1d4ed8;color:#fff;
-                      text-decoration:none;padding:12px 24px;border-radius:8px;
+                      text-decoration:none;padding:12px 22px;border-radius:8px;
                       font-family:'Syne',sans-serif;font-size:13px;font-weight:700;">
               Read Full Article →
             </a>
@@ -549,7 +550,7 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
         <table width="100%" cellpadding="0" cellspacing="0"
                style="background:#fff8e6;border-radius:12px;margin-bottom:24px;
                       border:1px solid rgba(200,160,40,0.25);overflow:hidden;">
-          <tr><td style="padding:22px 28px;">
+          <tr><td class="kc" style="padding:18px 18px;">
             <p style="margin:0 0 10px;font-family:'JetBrains Mono',monospace;
                       font-size:10px;letter-spacing:2px;text-transform:uppercase;
                       color:#b07d10;font-weight:500;">🤝 SPONSORED · PARTNER MESSAGE</p>
@@ -570,7 +571,7 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
         <table width="100%" cellpadding="0" cellspacing="0"
                style="background:#fff;border-radius:10px;margin-bottom:16px;
                       border:1px solid rgba(80,130,210,0.15);overflow:hidden;">
-          <tr><td style="padding:20px 24px;">
+          <tr><td class="kc" style="padding:16px 16px;">
             <p style="margin:0 0 8px;font-family:'JetBrains Mono',monospace;
                       font-size:10px;letter-spacing:2px;text-transform:uppercase;
                       color:{color};font-weight:500;">{emoji} {tag}</p>
@@ -649,7 +650,7 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
         <table width="100%" cellpadding="0" cellspacing="0"
                style="background:#f0f6ff;border-radius:12px;margin-bottom:24px;
                       border:1px solid rgba(80,130,210,0.18);overflow:hidden;">
-          <tr><td style="padding:24px 28px;">
+          <tr><td class="bc" style="padding:20px 16px;">
             <p style="margin:0 0 {('14px' if brief_notes else '18px')};font-family:'JetBrains Mono',monospace;
                       font-size:10px;letter-spacing:2px;text-transform:uppercase;
                       color:#3b72c8;font-weight:500;">⚡ SIGNAL BRIEFS</p>
@@ -684,7 +685,7 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
                 <tr>
                   <td style="padding:16px 0;border-bottom:1px solid rgba(80,130,210,0.10);vertical-align:top;">
                     <table width="100%" cellpadding="0" cellspacing="0"><tr>
-                      <td style="width:56px;vertical-align:top;padding-right:18px;text-align:center;">
+                      <td class="rdc" style="width:50px;vertical-align:top;padding-right:12px;text-align:center;">
                         {day_html}{month_html}
                       </td>
                       <td style="vertical-align:middle;">
@@ -727,7 +728,7 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
     footer = f"""
     <table width="100%" cellpadding="0" cellspacing="0"
            style="background:#e8f2fc;border-top:1px solid rgba(80,130,210,0.14);">
-      <tr><td style="padding:24px 32px;text-align:center;">
+      <tr><td class="fc" style="padding:20px 18px;text-align:center;">
         <p style="margin:0 0 10px;font-family:'JetBrains Mono',monospace;
                   font-size:12px;font-weight:700;color:#0f2651;letter-spacing:1px;">
           {SITE_NAME}
@@ -735,11 +736,13 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
         <p style="margin:0 0 14px;font-size:12px;color:#5a7fa8;">
           Science &amp; Technology · {_today_str()}
         </p>
-        <div style="display:flex;gap:16px;justify-content:center;margin-bottom:14px;flex-wrap:wrap;">
-          <a href="{frontend_url}" style="font-size:12px;color:#1d4ed8;text-decoration:none;">Visit {SITE_NAME}</a>
-          {f'<a href="{linkedin_url}" style="font-size:12px;color:#1d4ed8;text-decoration:none;">LinkedIn</a>' if linkedin_url and linkedin_url != "#" else ""}
-          <a href="{subscribe_url}" style="font-size:12px;color:#1d4ed8;text-decoration:none;">Subscribe</a>
-        </div>
+        <table cellpadding="0" cellspacing="0" style="margin:0 auto 14px;">
+          <tr>
+            <td style="padding:0 8px;"><a href="{frontend_url}" class="fl" style="font-size:12px;color:#1d4ed8;text-decoration:none;white-space:nowrap;">Visit {SITE_NAME}</a></td>
+            {('<td style="padding:0 8px;"><a href="' + linkedin_url + '" class="fl" style="font-size:12px;color:#1d4ed8;text-decoration:none;white-space:nowrap;">LinkedIn</a></td>') if linkedin_url and linkedin_url != "#" else ""}
+            <td style="padding:0 8px;"><a href="{subscribe_url}" class="fl" style="font-size:12px;color:#1d4ed8;text-decoration:none;white-space:nowrap;">Subscribe</a></td>
+          </tr>
+        </table>
         <p style="margin:0;font-size:11px;color:#8aabcc;">
           You received this because you subscribed to {SITE_NAME} updates. &nbsp;
           <a href="{unsubscribe_url}" style="color:#8aabcc;text-decoration:underline;">Unsubscribe</a>
@@ -755,18 +758,35 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
   <meta name="viewport" content="width=device-width,initial-scale=1.0">
   <title>{SITE_NAME} Newsletter — {issue_label}</title>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    @media only screen and (max-width:600px) {{
+      .ew   {{ width:100% !important; }}
+      .eb   {{ padding:16px 14px !important; }}
+      .hc   {{ padding:16px 16px 18px !important; }}
+      .cc   {{ padding:18px 14px !important; }}
+      .kc   {{ padding:16px 14px !important; }}
+      .bc   {{ padding:18px 14px !important; }}
+      .fc   {{ padding:18px 14px !important; }}
+      .ct   {{ font-size:17px !important; line-height:1.3 !important; }}
+      .sn   {{ font-size:14px !important; }}
+      .rb   {{ display:block !important; text-align:center !important; padding:13px 10px !important; }}
+      .ci   {{ max-height:190px !important; }}
+      .rdc  {{ width:42px !important; padding-right:8px !important; }}
+      .rd   {{ font-size:20px !important; }}
+      .fl   {{ display:block !important; padding:4px 0 !important; }}
+      img   {{ height:auto !important; max-width:100% !important; }}
+    }}
+  </style>
 </head>
-<body style="margin:0;padding:0;background:#d0e4f4;
-             font-family:'DM Sans',system-ui,sans-serif;font-size:15px;
-             line-height:1.68;color:#1a2a3a;padding:32px 16px;">
-  <table width="100%" cellpadding="0" cellspacing="0">
-    <tr><td align="center">
-      <table width="660" cellpadding="0" cellspacing="0"
-             style="max-width:660px;width:100%;background:#f5f9ff;
+<body style="margin:0;padding:0;background:#d0e4f4;font-family:'DM Sans',system-ui,sans-serif;font-size:15px;line-height:1.68;color:#1a2a3a;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#d0e4f4;">
+    <tr><td align="center" style="padding:16px 8px;">
+      <table class="ew" width="600" cellpadding="0" cellspacing="0"
+             style="max-width:600px;width:100%;background:#f5f9ff;
                     border:1px solid rgba(80,130,210,0.22);border-radius:4px;overflow:hidden;">
 
         <!-- Header -->
-        <tr><td style="background:#f5f9ff;padding:20px 36px 24px;
+        <tr><td class="hc" style="background:#f5f9ff;padding:20px 26px 22px;
                         border-bottom:2px solid rgba(80,130,210,0.14);">
           <table width="100%" cellpadding="0" cellspacing="0">
             <tr>
@@ -779,8 +799,8 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
                                    font-size:13px;color:#fff;">ST</span>
                     </td>
                     <td style="padding-left:11px;">
-                      <div style="font-family:'Syne',sans-serif;font-weight:700;
-                                  font-size:17px;color:#0f2651;">{SITE_NAME}</div>
+                      <div class="sn" style="font-family:'Syne',sans-serif;font-weight:700;
+                                  font-size:16px;color:#0f2651;">{SITE_NAME}</div>
                       <div style="font-family:'JetBrains Mono',monospace;font-size:10px;
                                   color:#7a9dc8;letter-spacing:2px;text-transform:uppercase;">
                         Science &amp; Technology
@@ -802,7 +822,7 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
         </td></tr>
 
         <!-- Body -->
-        <tr><td style="padding:28px 32px;">
+        <tr><td class="eb" style="padding:22px 22px;">
           {cover_section}
           {sponsor_section}
           {content_section}

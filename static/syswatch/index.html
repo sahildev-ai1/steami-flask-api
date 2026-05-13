@@ -1,0 +1,1214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SysWatch · STEAMI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;0,700;1,400&family=Bebas+Neue&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+/* ═══════════════════════════════════════════════════════
+   ROOT & RESET
+═══════════════════════════════════════════════════════ */
+:root {
+  --ink: #0b0c0f;
+  --ink2: #111318;
+  --ink3: #181c24;
+  --rule: #1f2535;
+  --rule2: #2a3347;
+  --lime: #c8f135;
+  --lime-dim: rgba(200,241,53,0.12);
+  --lime-glow: rgba(200,241,53,0.06);
+  --cyan: #38f5d4;
+  --red: #ff4757;
+  --amber: #ffa502;
+  --blue: #5352ed;
+  --text: #cdd6f4;
+  --muted: #6272a4;
+  --mono: 'IBM Plex Mono', monospace;
+  --display: 'Bebas Neue', sans-serif;
+  --body: 'DM Sans', sans-serif;
+}
+
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+html { font-size: 14px; }
+
+body {
+  background: var(--ink);
+  color: var(--text);
+  font-family: var(--mono);
+  min-height: 100vh;
+  overflow-x: hidden;
+  cursor: default;
+}
+
+/* Scanline overlay */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0,0,0,0.07) 2px,
+    rgba(0,0,0,0.07) 4px
+  );
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* Noise texture */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.035'/%3E%3C/svg%3E");
+  pointer-events: none;
+  z-index: 9998;
+  opacity: 0.4;
+}
+
+/* ═══════════════════════════════════════════════════════
+   LAYOUT
+═══════════════════════════════════════════════════════ */
+.shell {
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  grid-template-rows: 44px 1fr;
+  min-height: 100vh;
+}
+
+/* ═══════════════════════════════════════════════════════
+   TOPBAR
+═══════════════════════════════════════════════════════ */
+.topbar {
+  grid-column: 1 / -1;
+  background: var(--ink2);
+  border-bottom: 1px solid var(--rule);
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  gap: 0;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.topbar-brand {
+  font-family: var(--display);
+  font-size: 20px;
+  letter-spacing: 2px;
+  color: var(--lime);
+  margin-right: 28px;
+  text-shadow: 0 0 20px rgba(200,241,53,0.4);
+}
+
+.topbar-sub {
+  font-size: 10px;
+  color: var(--muted);
+  letter-spacing: 1.5px;
+  border-left: 1px solid var(--rule);
+  padding-left: 16px;
+  margin-right: auto;
+}
+
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+
+.pulse-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--lime);
+  box-shadow: 0 0 8px var(--lime);
+  animation: blink 1.4s ease-in-out infinite;
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+
+.topbar-clock {
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.5px;
+}
+
+.status-pill {
+  font-size: 10px;
+  padding: 3px 10px;
+  border-radius: 2px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  font-weight: 500;
+}
+.pill-ok { background: rgba(200,241,53,0.12); color: var(--lime); border: 1px solid rgba(200,241,53,0.25); }
+.pill-warn { background: rgba(255,165,2,0.12); color: var(--amber); border: 1px solid rgba(255,165,2,0.25); }
+
+/* ═══════════════════════════════════════════════════════
+   SIDEBAR
+═══════════════════════════════════════════════════════ */
+.sidebar {
+  background: var(--ink2);
+  border-right: 1px solid var(--rule);
+  display: flex;
+  flex-direction: column;
+  padding-top: 12px;
+  position: sticky;
+  top: 44px;
+  height: calc(100vh - 44px);
+  overflow-y: auto;
+}
+
+.nav-group-label {
+  font-size: 9px;
+  letter-spacing: 2px;
+  color: var(--muted);
+  padding: 16px 18px 6px;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+
+.nav-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 18px;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  border-left: 2px solid transparent;
+  transition: all 0.15s;
+  user-select: none;
+}
+
+.nav-link:hover { color: var(--lime); background: var(--lime-glow); }
+.nav-link.active {
+  color: var(--lime);
+  background: var(--lime-dim);
+  border-left-color: var(--lime);
+}
+
+.nav-icon { font-size: 13px; width: 14px; display: inline-block; text-align: center; }
+
+.nav-badge {
+  margin-left: auto;
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 2px;
+  background: var(--lime-dim);
+  color: var(--lime);
+}
+
+.sidebar-footer {
+  margin-top: auto;
+  padding: 14px 18px;
+  border-top: 1px solid var(--rule);
+  font-size: 10px;
+  color: var(--muted);
+  line-height: 1.8;
+}
+
+/* ═══════════════════════════════════════════════════════
+   MAIN CANVAS
+═══════════════════════════════════════════════════════ */
+.canvas {
+  padding: 22px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+/* ═══════════════════════════════════════════════════════
+   PAGE HEADER
+═══════════════════════════════════════════════════════ */
+.page-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.page-title-row { display: flex; flex-direction: column; gap: 2px; }
+
+.page-title {
+  font-family: var(--display);
+  font-size: 36px;
+  letter-spacing: 3px;
+  color: var(--text);
+  line-height: 1;
+}
+
+.page-title em { color: var(--lime); font-style: normal; }
+
+.page-hostname {
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 1px;
+}
+
+.header-actions { display: flex; gap: 10px; align-items: center; }
+
+.btn {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 7px 16px;
+  border-radius: 2px;
+  cursor: pointer;
+  letter-spacing: 0.5px;
+  border: none;
+  transition: all 0.15s;
+}
+
+.btn-ghost {
+  background: transparent;
+  border: 1px solid var(--rule2);
+  color: var(--muted);
+}
+.btn-ghost:hover { border-color: var(--lime); color: var(--lime); }
+
+.btn-primary {
+  background: var(--lime);
+  color: var(--ink);
+  font-weight: 700;
+}
+.btn-primary:hover { background: #d8ff3f; box-shadow: 0 0 16px rgba(200,241,53,0.3); }
+
+/* ═══════════════════════════════════════════════════════
+   ALERT STRIP
+═══════════════════════════════════════════════════════ */
+.alert-strip {
+  background: rgba(255,71,87,0.07);
+  border: 1px solid rgba(255,71,87,0.2);
+  border-left: 3px solid var(--red);
+  border-radius: 3px;
+  padding: 9px 14px;
+  font-size: 11px;
+  color: var(--red);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  animation: slideDown 0.3s ease;
+}
+@keyframes slideDown { from { opacity:0; transform:translateY(-6px); } to { opacity:1; transform:none; } }
+
+.alert-strip button {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+
+/* ═══════════════════════════════════════════════════════
+   METRIC STRIP (top 4 cards)
+═══════════════════════════════════════════════════════ */
+.metric-strip {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+}
+
+.mcard {
+  background: var(--ink2);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 16px 18px;
+  position: relative;
+  overflow: hidden;
+  transition: border-color 0.2s, transform 0.2s;
+}
+
+.mcard:hover { border-color: var(--rule2); transform: translateY(-1px); }
+
+.mcard::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 2px;
+}
+.mcard.c-lime::before { background: var(--lime); box-shadow: 0 0 8px rgba(200,241,53,0.5); }
+.mcard.c-cyan::before { background: var(--cyan); box-shadow: 0 0 8px rgba(56,245,212,0.4); }
+.mcard.c-amber::before { background: var(--amber); box-shadow: 0 0 8px rgba(255,165,2,0.4); }
+.mcard.c-red::before { background: var(--red); box-shadow: 0 0 8px rgba(255,71,87,0.4); }
+
+.mcard-label {
+  font-size: 9px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+
+.mcard-value {
+  font-family: var(--display);
+  font-size: 42px;
+  letter-spacing: 1px;
+  line-height: 1;
+}
+
+.mcard.c-lime .mcard-value { color: var(--lime); text-shadow: 0 0 20px rgba(200,241,53,0.3); }
+.mcard.c-cyan .mcard-value { color: var(--cyan); text-shadow: 0 0 20px rgba(56,245,212,0.3); }
+.mcard.c-amber .mcard-value { color: var(--amber); }
+.mcard.c-red .mcard-value { color: var(--red); }
+
+.mcard-sub {
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 5px;
+  line-height: 1.6;
+}
+
+.mbar {
+  height: 2px;
+  background: var(--rule);
+  border-radius: 1px;
+  margin-top: 12px;
+  overflow: hidden;
+}
+.mbar-fill {
+  height: 100%;
+  border-radius: 1px;
+  transition: width 0.8s cubic-bezier(0.23,1,0.32,1);
+}
+.c-lime .mbar-fill { background: var(--lime); }
+.c-cyan .mbar-fill { background: var(--cyan); }
+.c-amber .mbar-fill { background: var(--amber); }
+.c-red .mbar-fill { background: var(--red); }
+
+/* ═══════════════════════════════════════════════════════
+   GRID ROWS
+═══════════════════════════════════════════════════════ */
+.row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.row-3 { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; }
+.row-4 { display: grid; grid-template-columns: 3fr 1fr; gap: 14px; }
+
+/* ═══════════════════════════════════════════════════════
+   PANEL
+═══════════════════════════════════════════════════════ */
+.panel {
+  background: var(--ink2);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.panel-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--rule);
+  flex-shrink: 0;
+}
+
+.panel-title {
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.panel-tag {
+  font-size: 9px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 2px;
+}
+
+.tag-live { background: rgba(200,241,53,0.1); color: var(--lime); border: 1px solid rgba(200,241,53,0.2); }
+.tag-static { background: rgba(99,110,164,0.15); color: var(--muted); border: 1px solid var(--rule); }
+.tag-warn { background: rgba(255,165,2,0.1); color: var(--amber); border: 1px solid rgba(255,165,2,0.2); }
+
+/* ═══════════════════════════════════════════════════════
+   SPARKLINE CHART
+═══════════════════════════════════════════════════════ */
+.chart-wrap {
+  padding: 12px 16px;
+  position: relative;
+}
+
+.chart-svg { width: 100%; height: 110px; display: block; overflow: visible; }
+
+.chart-label {
+  font-size: 9px;
+  fill: var(--muted);
+  font-family: 'IBM Plex Mono';
+}
+
+/* ═══════════════════════════════════════════════════════
+   PROCESS TABLE
+═══════════════════════════════════════════════════════ */
+.proc-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+
+.proc-table th {
+  padding: 7px 16px;
+  text-align: left;
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--muted);
+  border-bottom: 1px solid var(--rule);
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.proc-table td {
+  padding: 8px 16px;
+  border-bottom: 1px solid rgba(31,37,53,0.6);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.proc-table tr:last-child td { border-bottom: none; }
+.proc-table tbody tr:hover td { background: rgba(200,241,53,0.025); }
+
+.p-name { color: var(--lime); font-weight: 500; max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
+.p-cmd { color: var(--muted); font-size: 10px; display: block; max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
+.p-pid { color: var(--muted); font-size: 10px; }
+.p-user { color: var(--cyan); font-size: 10px; }
+
+.mini-bar {
+  display: inline-block;
+  width: 48px;
+  height: 2px;
+  background: var(--rule);
+  border-radius: 1px;
+  vertical-align: middle;
+  margin-left: 6px;
+  overflow: hidden;
+}
+.mini-fill {
+  height: 100%;
+  border-radius: 1px;
+}
+
+.status-badge {
+  font-size: 9px;
+  padding: 2px 6px;
+  border-radius: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.s-run { background: rgba(200,241,53,0.1); color: var(--lime); }
+.s-slp { background: rgba(99,110,164,0.15); color: var(--muted); }
+.s-stp { background: rgba(255,71,87,0.1); color: var(--red); }
+
+/* ═══════════════════════════════════════════════════════
+   NETWORK PANEL
+═══════════════════════════════════════════════════════ */
+.net-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 16px;
+  border-bottom: 1px solid rgba(31,37,53,0.5);
+  font-size: 11px;
+}
+.net-row:last-child { border-bottom: none; }
+.net-name { color: var(--cyan); font-weight: 500; }
+.net-detail { color: var(--muted); font-size: 10px; }
+.net-val { color: var(--text); font-size: 11px; text-align: right; }
+.net-ip { color: var(--lime); font-size: 10px; }
+
+.net-up { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+.up-yes { background: var(--lime); box-shadow: 0 0 6px rgba(200,241,53,0.5); }
+.up-no { background: var(--muted); }
+
+/* ═══════════════════════════════════════════════════════
+   LOG PANEL
+═══════════════════════════════════════════════════════ */
+.log-scroll {
+  max-height: 230px;
+  overflow-y: auto;
+  flex: 1;
+}
+.log-scroll::-webkit-scrollbar { width: 3px; }
+.log-scroll::-webkit-scrollbar-track { background: transparent; }
+.log-scroll::-webkit-scrollbar-thumb { background: var(--rule2); border-radius: 2px; }
+
+.log-row {
+  display: flex;
+  gap: 10px;
+  padding: 5px 16px;
+  font-size: 10px;
+  font-family: var(--mono);
+  border-left: 2px solid transparent;
+  transition: background 0.1s;
+}
+.log-row:hover { background: rgba(200,241,53,0.02); }
+
+.log-time { color: var(--muted); white-space: nowrap; min-width: 64px; opacity: 0.7; }
+.log-level { min-width: 36px; font-weight: 700; letter-spacing: 0.5px; }
+.log-msg { color: var(--text); opacity: 0.85; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.lv-ok { color: var(--lime); border-left-color: var(--lime); }
+.lv-warn { color: var(--amber); border-left-color: var(--amber); }
+.lv-err { color: var(--red); border-left-color: var(--red); }
+.lv-info { color: var(--cyan); border-left-color: var(--cyan); }
+
+/* ═══════════════════════════════════════════════════════
+   USER TABLE
+═══════════════════════════════════════════════════════ */
+.user-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.user-table th {
+  padding: 7px 16px;
+  text-align: left;
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: var(--muted);
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--rule);
+  font-weight: 400;
+}
+.user-table td {
+  padding: 8px 16px;
+  border-bottom: 1px solid rgba(31,37,53,0.5);
+}
+.user-table tr:last-child td { border-bottom: none; }
+.user-table tbody tr:hover td { background: rgba(200,241,53,0.025); }
+
+.avatar {
+  display: inline-flex;
+  width: 22px; height: 22px;
+  border-radius: 3px;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--ink);
+  background: var(--lime);
+  margin-right: 8px;
+  vertical-align: middle;
+}
+
+/* ═══════════════════════════════════════════════════════
+   DISK PARTITIONS
+═══════════════════════════════════════════════════════ */
+.disk-row {
+  padding: 10px 16px;
+  border-bottom: 1px solid rgba(31,37,53,0.5);
+  font-size: 11px;
+}
+.disk-row:last-child { border-bottom: none; }
+.disk-mount { color: var(--lime); font-weight: 500; }
+.disk-details { color: var(--muted); font-size: 10px; margin-top: 2px; }
+.disk-bar-bg {
+  height: 3px;
+  background: var(--rule);
+  border-radius: 2px;
+  margin-top: 6px;
+  overflow: hidden;
+}
+.disk-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.8s ease;
+}
+
+/* ═══════════════════════════════════════════════════════
+   SYSTEM INFO GRID
+═══════════════════════════════════════════════════════ */
+.sysinfo-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+}
+.sysinfo-item {
+  padding: 9px 16px;
+  border-bottom: 1px solid rgba(31,37,53,0.5);
+  border-right: 1px solid rgba(31,37,53,0.5);
+  font-size: 10px;
+}
+.sysinfo-item:nth-child(even) { border-right: none; }
+.sysinfo-item:nth-last-child(-n+2) { border-bottom: none; }
+.sysinfo-key { color: var(--muted); margin-bottom: 2px; letter-spacing: 0.5px; font-size: 9px; text-transform: uppercase; }
+.sysinfo-val { color: var(--text); font-weight: 500; }
+
+/* ═══════════════════════════════════════════════════════
+   LOADING / ERROR
+═══════════════════════════════════════════════════════ */
+.loading-shimmer {
+  background: linear-gradient(90deg, var(--ink2) 25%, var(--ink3) 50%, var(--ink2) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: 3px;
+  height: 1em;
+}
+@keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+
+.error-msg {
+  padding: 16px;
+  color: var(--red);
+  font-size: 11px;
+  text-align: center;
+  opacity: 0.7;
+}
+
+/* ═══════════════════════════════════════════════════════
+   SPINNER (refresh)
+═══════════════════════════════════════════════════════ */
+@keyframes spin { to { transform: rotate(360deg); } }
+.spinning { display: inline-block; animation: spin 0.5s linear infinite; }
+
+/* ═══════════════════════════════════════════════════════
+   FADE IN
+═══════════════════════════════════════════════════════ */
+.fadein {
+  opacity: 0;
+  animation: fi 0.4s ease forwards;
+}
+@keyframes fi { to { opacity:1; } }
+.fadein:nth-child(1){animation-delay:0.05s}
+.fadein:nth-child(2){animation-delay:0.1s}
+.fadein:nth-child(3){animation-delay:0.15s}
+.fadein:nth-child(4){animation-delay:0.2s}
+
+/* tooltip */
+[title] { cursor: help; }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- ═══ TOPBAR ═══ -->
+  <header class="topbar">
+    <span class="topbar-brand">SYSWATCH</span>
+    <span class="topbar-sub">STEAMI · BRAIN CENTRE · IIT MADRAS</span>
+    <div class="topbar-right">
+      <span class="pulse-dot"></span>
+      <span class="topbar-clock" id="clock">--:--:--</span>
+      <span class="status-pill pill-ok" id="health-pill">HEALTHY</span>
+    </div>
+  </header>
+
+  <!-- ═══ SIDEBAR ═══ -->
+  <nav class="sidebar">
+    <div class="nav-group-label">Monitor</div>
+    <div class="nav-link active" data-view="overview"><span class="nav-icon">⬡</span>Overview</div>
+    <div class="nav-link" data-view="processes"><span class="nav-icon">▤</span>Processes<span class="nav-badge" id="proc-count">…</span></div>
+    <div class="nav-link" data-view="disk"><span class="nav-icon">◈</span>Disk</div>
+
+    <div class="nav-group-label">Network</div>
+    <div class="nav-link" data-view="network"><span class="nav-icon">⟡</span>Interfaces</div>
+
+    <div class="nav-group-label">Admin</div>
+    <div class="nav-link" data-view="users"><span class="nav-icon">⬟</span>Users</div>
+    <div class="nav-link" data-view="logs"><span class="nav-icon">▣</span>Logs</div>
+
+    <div class="sidebar-footer">
+      <div id="sb-os">OS: —</div>
+      <div id="sb-uptime">Up: —</div>
+      <div id="sb-kernel">Kern: —</div>
+    </div>
+  </nav>
+
+  <!-- ═══ CANVAS ═══ -->
+  <main class="canvas" id="canvas">
+    <!-- Filled by JS -->
+    <div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:12px;">
+      Connecting to STEAMI API…
+    </div>
+  </main>
+
+</div>
+
+<script>
+/* ═══════════════════════════════════════════════════════
+   CONFIG
+═══════════════════════════════════════════════════════ */
+const API = '/api/syswatch';
+const POLL_MS = 4000;
+
+/* ═══════════════════════════════════════════════════════
+   STATE
+═══════════════════════════════════════════════════════ */
+let state = {
+  overview: null,
+  processes: null,
+  network: null,
+  disk: null,
+  users: null,
+  logs: null,
+  cpuHistory: Array(50).fill(0),
+  memHistory: Array(50).fill(0),
+  currentView: 'overview',
+};
+
+/* ═══════════════════════════════════════════════════════
+   CLOCK
+═══════════════════════════════════════════════════════ */
+(function clock() {
+  const el = document.getElementById('clock');
+  function tick() {
+    el.textContent = new Date().toLocaleTimeString('en-IN', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  }
+  tick(); setInterval(tick, 1000);
+})();
+
+/* ═══════════════════════════════════════════════════════
+   API CALLS
+═══════════════════════════════════════════════════════ */
+async function api(endpoint) {
+  try {
+    const res = await fetch(`${API}/${endpoint}`);
+    if (!res.ok) throw new Error(res.status);
+    return await res.json();
+  } catch(e) {
+    console.error(`[SysWatch] ${endpoint}:`, e);
+    return null;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   POLL LOOP
+═══════════════════════════════════════════════════════ */
+async function pollAll() {
+  const [overview, procs, net, disk, users, logs, health] = await Promise.all([
+    api('overview'), api('processes'), api('network'),
+    api('disk'), api('users'), api('logs'), api('health')
+  ]);
+
+  if (overview) {
+    state.overview = overview;
+    state.cpuHistory = [...state.cpuHistory.slice(1), overview.cpu.percent];
+    state.memHistory = [...state.memHistory.slice(1), overview.memory.percent];
+
+    // Sidebar
+    document.getElementById('sb-os').textContent = `OS: ${overview.os || '—'}`;
+    document.getElementById('sb-uptime').textContent = `Up: ${overview.uptime}`;
+    document.getElementById('sb-kernel').textContent = `Kern: ${overview.kernel}`;
+  }
+
+  if (procs) {
+    state.processes = procs;
+    document.getElementById('proc-count').textContent = procs.total;
+  }
+  if (net)   state.network = net;
+  if (disk)  state.disk = disk;
+  if (users) state.users = users;
+  if (logs)  state.logs = logs;
+
+  if (health) {
+    const pill = document.getElementById('health-pill');
+    pill.textContent = health.status.toUpperCase();
+    pill.className = 'status-pill ' + (health.status === 'healthy' ? 'pill-ok' : 'pill-warn');
+  }
+
+  render();
+}
+
+/* ═══════════════════════════════════════════════════════
+   ROUTER
+═══════════════════════════════════════════════════════ */
+function render() {
+  const views = { overview, processes, network, disk, users, logs };
+  const fn = views[state.currentView];
+  if (fn) fn();
+}
+
+document.querySelectorAll('.nav-link').forEach(link => {
+  link.addEventListener('click', () => {
+    document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+    link.classList.add('active');
+    state.currentView = link.dataset.view;
+    render();
+  });
+});
+
+/* ═══════════════════════════════════════════════════════
+   HELPERS
+═══════════════════════════════════════════════════════ */
+function pct(v) { return `${Math.round(v)}%`; }
+
+function colorFor(v) {
+  if (v > 85) return 'c-red';
+  if (v > 65) return 'c-amber';
+  if (v > 40) return 'c-cyan';
+  return 'c-lime';
+}
+
+function barColor(v) {
+  if (v > 85) return 'var(--red)';
+  if (v > 65) return 'var(--amber)';
+  return 'var(--lime)';
+}
+
+function statusClass(s) {
+  if (!s) return 's-slp';
+  if (s.includes('running') || s === 'R') return 's-run';
+  if (s.includes('stop')) return 's-stp';
+  return 's-slp';
+}
+
+function avatarColors(name) {
+  const colors = ['var(--lime)', 'var(--cyan)', 'var(--amber)'];
+  return colors[(name || '').charCodeAt(0) % colors.length];
+}
+
+/* ─── Sparkline builder ─── */
+function buildSparkline(history, color, gradId) {
+  const W = 500, H = 90, PAD_T = 8, PAD_B = 4;
+  const n = history.length;
+  const pts = history.map((v, i) => {
+    const x = (i / (n - 1)) * W;
+    const y = H - PAD_B - (v / 100) * (H - PAD_T - PAD_B);
+    return `${x},${y}`;
+  });
+  const lineD = `M ${pts.join(' L ')}`;
+  const lastPt = pts[pts.length - 1].split(',');
+  const areaD = `${lineD} L ${lastPt[0]},${H} L 0,${H} Z`;
+
+  return `
+  <defs>
+    <linearGradient id="${gradId}" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="${color}" stop-opacity="0.25"/>
+      <stop offset="100%" stop-color="${color}" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <line x1="0" y1="${H*0.33}" x2="${W}" y2="${H*0.33}" stroke="var(--rule)" stroke-width="1" stroke-dasharray="3,3"/>
+  <line x1="0" y1="${H*0.66}" x2="${W}" y2="${H*0.66}" stroke="var(--rule)" stroke-width="1" stroke-dasharray="3,3"/>
+  <path d="${areaD}" fill="url(#${gradId})" stroke="none"/>
+  <path d="${lineD}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+  <circle cx="${lastPt[0]}" cy="${lastPt[1]}" r="3" fill="${color}" opacity="0.9"/>
+  <text x="2" y="14" class="chart-label">100%</text>
+  <text x="2" y="${H*0.33+4}" class="chart-label">66%</text>
+  <text x="2" y="${H*0.66+4}" class="chart-label">33%</text>`;
+}
+
+/* ═══════════════════════════════════════════════════════
+   VIEW: OVERVIEW
+═══════════════════════════════════════════════════════ */
+function overview() {
+  const o = state.overview;
+  if (!o) { document.getElementById('canvas').innerHTML = '<div class="error-msg">Connecting…</div>'; return; }
+
+  const cpu = o.cpu.percent;
+  const mem = o.memory.percent;
+  const disk = state.disk ? state.disk.partitions[0]?.percent ?? 0 : 0;
+
+  document.getElementById('canvas').innerHTML = `
+
+  <div class="page-header">
+    <div class="page-title-row">
+      <div class="page-title">SYSTEM <em>OVERVIEW</em></div>
+      <div class="page-hostname">▸ ${o.hostname} · ${o.os} · ${o.architecture}</div>
+    </div>
+    <div class="header-actions">
+      <button class="btn btn-ghost" onclick="pollAll()">⟳ Refresh</button>
+    </div>
+  </div>
+
+  <!-- METRIC STRIP -->
+  <div class="metric-strip">
+    ${[
+      {label:'CPU Load', val:pct(cpu), sub:`${o.cpu.count_logical} cores · ${o.cpu.freq_mhz||'?'} MHz<br>Load: ${(o.cpu.load_avg||[0,0,0]).join(' / ')}`, cls:colorFor(cpu), bar:cpu},
+      {label:'Memory', val:pct(mem), sub:`${o.memory.used} / ${o.memory.total}<br>Avail: ${o.memory.available}`, cls:colorFor(mem), bar:mem},
+      {label:'Disk', val:pct(disk), sub:`${state.disk?.partitions[0]?.used||'—'} / ${state.disk?.partitions[0]?.total||'—'}<br>Free: ${state.disk?.partitions[0]?.free||'—'}`, cls:colorFor(disk), bar:disk},
+      {label:'Uptime', val:'—', sub:`Boot: ${o.boot_time}<br>${o.uptime} online`, cls:'c-cyan', bar:0, big:o.uptime},
+    ].map(m => `
+    <div class="mcard ${m.cls} fadein">
+      <div class="mcard-label">${m.label}</div>
+      <div class="mcard-value">${m.big||m.val}</div>
+      <div class="mcard-sub">${m.sub}</div>
+      <div class="mbar"><div class="mbar-fill" style="width:${m.bar}%"></div></div>
+    </div>`).join('')}
+  </div>
+
+  <!-- CHARTS -->
+  <div class="row-2">
+    <div class="panel">
+      <div class="panel-top">
+        <span class="panel-title">CPU % — History</span>
+        <span class="panel-tag tag-live">● LIVE</span>
+      </div>
+      <div class="chart-wrap">
+        <svg class="chart-svg" viewBox="0 0 500 90" preserveAspectRatio="none">
+          ${buildSparkline(state.cpuHistory, 'var(--lime)', 'gcpu')}
+        </svg>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-top">
+        <span class="panel-title">Memory % — History</span>
+        <span class="panel-tag tag-live">● LIVE</span>
+      </div>
+      <div class="chart-wrap">
+        <svg class="chart-svg" viewBox="0 0 500 90" preserveAspectRatio="none">
+          ${buildSparkline(state.memHistory, 'var(--cyan)', 'gmem')}
+        </svg>
+      </div>
+    </div>
+  </div>
+
+  <!-- PROCESSES + NETWORK + LOGS -->
+  <div class="row-2">
+    <div class="panel">
+      <div class="panel-top">
+        <span class="panel-title">Top Processes</span>
+        <span class="panel-tag tag-static">${state.processes?.total||0} total</span>
+      </div>
+      <table class="proc-table">
+        <thead><tr>
+          <th>Name</th><th>PID</th><th>User</th><th>CPU</th><th>MEM</th><th>Status</th>
+        </tr></thead>
+        <tbody>
+          ${(state.processes?.processes||[]).slice(0,7).map(p => `
+          <tr>
+            <td><span class="p-name">${p.name}</span><span class="p-cmd">${p.cmd}</span></td>
+            <td class="p-pid">${p.pid}</td>
+            <td class="p-user">${p.user}</td>
+            <td>${pct(p.cpu_percent)}<span class="mini-bar"><span class="mini-fill" style="width:${Math.min(p.cpu_percent,100)}%;height:100%;display:block;background:${barColor(p.cpu_percent)}"></span></span></td>
+            <td>${p.mem_mb} MB</td>
+            <td><span class="status-badge ${statusClass(p.status)}">${p.status}</span></td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:14px;">
+      <!-- USERS -->
+      <div class="panel">
+        <div class="panel-top">
+          <span class="panel-title">Active Sessions</span>
+          <span class="panel-tag tag-live">${state.users?.count||0} online</span>
+        </div>
+        ${state.users?.users?.length ? `
+        <table class="user-table">
+          <thead><tr><th>User</th><th>Term</th><th>Since</th></tr></thead>
+          <tbody>
+          ${state.users.users.map(u => `
+          <tr>
+            <td><span class="avatar" style="background:${avatarColors(u.name)}">${(u.name||'?')[0].toUpperCase()}</span>${u.name}</td>
+            <td style="color:var(--muted);font-size:10px">${u.terminal}</td>
+            <td style="color:var(--lime);font-size:10px">${u.started}</td>
+          </tr>`).join('')}
+          </tbody>
+        </table>` : '<div class="error-msg" style="padding:16px">No active sessions</div>'}
+      </div>
+
+      <!-- SYSTEM INFO -->
+      <div class="panel">
+        <div class="panel-top"><span class="panel-title">System Info</span></div>
+        <div class="sysinfo-grid">
+          <div class="sysinfo-item"><div class="sysinfo-key">Platform</div><div class="sysinfo-val">${o.platform}</div></div>
+          <div class="sysinfo-item"><div class="sysinfo-key">Arch</div><div class="sysinfo-val">${o.architecture}</div></div>
+          <div class="sysinfo-item"><div class="sysinfo-key">Swap %</div><div class="sysinfo-val">${o.memory.swap_percent ?? '—'}%</div></div>
+          <div class="sysinfo-item"><div class="sysinfo-key">Net TX</div><div class="sysinfo-val">${o.network.bytes_sent}</div></div>
+          <div class="sysinfo-item"><div class="sysinfo-key">Net RX</div><div class="sysinfo-val">${o.network.bytes_recv}</div></div>
+          <div class="sysinfo-item"><div class="sysinfo-key">Pkts</div><div class="sysinfo-val">${o.network.packets_sent}</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- LOGS -->
+  <div class="panel">
+    <div class="panel-top">
+      <span class="panel-title">System Log</span>
+      <span class="panel-tag tag-static">${state.logs?.source||'—'}</span>
+    </div>
+    <div class="log-scroll">
+      ${(state.logs?.entries||[]).map(e => {
+        const cls = {OK:'lv-ok',WARN:'lv-warn',ERROR:'lv-err',INFO:'lv-info'}[e.level]||'lv-info';
+        return `<div class="log-row ${cls}">
+          <span class="log-time">${e.time}</span>
+          <span class="log-level">${e.level}</span>
+          <span class="log-msg">${e.msg}</span>
+        </div>`;
+      }).join('')}
+    </div>
+  </div>`;
+}
+
+/* ═══════════════════════════════════════════════════════
+   VIEW: PROCESSES
+═══════════════════════════════════════════════════════ */
+function processes() {
+  const procs = state.processes?.processes || [];
+  document.getElementById('canvas').innerHTML = `
+  <div class="page-header">
+    <div class="page-title-row">
+      <div class="page-title">PROCESS <em>LIST</em></div>
+      <div class="page-hostname">▸ ${state.processes?.total||0} total processes</div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-top">
+      <span class="panel-title">All Processes · Sorted by CPU</span>
+      <span class="panel-tag tag-live">● LIVE</span>
+    </div>
+    <table class="proc-table">
+      <thead><tr><th>Name</th><th>PID</th><th>User</th><th>CPU %</th><th>Memory</th><th>Status</th></tr></thead>
+      <tbody>
+        ${procs.map(p => `
+        <tr>
+          <td><span class="p-name">${p.name}</span><span class="p-cmd">${p.cmd}</span></td>
+          <td class="p-pid">${p.pid}</td>
+          <td class="p-user">${p.user}</td>
+          <td>${pct(p.cpu_percent)}<span class="mini-bar"><span class="mini-fill" style="width:${Math.min(p.cpu_percent,100)}%;height:100%;display:block;background:${barColor(p.cpu_percent)}"></span></span></td>
+          <td>${p.mem_mb} MB</td>
+          <td><span class="status-badge ${statusClass(p.status)}">${p.status}</span></td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+  </div>`;
+}
+
+/* ═══════════════════════════════════════════════════════
+   VIEW: NETWORK
+═══════════════════════════════════════════════════════ */
+function network() {
+  const ifaces = state.network?.interfaces || [];
+  document.getElementById('canvas').innerHTML = `
+  <div class="page-header">
+    <div class="page-title-row">
+      <div class="page-title">NETWORK <em>INTERFACES</em></div>
+      <div class="page-hostname">▸ ${ifaces.length} interfaces found</div>
+    </div>
+  </div>
+  <div class="row-2">
+    ${ifaces.map(iface => `
+    <div class="panel">
+      <div class="panel-top">
+        <span class="panel-title"><span class="net-up ${iface.is_up ? 'up-yes':'up-no'}"></span>${iface.name}</span>
+        <span class="panel-tag ${iface.is_up ? 'tag-live':'tag-static'}">${iface.is_up ? 'UP':'DOWN'}</span>
+      </div>
+      <div class="net-row">
+        <span class="net-name">IPv4</span>
+        <span class="net-ip">${iface.ipv4}</span>
+      </div>
+      <div class="net-row">
+        <span class="net-detail">Speed</span>
+        <span class="net-val">${iface.speed_mbps ? iface.speed_mbps + ' Mbps' : '—'}</span>
+      </div>
+      <div class="net-row">
+        <span class="net-detail">Bytes Sent</span>
+        <span class="net-val">${iface.bytes_sent}</span>
+      </div>
+      <div class="net-row">
+        <span class="net-detail">Bytes Recv</span>
+        <span class="net-val">${iface.bytes_recv}</span>
+      </div>
+      <div class="net-row">
+        <span class="net-detail">Pkts TX / RX</span>
+        <span class="net-val">${iface.packets_sent} / ${iface.packets_recv}</span>
+      </div>
+      <div class="net-row">
+        <span class="net-detail">Errors IN / OUT</span>
+        <span class="net-val" style="color:${iface.errors_in||iface.errors_out ? 'var(--red)':'var(--muted)'}">
+          ${iface.errors_in} / ${iface.errors_out}
+        </span>
+      </div>
+    </div>`).join('')}
+  </div>`;
+}
+
+/* ═══════════════════════════════════════════════════════
+   VIEW: DISK
+═══════════════════════════════════════════════════════ */
+function disk() {
+  const parts = state.disk?.partitions || [];
+  document.getElementById('canvas').innerHTML = `
+  <div class="page-header">
+    <div class="page-title-row">
+      <div class="page-title">DISK <em>STORAGE</em></div>
+      <div class="page-hostname">▸ ${parts.length} partition(s) · Read: ${state.disk?.read_bytes} · Write: ${state.disk?.write_bytes}</div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-top"><span class="panel-title">Mounted Partitions</span></div>
+    ${parts.map(p => `
+    <div class="disk-row">
+      <div style="display:flex;justify-content:space-between;align-items:baseline">
+        <span class="disk-mount">${p.mountpoint}</span>
+        <span style="font-size:11px;color:${barColor(p.percent)}">${pct(p.percent)}</span>
+      </div>
+      <div class="disk-details">${p.device} · ${p.fstype} · ${p.used} / ${p.total} used · ${p.free} free</div>
+      <div class="disk-bar-bg"><div class="disk-bar-fill" style="width:${p.percent}%;background:${barColor(p.percent)}"></div></div>
+    </div>`).join('')}
+  </div>
+  <div class="row-2">
+    <div class="panel">
+      <div class="panel-top"><span class="panel-title">I/O Stats</span></div>
+      <div class="net-row"><span class="net-detail">Total Reads</span><span class="net-val">${state.disk?.read_bytes}</span></div>
+      <div class="net-row"><span class="net-detail">Total Writes</span><span class="net-val">${state.disk?.write_bytes}</span></div>
+      <div class="net-row"><span class="net-detail">Read Ops</span><span class="net-val">${state.disk?.read_count}</span></div>
+      <div class="net-row"><span class="net-detail">Write Ops</span><span class="net-val">${state.disk?.write_count}</span></div>
+    </div>
+  </div>`;
+}
+
+/* ═══════════════════════════════════════════════════════
+   VIEW: USERS
+═══════════════════════════════════════════════════════ */
+function users() {
+  const us = state.users?.users || [];
+  document.getElementById('canvas').innerHTML = `
+  <div class="page-header">
+    <div class="page-title-row">
+      <div class="page-title">ACTIVE <em>SESSIONS</em></div>
+      <div class="page-hostname">▸ ${us.length} user(s) logged in</div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-top"><span class="panel-title">Logged-in Users</span><span class="panel-tag tag-live">● LIVE</span></div>
+    ${us.length ? `
+    <table class="user-table">
+      <thead><tr><th>Username</th><th>Terminal</th><th>Host</th><th>Login Time</th></tr></thead>
+      <tbody>
+      ${us.map(u => `
+      <tr>
+        <td><span class="avatar" style="background:${avatarColors(u.name)};color:var(--ink)">${(u.name||'?')[0].toUpperCase()}</span>${u.name}</td>
+        <td style="color:var(--muted);font-size:10px">${u.terminal}</td>
+        <td style="color:var(--cyan);font-size:10px">${u.host}</td>
+        <td style="color:var(--lime);font-size:10px">${u.started_full}</td>
+      </tr>`).join('')}
+      </tbody>
+    </table>` : '<div class="error-msg">No active sessions detected</div>'}
+  </div>`;
+}
+
+/* ═══════════════════════════════════════════════════════
+   VIEW: LOGS
+═══════════════════════════════════════════════════════ */
+function logs() {
+  const entries = state.logs?.entries || [];
+  document.getElementById('canvas').innerHTML = `
+  <div class="page-header">
+    <div class="page-title-row">
+      <div class="page-title">SYSTEM <em>LOGS</em></div>
+      <div class="page-hostname">▸ Source: ${state.logs?.source || '—'}</div>
+    </div>
+  </div>
+  <div class="panel" style="max-height:70vh;overflow:hidden">
+    <div class="panel-top"><span class="panel-title">Recent Events</span><span class="panel-tag tag-static">${entries.length} entries</span></div>
+    <div class="log-scroll" style="max-height:calc(70vh - 40px)">
+      ${entries.map(e => {
+        const cls = {OK:'lv-ok',WARN:'lv-warn',ERROR:'lv-err',INFO:'lv-info'}[e.level]||'lv-info';
+        return `<div class="log-row ${cls}">
+          <span class="log-time">${e.time}</span>
+          <span class="log-level">${e.level}</span>
+          <span class="log-msg">${e.msg}</span>
+        </div>`;
+      }).join('')}
+    </div>
+  </div>`;
+}
+
+/* ═══════════════════════════════════════════════════════
+   BOOT
+═══════════════════════════════════════════════════════ */
+pollAll();
+setInterval(pollAll, POLL_MS);
+</script>
+</body>
+</html>
