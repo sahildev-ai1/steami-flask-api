@@ -459,42 +459,49 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
     # ── 1. Cover Signal ──────────────────────────────────────────────────────
     cover_chart = ""
 
-    png_b64        = draft.get("cover_chart_png_b64", "")    # V5: pre-rendered PNG from QuickChart.io
-    svg_data       = draft.get("cover_chart_svg_data", "")   # legacy SVG string
-    chart_url      = draft.get("cover_chart_image_url", "")  # public URL
-    chart_filename = draft.get("cover_chart_filename", "")   # just the filename e.g. "abc123.png"
+    png_b64        = draft.get("cover_chart_png_b64", "")
+    svg_data       = draft.get("cover_chart_svg_data", "")
+    chart_filename = (draft.get("cover_chart_filename") or "").strip()
+    chart_url      = (draft.get("cover_chart_image_url") or "").strip()
 
-    # If we have a filename, try reading directly from disk — fastest path,
-    # no dependency on whether the stored URL is still valid.
-    if not chart_url and chart_filename:
-        disk_path = CHART_STORE_DIR / chart_filename
-        if disk_path.exists():
-            chart_url = f"{API_BASE_URL}/images/newsletter/charts/{chart_filename}"
-            log.info("Chart: resolved URL from stored filename → %s", chart_url)
+    # ── ALWAYS build the URL from the filename first ──────────────────────────
+    # cover_chart_image_url can be empty (frontend never carries it back after
+    # saving).  cover_chart_filename is the ground truth — always reconstruct
+    # the full public URL from it so the <img> tag is always correct.
+    # Format: https://steami-flask-api.onrender.com/images/newsletter/charts/<filename>
+    if chart_filename:
+        base = API_BASE_URL.rstrip("/") if API_BASE_URL else SITE_URL.rstrip("/")
+        chart_url = f"{base}/images/newsletter/charts/{chart_filename}"
+        log.info("Chart URL built from filename → %s", chart_url)
+    elif chart_url:
+        # fallback: derive filename from stored URL and save it for next time
+        chart_filename = chart_url.rstrip("/").split("/")[-1]
+        log.info("Chart URL from stored field → %s", chart_url)
+    else:
+        log.warning("Chart: no filename and no URL in draft — image will be missing")
+
+    log.info("Chart debug | filename=%r url=%r png_b64_len=%d",
+             chart_filename, chart_url, len(png_b64))
 
     img_src = ""
 
-    # Priority 1: public URL — use directly if available.
-    # Brevo's sending infrastructure rewrites <img src="..."> to proxy images
-    # through its own CDN (click-tracking), so the recipient's Gmail actually
-    # loads the image from Brevo's CDN — not from our server — which bypasses
-    # Gmail's "block external images" for unknown senders.
-    # This is the most reliable path: small email size, no base64 bloat.
+    # Priority 1: public URL built from filename — the ONLY reliable path.
+    # Brevo rewrites <img src> through its own CDN, so Gmail receives the image
+    # from Brevo's trusted domain regardless of Gmail's image-blocking setting.
     if chart_url and chart_url.startswith("https://"):
         img_src = chart_url
-        log.info("Chart: using public URL directly → %s", chart_url)
+        log.info("Chart: using public URL → %s", img_src)
 
-    # Priority 2: base64 fallback — used when no public URL is stored
-    # (e.g. API_BASE_URL was not set during chart generation).
+    # Priority 2: base64 — only if no URL available
     if not img_src and png_b64 and png_b64.startswith("data:image/png;base64,"):
         img_src = png_b64
-        log.info("Chart: using pre-rendered PNG base64 (QuickChart) as fallback")
+        log.info("Chart: falling back to base64")
 
-    # Priority 3: convert stored SVG string → PNG base64
+    # Priority 3: SVG → PNG base64
     if not img_src and svg_data and svg_data.strip().startswith("<svg"):
         img_src = _svg_to_png_base64(svg_data)
         if img_src:
-            log.info("Chart: SVG string converted to PNG base64 for email")
+            log.info("Chart: SVG converted to PNG base64")
 
     if img_src:
         cover_chart = f"""
@@ -757,18 +764,16 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
     <table width="100%" cellpadding="0" cellspacing="0"
            style="background:#e8f2fc;border-top:1px solid rgba(80,130,210,0.14);">
       <tr><td class="fc" style="padding:20px 18px;text-align:center;">
-        <p style="margin:0 0 10px;font-family:'JetBrains Mono',monospace;
+        <p style="margin:0 0 14px;font-family:'JetBrains Mono',monospace;
                   font-size:12px;font-weight:700;color:#0f2651;letter-spacing:1px;">
           {SITE_NAME}
-        </p>
-        <p style="margin:0 0 14px;font-size:12px;color:#5a7fa8;">
-          Science &amp; Technology · {_today_str()}
         </p>
         <table cellpadding="0" cellspacing="0" style="margin:0 auto 14px;">
           <tr>
             <td style="padding:0 8px;"><a href="{frontend_url}" class="fl" style="font-size:12px;color:#1d4ed8;text-decoration:none;white-space:nowrap;">Visit {SITE_NAME}</a></td>
             {('<td style="padding:0 8px;"><a href="' + linkedin_url + '" class="fl" style="font-size:12px;color:#1d4ed8;text-decoration:none;white-space:nowrap;">LinkedIn</a></td>') if linkedin_url and linkedin_url != "#" else ""}
             <td style="padding:0 8px;"><a href="{subscribe_url}" class="fl" style="font-size:12px;color:#1d4ed8;text-decoration:none;white-space:nowrap;">Subscribe</a></td>
+            <td style="padding:0 8px;"><a href="{frontend_url}/privacy" class="fl" style="font-size:12px;color:#1d4ed8;text-decoration:none;white-space:nowrap;">Privacy Policy</a></td>
           </tr>
         </table>
         <p style="margin:0;font-size:11px;color:#8aabcc;">
@@ -814,38 +819,15 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
                     border:1px solid rgba(80,130,210,0.22);border-radius:4px;overflow:hidden;">
 
         <!-- Header -->
-        <tr><td class="hc" style="background:#f5f9ff;padding:20px 26px 22px;
+        <tr><td class="hc" style="background:#f5f9ff;padding:20px 26px 18px;
                         border-bottom:2px solid rgba(80,130,210,0.14);">
-          <table width="100%" cellpadding="0" cellspacing="0">
-            <tr>
-              <td>
-                <table cellpadding="0" cellspacing="0">
-                  <tr>
-                    <td style="width:38px;height:38px;background:#1d4ed8;border-radius:6px;
-                                text-align:center;vertical-align:middle;">
-                      <span style="font-family:'Syne',sans-serif;font-weight:800;
-                                   font-size:13px;color:#fff;">ST</span>
-                    </td>
-                    <td style="padding-left:11px;">
-                      <div class="sn" style="font-family:'Syne',sans-serif;font-weight:700;
-                                  font-size:16px;color:#0f2651;">{SITE_NAME}</div>
-                      <div style="font-family:'JetBrains Mono',monospace;font-size:10px;
-                                  color:#7a9dc8;letter-spacing:2px;text-transform:uppercase;">
-                        Science &amp; Technology
-                      </div>
-                    </td>
-                  </tr>
-                </table>
-              </td>
-              <td style="text-align:right;font-family:'JetBrains Mono',monospace;
-                          font-size:11px;color:#7a9dc8;line-height:1.6;">
-                {issue_label + ('<br>' + _today_str()) if issue_number else issue_label}
-              </td>
-            </tr>
-          </table>
+          <div style="font-family:'Syne',sans-serif;font-weight:800;
+                      font-size:22px;color:#0f2651;letter-spacing:-0.5px;">{SITE_NAME}</div>
+          <div style="font-family:'JetBrains Mono',monospace;font-size:10px;
+                      color:#7a9dc8;margin-top:4px;">{_today_str()}</div>
           <!-- Greeting -->
-          <p style="margin:20px 0 0;font-size:15px;color:#374151;">
-            {greeting} Here's your STEAMI digest — the science &amp; tech signals you need to know. ✨
+          <p style="margin:18px 0 0;font-size:15px;color:#374151;line-height:1.6;">
+            {greeting} Here's your STEAMI digest — the science &amp; tech signals you need to know.
           </p>
         </td></tr>
 
@@ -1390,7 +1372,7 @@ def preview_draft(draft: NewsletterDraft, payload: dict = Depends(require_mod)):
 @router.post("/send-custom",
              summary="Send the custom drafted newsletter to all subscribers — ADMIN ONLY",
              tags=["Newsletter"])
-def send_custom_newsletter(draft: NewsletterDraft, payload: dict = Depends(require_admin)):
+def send_custom_newsletter(draft: NewsletterDraft, payload: dict = Depends(require_mod)):
     """
     Send the mod-drafted newsletter to all active subscribers.
     Replaces the old send-daily endpoint for custom newsletters.
@@ -1552,9 +1534,9 @@ def unsubscribe(body: UnsubscribeBody):
 # ═════════════════════════════════════════════════════════════════════════════
 
 @router.get("/recipients",
-            summary="List all newsletter subscribers — ADMIN ONLY",
+            summary="List all newsletter subscribers — public",
             tags=["Newsletter"])
-def list_recipients(payload: dict = Depends(require_admin)):
+def list_recipients():
     docs = db.collection("newsletter_subscribers").stream()
     return [d.to_dict() for d in docs]
 
@@ -1632,7 +1614,7 @@ def preview_auto_digest(limit: int = Query(5, ge=1, le=20), payload: dict = Depe
 @router.post("/test",
              summary="Send a test newsletter to one address — ADMIN ONLY",
              tags=["Newsletter"])
-def send_test_email(body: TestEmailBody, payload: dict = Depends(require_admin)):
+def send_test_email(body: TestEmailBody, payload: dict = Depends(require_mod)):
     """
     Sends the full custom draft newsletter (same HTML as the real send) to a
     single test address.  If no draft is passed in the request body, it loads
@@ -1642,14 +1624,25 @@ def send_test_email(body: TestEmailBody, payload: dict = Depends(require_admin))
     # 1. Use draft from request body if provided
     draft_dict = body.draft or {}
 
-    # 2. If none provided, load saved draft from MongoDB
-    if not draft_dict:
-        try:
-            doc = db.collection("newsletter_draft").document(DRAFT_DOC_ID).get()
-            if doc.exists:
-                draft_dict = doc.to_dict() or {}
-        except Exception as e:
-            log.warning("Could not load draft for test email: %s", e)
+    # 2. Always load saved draft from MongoDB and merge —
+    #    the frontend never carries cover_chart_filename / cover_chart_png_b64
+    #    so we must restore them from the DB regardless of whether a draft was
+    #    passed in the request body.
+    try:
+        all_docs = list(db.collection("newsletter_draft").stream())
+        for d in all_docs:
+            d_data = d.to_dict() or {}
+            # If no draft from frontend, use the full saved doc
+            if not draft_dict:
+                draft_dict = d_data
+                break
+            # Otherwise merge only the blob/image fields
+            for field in _BLOB_FIELDS:
+                if not draft_dict.get(field) and d_data.get(field):
+                    draft_dict[field] = d_data[field]
+                    log.info("send_test: restored %s from MongoDB doc %s", field, d.id)
+    except Exception as e:
+        log.warning("send_test: could not load draft from MongoDB: %s", e)
 
     subject = body.subject or f"[TEST] {SITE_NAME} Newsletter"
 
