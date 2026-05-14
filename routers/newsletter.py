@@ -750,9 +750,16 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
     if radar_events_list:
         rows = ""
         for ev in radar_events_list:
-            day, month = _radar_date_cells(ev.get("date", ""))
-            # Frontend stores fields as: name, info, date
-            # Backend legacy fields:     title/heading, description/text, date
+            # Frontend may send date as:
+            #   {day: "18", month: "May", ...}  — two separate fields
+            #   {date: "18 May", ...}            — combined string
+            if ev.get("day"):
+                # Separate day/month fields from frontend
+                day   = str(ev.get("day", "")).strip()
+                month = str(ev.get("month", "")).strip()[:3].capitalize()
+            else:
+                day, month = _radar_date_cells(ev.get("date", ""))
+            # Field name aliases: name/title/heading, info/description/text
             heading = (ev.get("name") or ev.get("title") or ev.get("heading") or "").strip()
             desc    = (ev.get("info") or ev.get("description") or ev.get("text") or "").strip()
             rows += _radar_item_html(day, month, heading, desc)
@@ -1004,37 +1011,42 @@ def save_draft(draft: NewsletterDraft, payload: dict = Depends(require_mod)):
     # The chart endpoint's merge=True can create a second document (orphan) that
     # holds the png_b64 / image_url.  We read every doc, merge blobs from all of
     # them, then delete any that are not the primary DRAFT_DOC_ID doc.
-    _BLOB_FIELDS_SAVE = ("cover_chart_png_b64", "cover_chart_config",
-                         "cover_chart_svg_data", "cover_chart_image_url",
-                         "cover_chart_filename", "cover_chart_explanation")
+    # These fields are ONLY ever written by the chart-generation endpoint —
+    # never by the frontend.  Always load them fresh from MongoDB and overwrite
+    # whatever the frontend sent (frontend carries stale values from last load).
+    _CHART_FIELDS  = ("cover_chart_filename", "cover_chart_image_url",
+                      "cover_chart_png_b64",  "cover_chart_config",
+                      "cover_chart_explanation")
+    # These fields may be empty in the frontend; restore only when absent.
+    _RESTORE_FIELDS = ("cover_chart_svg_data",)
     try:
         all_docs = list(db.collection("newsletter_draft").stream())
         orphan_ids = []
+        # Read the current DB state before overwriting
+        db_chart = {}
         for d in all_docs:
             d_data = d.to_dict() or {}
-            d_id   = d.id  # MongoDB document _id / Firestore doc id
+            d_id   = d.id
             is_primary = (d_id == DRAFT_DOC_ID or d_data.get("doc_id") == DRAFT_DOC_ID)
-            # Merge any non-empty blob fields from this doc
-            for field in _BLOB_FIELDS_SAVE:
+            # Collect chart fields — last writer wins (orphan overwrites primary
+            # because chart endpoint writes to primary via merge=True, so primary
+            # always has the freshest chart after the chart endpoint runs)
+            for field in _CHART_FIELDS:
                 if d_data.get(field):
-                    if not doc.get(field):
-                        doc[field] = d_data[field]
-                        log.info("save_draft: merged %s from doc %s", field, d_id)
-                    elif field in ("cover_chart_filename", "cover_chart_image_url",
-                                   "cover_chart_png_b64", "cover_chart_config"):
-                        # For chart fields, always prefer the value from a NON-primary
-                        # doc (orphan created by chart endpoint's merge=True upsert)
-                        # because that doc has the FRESHEST chart data.
-                        # Primary doc may still have stale filename from previous chart.
-                        if not is_primary:
-                            doc[field] = d_data[field]
-                            log.info("save_draft: overwrote %s from fresh orphan doc %s", field, d_id)
-                        elif not doc.get(field):
-                            doc[field] = d_data[field]
-                            log.info("save_draft: merged %s from primary doc %s", field, d_id)
-            # Mark non-primary docs for deletion
+                    db_chart[field] = d_data[field]
+            for field in _RESTORE_FIELDS:
+                if not doc.get(field) and d_data.get(field):
+                    doc[field] = d_data[field]
             if not is_primary:
                 orphan_ids.append(d_id)
+
+        # Unconditionally overwrite chart fields from DB
+        for field, value in db_chart.items():
+            old_val = doc.get(field, "")
+            doc[field] = value
+            if old_val != value:
+                log.info("save_draft: updated %s from DB (was: %s...)",
+                         field, str(old_val)[:40])
     except Exception as e:
         log.warning("save_draft: could not scan newsletter_draft collection: %s", e)
         orphan_ids = []
