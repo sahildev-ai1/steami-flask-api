@@ -485,19 +485,32 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
 
     img_src = ""
 
-    # Priority 1: public URL built from filename — the ONLY reliable path.
-    # Brevo rewrites <img src> through its own CDN, so Gmail receives the image
-    # from Brevo's trusted domain regardless of Gmail's image-blocking setting.
-    if chart_url and chart_url.startswith("https://"):
-        img_src = chart_url
-        log.info("Chart: using public URL → %s", img_src)
+    # Priority 1: public URL — verify file actually exists on disk before using.
+    # Render's ephemeral FS means the file may have been deleted (new deploy or
+    # chart was regenerated and old filename is still in MongoDB).
+    # Check disk first; if missing, fall back to png_b64 from MongoDB.
+    if chart_url and chart_url.startswith("https://") and chart_filename:
+        disk_path = CHART_STORE_DIR / chart_filename
+        if disk_path.exists():
+            img_src = chart_url
+            log.info("Chart: URL verified on disk → %s", img_src)
+        else:
+            log.warning("Chart: file not on disk (%s) — falling back to base64", chart_filename)
 
-    # Priority 2: base64 — only if no URL available
+    # Priority 2: base64 from MongoDB — used when file is missing from disk
+    # (e.g. after a new chart was generated but save_draft hasn't run yet,
+    # or after a Render deploy wiped the ephemeral filesystem).
+    # png_b64 is always fresh — it is written to MongoDB at generation time.
     if not img_src and png_b64 and png_b64.startswith("data:image/png;base64,"):
         img_src = png_b64
-        log.info("Chart: falling back to base64")
+        log.info("Chart: using base64 from MongoDB (file missing from disk)")
 
-    # Priority 3: SVG → PNG base64
+    # Priority 3: URL without disk check (e.g. no filename stored)
+    if not img_src and chart_url and chart_url.startswith("https://"):
+        img_src = chart_url
+        log.info("Chart: using URL without disk verify → %s", img_src)
+
+    # Priority 4: SVG → PNG base64
     if not img_src and svg_data and svg_data.strip().startswith("<svg"):
         img_src = _svg_to_png_base64(svg_data)
         if img_src:
@@ -692,15 +705,16 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
         return (s, "")
 
     def _radar_item_html(day, month, heading, desc):
-        day_html   = (f'<div style="font-family:Syne,sans-serif;font-size:24px;'
-                      f'font-weight:800;color:#1d4ed8;line-height:1;">{day}</div>') if day else ""
-        month_html = (f'<div style="font-family:monospace;font-size:9px;letter-spacing:2px;'
-                      f'text-transform:uppercase;color:#5a7fa8;margin-top:2px;">{month}</div>') if month else ""
-        head_html  = (f'<p style="margin:0 0 4px;font-family:Syne,sans-serif;font-size:14px;'
-                      f'font-weight:700;color:#0f2651;line-height:1.3;">{heading}</p>') if heading else ""
-        desc_html  = (f'<p style="margin:0;font-size:13px;color:#2a3f5a;line-height:1.65;">'
-                      f'{_linkify(desc.replace(chr(10),"<br>"))}</p>') if desc else ""
-        return f"""
+        head_html = (f'<p style="margin:0 0 4px;font-family:Syne,sans-serif;font-size:14px;'
+                     f'font-weight:700;color:#0f2651;line-height:1.3;">{heading}</p>') if heading else ""
+        desc_html = (f'<p style="margin:0;font-size:13px;color:#2a3f5a;line-height:1.65;">'
+                     f'{_linkify(desc.replace(chr(10),"<br>"))}</p>') if desc else ""
+        if day:
+            # Show date column on the left
+            day_html   = f'<div style="font-family:Syne,sans-serif;font-size:24px;font-weight:800;color:#1d4ed8;line-height:1;">{day}</div>'
+            month_html = (f'<div style="font-family:monospace;font-size:9px;letter-spacing:2px;'
+                          f'text-transform:uppercase;color:#5a7fa8;margin-top:2px;">{month}</div>') if month else ""
+            return f"""
                 <tr>
                   <td style="padding:14px 0;border-bottom:1px solid rgba(80,130,210,0.10);vertical-align:top;">
                     <table width="100%" cellpadding="0" cellspacing="0"><tr>
@@ -709,6 +723,14 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
                       </td>
                       <td style="vertical-align:middle;">{head_html}{desc_html}</td>
                     </tr></table>
+                  </td>
+                </tr>"""
+        else:
+            # No date — full-width single column
+            return f"""
+                <tr>
+                  <td style="padding:14px 0;border-bottom:1px solid rgba(80,130,210,0.10);">
+                    {head_html}{desc_html}
                   </td>
                 </tr>"""
 
@@ -994,9 +1016,18 @@ def save_draft(draft: NewsletterDraft, payload: dict = Depends(require_mod)):
             is_primary = (d_id == DRAFT_DOC_ID or d_data.get("doc_id") == DRAFT_DOC_ID)
             # Merge any non-empty blob fields from this doc
             for field in _BLOB_FIELDS_SAVE:
-                if not doc.get(field) and d_data.get(field):
-                    doc[field] = d_data[field]
-                    log.info("save_draft: merged %s from doc %s", field, d_id)
+                if d_data.get(field):
+                    if not doc.get(field):
+                        # Field missing in frontend draft — always restore from DB
+                        doc[field] = d_data[field]
+                        log.info("save_draft: merged %s from doc %s", field, d_id)
+                    elif field in ("cover_chart_filename", "cover_chart_image_url",
+                                   "cover_chart_png_b64", "cover_chart_config"):
+                        # Always use the DB value for chart fields — these are set
+                        # by the chart endpoint, never by the frontend, so the DB
+                        # value is always the authoritative/latest one.
+                        doc[field] = d_data[field]
+                        log.info("save_draft: overwrote %s with latest from DB", field)
             # Mark non-primary docs for deletion
             if not is_primary:
                 orphan_ids.append(d_id)
