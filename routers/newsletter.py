@@ -751,11 +751,11 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
         rows = ""
         for ev in radar_events_list:
             day, month = _radar_date_cells(ev.get("date", ""))
-            rows += _radar_item_html(
-                day, month,
-                ev.get("title", "") or ev.get("heading", ""),
-                ev.get("description", "") or ev.get("text", ""),
-            )
+            # Frontend stores fields as: name, info, date
+            # Backend legacy fields:     title/heading, description/text, date
+            heading = (ev.get("name") or ev.get("title") or ev.get("heading") or "").strip()
+            desc    = (ev.get("info") or ev.get("description") or ev.get("text") or "").strip()
+            rows += _radar_item_html(day, month, heading, desc)
         radar_section = _radar_wrap(rows)
 
     elif on_the_radar:
@@ -1018,16 +1018,20 @@ def save_draft(draft: NewsletterDraft, payload: dict = Depends(require_mod)):
             for field in _BLOB_FIELDS_SAVE:
                 if d_data.get(field):
                     if not doc.get(field):
-                        # Field missing in frontend draft — always restore from DB
                         doc[field] = d_data[field]
                         log.info("save_draft: merged %s from doc %s", field, d_id)
                     elif field in ("cover_chart_filename", "cover_chart_image_url",
                                    "cover_chart_png_b64", "cover_chart_config"):
-                        # Always use the DB value for chart fields — these are set
-                        # by the chart endpoint, never by the frontend, so the DB
-                        # value is always the authoritative/latest one.
-                        doc[field] = d_data[field]
-                        log.info("save_draft: overwrote %s with latest from DB", field)
+                        # For chart fields, always prefer the value from a NON-primary
+                        # doc (orphan created by chart endpoint's merge=True upsert)
+                        # because that doc has the FRESHEST chart data.
+                        # Primary doc may still have stale filename from previous chart.
+                        if not is_primary:
+                            doc[field] = d_data[field]
+                            log.info("save_draft: overwrote %s from fresh orphan doc %s", field, d_id)
+                        elif not doc.get(field):
+                            doc[field] = d_data[field]
+                            log.info("save_draft: merged %s from primary doc %s", field, d_id)
             # Mark non-primary docs for deletion
             if not is_primary:
                 orphan_ids.append(d_id)
@@ -1652,28 +1656,31 @@ def send_test_email(body: TestEmailBody, payload: dict = Depends(require_mod)):
     the current saved draft from MongoDB.  Falls back to the old digest only
     if neither is available.
     """
-    # 1. Use draft from request body if provided
-    draft_dict = body.draft or {}
-
-    # 2. Always load saved draft from MongoDB and merge —
-    #    the frontend never carries cover_chart_filename / cover_chart_png_b64
-    #    so we must restore them from the DB regardless of whether a draft was
-    #    passed in the request body.
+    # Always load the full saved draft from MongoDB — this is the authoritative
+    # source for chart fields (filename, png_b64, image_url) which are never
+    # carried by the frontend.  Merge any extra fields from the request body
+    # on top so manual overrides still work.
+    draft_dict = {}
     try:
         all_docs = list(db.collection("newsletter_draft").stream())
+        # Find the primary doc first
         for d in all_docs:
             d_data = d.to_dict() or {}
-            # If no draft from frontend, use the full saved doc
-            if not draft_dict:
+            if d.id == DRAFT_DOC_ID or d_data.get("doc_id") == DRAFT_DOC_ID:
                 draft_dict = d_data
+                log.info("send_test: loaded primary draft from MongoDB doc %s", d.id)
                 break
-            # Otherwise merge only the blob/image fields
-            for field in _BLOB_FIELDS:
-                if not draft_dict.get(field) and d_data.get(field):
-                    draft_dict[field] = d_data[field]
-                    log.info("send_test: restored %s from MongoDB doc %s", field, d.id)
+        # If not found, use first doc
+        if not draft_dict and all_docs:
+            draft_dict = all_docs[0].to_dict() or {}
     except Exception as e:
         log.warning("send_test: could not load draft from MongoDB: %s", e)
+
+    # Merge request body fields on top (non-empty values override DB values)
+    if body.draft:
+        for k, v in body.draft.items():
+            if v not in (None, "", [], {}):
+                draft_dict[k] = v
 
     subject = body.subject or f"[TEST] {SITE_NAME} Newsletter"
 
