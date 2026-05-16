@@ -1575,3 +1575,481 @@ def cms_get_blog_post(
         "created_at": p.get("created_at", ""),
         "updated_at": p.get("updated_at", ""),
     }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIMULATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+# Endpoints:
+#   POST   /api/simulations/seed                          — bulk seed (admin)
+#   POST   /api/simulations                               — JSON create (mod/admin)
+#   GET    /api/simulations                               — list (PUBLIC — every user)
+#   GET    /api/simulations/{id}                          — get one (PUBLIC)
+#   PUT    /api/simulations/{id}                          — update (mod/admin)
+#   DELETE /api/simulations/{id}                          — delete (admin)
+#   POST   /api/simulations/{id}/snapshot                 — upload canvas PNG snapshot (mod/admin)
+#   POST   /api/simulations/{id}/glb                      — upload raw .glb / .gltf file (mod/admin)
+#   GET    /api/cms/simulations                           — CMS slim list (mod/admin)
+#   GET    /api/cms/simulations/{id}                      — CMS full doc (mod/admin)
+# ══════════════════════════════════════════════════════════════════════════════
+
+import base64
+import uuid as _uuid
+
+# ── Allowed 3-D / snapshot MIME types ────────────────────────────────────────
+
+ALLOWED_3D_EXT = {".glb", ".gltf", ".obj", ".fbx", ".stl"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PYDANTIC MODELS
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CreateSimulationBody(BaseModel):
+    """
+    JSON body for POST /api/simulations.
+    simulation_type: 'bloch_sphere' | 'three_body' | 'custom'
+    component_id   : matches the React component key used in SimulationsPage
+                     e.g. 'quantum' | 'threebody' | custom string
+    """
+    id:              str
+    title:           str
+    field:           str              = ""
+    fieldColor:      str              = ""   # e.g. 'steami-badge-violet'
+    description:     str              = ""
+    caption:         str              = ""
+    readTime:        str              = "10 min interactive"
+    simulation_type: str              = "custom"
+    component_id:    str              = ""   # React component key: 'quantum' | 'threebody'
+    insights:        list             = []
+    snapshot_url:    str              = ""   # Cloudinary CDN URL for the preview image
+    glb_url:         str              = ""   # Cloudinary CDN URL for the .glb file (if any)
+    tags:            list             = []
+
+
+class UpdateSimulationBody(BaseModel):
+    title:           Optional[str]  = None
+    field:           Optional[str]  = None
+    fieldColor:      Optional[str]  = None
+    description:     Optional[str]  = None
+    caption:         Optional[str]  = None
+    readTime:        Optional[str]  = None
+    simulation_type: Optional[str]  = None
+    component_id:    Optional[str]  = None
+    insights:        Optional[list] = None
+    snapshot_url:    Optional[str]  = None
+    glb_url:         Optional[str]  = None
+    tags:            Optional[list] = None
+
+
+class SnapshotUploadBody(BaseModel):
+    """Base64 PNG captured from a Three.js canvas."""
+    image_data: str   # data:image/png;base64,<…>  OR raw base64
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fmt_simulation(s: dict) -> dict:
+    """Return a clean simulation dict safe to send to the frontend."""
+    return {
+        "id":              s.get("id"),
+        "title":           s.get("title"),
+        "field":           s.get("field", ""),
+        "fieldColor":      s.get("fieldColor", "steami-badge-cyan"),
+        "description":     s.get("description", ""),
+        "caption":         s.get("caption", ""),
+        "readTime":        s.get("readTime", "10 min interactive"),
+        "simulation_type": s.get("simulation_type", "custom"),
+        "component_id":    s.get("component_id", ""),
+        "insights":        s.get("insights", []),
+        "snapshot_url":    s.get("snapshot_url", ""),
+        "glb_url":         s.get("glb_url", ""),
+        "tags":            s.get("tags", []),
+    }
+
+
+def _upload_snapshot_to_cloudinary(b64_data: str, sim_id: str) -> str:
+    """
+    Upload a base64 PNG snapshot to Cloudinary.
+    Returns the secure CDN URL.
+    """
+    # Strip the data-URI prefix if present
+    if "," in b64_data:
+        b64_data = b64_data.split(",", 1)[1]
+
+    try:
+        base64.b64decode(b64_data)   # validate
+    except Exception:
+        raise HTTPException(400, detail="Invalid base64 image data")
+
+    public_id = f"steami/simulations/{sim_id}/snapshot"
+    try:
+        result = cloudinary.uploader.upload(
+            f"data:image/png;base64,{b64_data}",
+            public_id     = public_id,
+            resource_type = "image",
+            overwrite     = True,
+            tags          = ["simulation", "snapshot", sim_id],
+        )
+        return result["secure_url"]
+    except Exception as exc:
+        log.error("Cloudinary snapshot upload failed for %s: %s", sim_id, exc)
+        raise HTTPException(500, detail=f"Cloudinary upload failed: {exc}")
+
+
+def _upload_glb_to_cloudinary(data: bytes, sim_id: str, filename: str) -> str:
+    """
+    Upload a raw .glb/.gltf file to Cloudinary as a raw resource.
+    Returns the secure CDN URL.
+    """
+    ext       = os.path.splitext(filename)[-1].lower()
+    public_id = f"steami/simulations/{sim_id}/model_{_uuid.uuid4().hex[:8]}{ext}"
+    try:
+        result = cloudinary.uploader.upload(
+            data,
+            public_id     = public_id,
+            resource_type = "raw",   # required for binary 3-D files
+            overwrite     = True,
+            tags          = ["simulation", "glb", sim_id],
+        )
+        return result["secure_url"]
+    except Exception as exc:
+        log.error("Cloudinary GLB upload failed for %s: %s", sim_id, exc)
+        raise HTTPException(500, detail=f"Cloudinary upload failed: {exc}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SEED
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SIMULATION_SEED = [
+    {
+        "id":              "quantum",
+        "title":           "How does Qubits react in Quantum Space",
+        "field":           "QUANTUM COMPUTING",
+        "fieldColor":      "steami-badge-violet",
+        "description":     "Explore the Bloch sphere — the geometric representation of a qubit's quantum state. Unlike classical bits locked to 0 or 1, a qubit can exist in any superposition, represented as a point anywhere on the sphere's surface.",
+        "caption":         "Interactive Bloch Sphere — drag to rotate, toggle superposition mode, or manually set θ and φ angles.",
+        "readTime":        "12 min interactive",
+        "simulation_type": "bloch_sphere",
+        "component_id":    "quantum",
+        "insights": [
+            "A qubit is like a coin spinning in the air — it's both heads and tails until it lands (is measured).",
+            "The Bloch sphere is a map of all possible qubit states — the north pole is '0', the south pole is '1', and everywhere else is a mix.",
+            "Quantum computers use qubits to test many answers at once, like reading every book in a library simultaneously.",
+            "When you measure a qubit, its superposition 'collapses' to a definite answer — just like catching the spinning coin.",
+        ],
+        "snapshot_url": "",
+        "glb_url":      "",
+        "tags":         ["quantum", "physics", "interactive"],
+    },
+    {
+        "id":              "threebody",
+        "title":           "Three Body Problem",
+        "field":           "PHYSICS",
+        "fieldColor":      "steami-badge-cyan",
+        "description":     "The three-body problem has no general closed-form solution — three masses interacting gravitationally produce chaotic, unpredictable trajectories. This simulation demonstrates why even tiny changes in initial conditions lead to wildly divergent orbits.",
+        "caption":         "Gravitational N-body simulation — adjust mass ratios and simulation speed to observe chaotic dynamics.",
+        "readTime":        "10 min interactive",
+        "simulation_type": "three_body",
+        "component_id":    "threebody",
+        "insights": [
+            "Predicting the motion of three objects pulling on each other with gravity is one of the oldest unsolved problems in physics.",
+            "Even the tiniest change in starting position can lead to a completely different outcome — this is called 'chaos'.",
+            "We can predict Earth orbiting the Sun easily (two bodies), but add a third and the math becomes nearly impossible to solve exactly.",
+            "Scientists use computers to approximate solutions step-by-step, which is exactly what this simulation does.",
+        ],
+        "snapshot_url": "",
+        "glb_url":      "",
+        "tags":         ["physics", "gravity", "chaos", "interactive"],
+    },
+]
+
+
+@router.post("/simulations/seed", status_code=201, tags=["Simulations"])
+def seed_simulations(payload: dict = Depends(require_admin)):
+    """
+    POST /api/simulations/seed
+    Bulk-seed the two built-in simulations. Admin only. Safe to re-run (upsert).
+
+    curl -X POST http://127.0.0.1:5000/api/simulations/seed \\
+      -H "Authorization: Bearer <admin_token>"
+    """
+    seeded = []
+    for sim in _SIMULATION_SEED:
+        doc = {**sim, "created_at": _now(), "updated_at": _now()}
+        try:
+            db.collection("simulations").document(sim["id"]).set(doc, merge=True)
+            seeded.append(sim["id"])
+        except Exception as e:
+            log.error("seed_simulations failed for %s: %s", sim["id"], e)
+    log.info("Simulations seeded: %d", len(seeded))
+    return {"seeded": len(seeded), "ids": seeded}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CREATE / READ / UPDATE / DELETE
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/simulations", status_code=201, tags=["Simulations"])
+def create_simulation(
+    body:    CreateSimulationBody,
+    payload: dict = Depends(require_mod),
+):
+    """
+    POST /api/simulations  (JSON body)
+    MOD/ADMIN — create a new simulation record.
+    Use POST /api/simulations/{id}/snapshot or /glb to upload media afterwards.
+
+    curl -X POST http://127.0.0.1:5000/api/simulations \\
+      -H "Authorization: Bearer <mod_token>" \\
+      -H "Content-Type: application/json" \\
+      -d '{"id":"wave-function","title":"Wave Function Collapse","field":"QUANTUM PHYSICS","simulation_type":"custom","component_id":"wavefn"}'
+    """
+    doc = {**body.model_dump(), "created_at": _now(), "updated_at": _now()}
+    try:
+        db.collection("simulations").document(body.id).set(doc, merge=True)
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+    log.info("Simulation created: %s by %s", body.id, get_uid(payload))
+    return _fmt_simulation(doc)
+
+
+@router.get("/simulations", tags=["Simulations"])
+def list_simulations(
+    field:           str = Query("", description="Filter by field e.g. PHYSICS"),
+    simulation_type: str = Query("", description="Filter by simulation_type e.g. bloch_sphere"),
+):
+    """
+    GET /api/simulations
+    PUBLIC — list all simulations. No auth required.
+    Optional query params: field, simulation_type.
+
+    curl http://127.0.0.1:5000/api/simulations
+    curl http://127.0.0.1:5000/api/simulations?field=PHYSICS
+    """
+    try:
+        q    = db.collection("simulations").order_by("created_at", direction="ASCENDING")
+        docs = q.limit(100).stream()
+        sims = []
+        for d in docs:
+            s = d.to_dict()
+            if field and s.get("field", "").upper() != field.strip().upper():
+                continue
+            if simulation_type and s.get("simulation_type", "") != simulation_type.strip():
+                continue
+            sims.append(_fmt_simulation(s))
+    except Exception as e:
+        log.error("list_simulations: %s", e)
+        raise HTTPException(500, detail=str(e))
+    return {"simulations": sims, "total": len(sims)}
+
+
+@router.get("/simulations/{simulation_id}", tags=["Simulations"])
+def get_simulation(simulation_id: str):
+    """
+    GET /api/simulations/{id}
+    PUBLIC — get a single simulation. No auth required.
+
+    curl http://127.0.0.1:5000/api/simulations/quantum
+    """
+    doc = db.collection("simulations").document(simulation_id).get()
+    if not doc.exists:
+        raise HTTPException(404, detail="Simulation not found")
+    return _fmt_simulation(doc.to_dict())
+
+
+@router.put("/simulations/{simulation_id}", tags=["Simulations"])
+def update_simulation(
+    simulation_id: str,
+    body:          UpdateSimulationBody,
+    payload:       dict = Depends(require_mod),
+):
+    """
+    PUT /api/simulations/{id}
+    MOD/ADMIN — update simulation fields. All fields optional.
+
+    curl -X PUT http://127.0.0.1:5000/api/simulations/quantum \\
+      -H "Authorization: Bearer <mod_token>" \\
+      -d '{"readTime":"15 min interactive"}'
+    """
+    doc_ref = db.collection("simulations").document(simulation_id)
+    if not doc_ref.get().exists:
+        raise HTTPException(404, detail="Simulation not found")
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    updates["updated_at"] = _now()
+    try:
+        doc_ref.update(updates)
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+    log.info("Simulation updated: %s by %s", simulation_id, get_uid(payload))
+    return {"updated": True, "id": simulation_id}
+
+
+@router.delete("/simulations/{simulation_id}", tags=["Simulations"])
+def delete_simulation(
+    simulation_id: str,
+    payload:       dict = Depends(require_admin),
+):
+    """
+    DELETE /api/simulations/{id}
+    ADMIN only — permanently delete a simulation and its Cloudinary assets.
+
+    curl -X DELETE http://127.0.0.1:5000/api/simulations/quantum \\
+      -H "Authorization: Bearer <admin_token>"
+    """
+    doc_ref = db.collection("simulations").document(simulation_id)
+    doc     = doc_ref.get()
+    if not doc.exists:
+        raise HTTPException(404, detail="Simulation not found")
+    data = doc.to_dict()
+    doc_ref.delete()
+    # Clean up Cloudinary assets
+    _delete_file(data.get("snapshot_url", ""))
+    _delete_file(data.get("glb_url", ""))
+    log.info("Simulation deleted: %s by %s", simulation_id, get_uid(payload))
+    return {"deleted": True, "id": simulation_id}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SNAPSHOT UPLOAD  (base64 PNG from canvas.toDataURL)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/simulations/{simulation_id}/snapshot", tags=["Simulations"])
+async def upload_simulation_snapshot(
+    simulation_id: str,
+    body:          SnapshotUploadBody,
+    payload:       dict = Depends(require_mod),
+):
+    """
+    POST /api/simulations/{id}/snapshot
+    MOD/ADMIN — capture a Three.js canvas PNG and upload it to Cloudinary.
+    The returned `snapshot_url` is stored in the simulation document.
+
+    Body JSON:
+      { "image_data": "data:image/png;base64,<…>" }
+
+    curl -X POST http://127.0.0.1:5000/api/simulations/quantum/snapshot \\
+      -H "Authorization: Bearer <mod_token>" \\
+      -H "Content-Type: application/json" \\
+      -d '{"image_data":"data:image/png;base64,iVBORw0KG..."}'
+    """
+    doc_ref = db.collection("simulations").document(simulation_id)
+    if not doc_ref.get().exists:
+        raise HTTPException(404, detail="Simulation not found")
+
+    # Delete old snapshot from Cloudinary
+    old_url = doc_ref.get().to_dict().get("snapshot_url", "")
+    if old_url:
+        _delete_file(old_url)
+
+    snapshot_url = _upload_snapshot_to_cloudinary(body.image_data, simulation_id)
+
+    try:
+        doc_ref.update({"snapshot_url": snapshot_url, "updated_at": _now()})
+    except Exception as e:
+        raise HTTPException(500, detail=f"Uploaded to Cloudinary but DB update failed: {e}")
+
+    log.info("Simulation snapshot uploaded: %s → %s by %s", simulation_id, snapshot_url, get_uid(payload))
+    return {"updated": True, "id": simulation_id, "snapshot_url": snapshot_url}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GLB / 3-D FILE UPLOAD
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/simulations/{simulation_id}/glb", tags=["Simulations"])
+async def upload_simulation_glb(
+    simulation_id: str,
+    file:          UploadFile = File(..., description="3-D file (.glb / .gltf / .obj / .fbx / .stl)"),
+    payload:       dict       = Depends(require_mod),
+):
+    """
+    POST /api/simulations/{id}/glb  (multipart/form-data)
+    MOD/ADMIN — upload a raw 3-D file (.glb etc.) to Cloudinary as a 'raw' resource.
+    Requires a Cloudinary paid plan for 3-D asset support.
+
+    curl -X POST http://127.0.0.1:5000/api/simulations/quantum/glb \\
+      -H "Authorization: Bearer <mod_token>" \\
+      -F "file=@/path/to/bloch.glb"
+    """
+    doc_ref = db.collection("simulations").document(simulation_id)
+    if not doc_ref.get().exists:
+        raise HTTPException(404, detail="Simulation not found")
+
+    ext = os.path.splitext(file.filename or "")[-1].lower()
+    if ext not in ALLOWED_3D_EXT:
+        raise HTTPException(400, detail=f"Unsupported 3-D file type '{ext}'. Allowed: {ALLOWED_3D_EXT}")
+
+    data = await file.read()
+    glb_url = _upload_glb_to_cloudinary(data, simulation_id, file.filename or f"model{ext}")
+
+    # Delete old GLB from Cloudinary
+    old_url = doc_ref.get().to_dict().get("glb_url", "")
+    if old_url:
+        _delete_file(old_url)
+
+    try:
+        doc_ref.update({"glb_url": glb_url, "updated_at": _now()})
+    except Exception as e:
+        raise HTTPException(500, detail=f"Uploaded to Cloudinary but DB update failed: {e}")
+
+    log.info("Simulation GLB uploaded: %s → %s by %s", simulation_id, glb_url, get_uid(payload))
+    return {"updated": True, "id": simulation_id, "glb_url": glb_url}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CMS HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/cms/simulations", tags=["CMS"])
+def cms_list_simulations(payload: dict = Depends(require_mod)):
+    """
+    GET /api/cms/simulations
+    MOD/ADMIN — slim list of all simulations for the CMS table.
+
+    curl -H "Authorization: Bearer <mod_token>" \\
+      http://127.0.0.1:5000/api/cms/simulations
+    """
+    try:
+        docs = db.collection("simulations").order_by("created_at").stream()
+        rows = []
+        for d in docs:
+            s = d.to_dict()
+            rows.append({
+                "id":              s.get("id"),
+                "title":           s.get("title"),
+                "field":           s.get("field", ""),
+                "simulation_type": s.get("simulation_type", ""),
+                "component_id":    s.get("component_id", ""),
+                "readTime":        s.get("readTime", ""),
+                "snapshot_url":    s.get("snapshot_url", ""),
+                "glb_url":         s.get("glb_url", ""),
+                "updated_at":      s.get("updated_at", ""),
+            })
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+    return {"simulations": rows, "total": len(rows)}
+
+
+@router.get("/cms/simulations/{simulation_id}", tags=["CMS"])
+def cms_get_simulation(
+    simulation_id: str,
+    payload:       dict = Depends(require_mod),
+):
+    """
+    GET /api/cms/simulations/{id}
+    MOD/ADMIN — full simulation document, ready to pre-populate an edit form.
+
+    curl -H "Authorization: Bearer <mod_token>" \\
+      http://127.0.0.1:5000/api/cms/simulations/quantum
+    """
+    doc = db.collection("simulations").document(simulation_id).get()
+    if not doc.exists:
+        raise HTTPException(404, detail="Simulation not found")
+    s = doc.to_dict()
+    return {
+        **_fmt_simulation(s),
+        "created_at": s.get("created_at", ""),
+        "updated_at": s.get("updated_at", ""),
+    }

@@ -280,7 +280,7 @@ def _linkify(text: str) -> str:
     url_re = re.compile(r'(https?://[^\s<>"]+)')
     return url_re.sub(
         r'<a href="\1" target="_blank" rel="noopener" '
-        r'style="color:#1d4ed8;text-decoration:underline;">\1</a>',
+        r'style="color:#1d4ed8;text-decoration:none;">\1</a>',
         text
     )
 
@@ -600,7 +600,7 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
                         font-weight:700;color:#0f2651;line-height:1.3;">{title}</h3>
             <a href="{link}" target="_blank" rel="noopener"
                style="font-family:'JetBrains Mono',monospace;font-size:12px;
-                      color:#1d4ed8;text-decoration:underline;">Read more →</a>
+                      color:#1d4ed8;text-decoration:none;">Read more →</a>
           </td></tr>
         </table>"""
 
@@ -663,7 +663,7 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
                 <p style="margin:0 0 8px;font-size:13px;color:#2a3f5a;line-height:1.6;">{summary}…</p>
                 <a href="{art_url}" target="_blank" rel="noopener"
                    style="font-family:'JetBrains Mono',monospace;font-size:11px;
-                          color:#1d4ed8;text-decoration:underline;">Read insight →</a>
+                          color:#1d4ed8;text-decoration:none;">Read insight →</a>
               </td>
             </tr>"""
 
@@ -807,7 +807,7 @@ def _build_custom_html(draft: dict, signal_articles: list[dict], recipient_name:
         </table>
         <p style="margin:0;font-size:11px;color:#8aabcc;">
           You received this because you subscribed to {SITE_NAME} updates. &nbsp;
-          <a href="{unsubscribe_url}" style="color:#8aabcc;text-decoration:underline;">Unsubscribe</a>
+          <a href="{unsubscribe_url}" style="color:#8aabcc;text-decoration:none;">Unsubscribe</a>
         </p>
       </td></tr>
     </table>"""
@@ -1014,42 +1014,43 @@ def save_draft(draft: NewsletterDraft, payload: dict = Depends(require_mod)):
     # These fields are ONLY ever written by the chart-generation endpoint —
     # never by the frontend.  Always load them fresh from MongoDB and overwrite
     # whatever the frontend sent (frontend carries stale values from last load).
-    _CHART_FIELDS  = ("cover_chart_filename", "cover_chart_image_url",
-                      "cover_chart_png_b64",  "cover_chart_config",
-                      "cover_chart_explanation")
-    # These fields may be empty in the frontend; restore only when absent.
-    _RESTORE_FIELDS = ("cover_chart_svg_data",)
+    _CHART_FIELDS = ("cover_chart_filename", "cover_chart_image_url",
+                     "cover_chart_png_b64",  "cover_chart_config",
+                     "cover_chart_explanation", "cover_chart_svg_data")
+    orphan_ids = []
     try:
+        # Use direct .get() (not .stream()) to read the freshest document state.
+        # .stream() can return stale data; .get() forces a consistent read.
+        fresh = db.collection("newsletter_draft").document(DRAFT_DOC_ID).get()
+        db_data = fresh.to_dict() if fresh.exists else {}
+
+        # Unconditionally overwrite ALL chart fields from the fresh DB doc.
+        # These fields are only ever written by the chart endpoint — the frontend
+        # never has the authoritative values.
+        for field in _CHART_FIELDS:
+            db_val = db_data.get(field)
+            if db_val:
+                old_val = doc.get(field, "")
+                doc[field] = db_val
+                if str(old_val)[:60] != str(db_val)[:60]:
+                    log.info("save_draft: overwrote %s from DB  old=%s…  new=%s…",
+                             field, str(old_val)[:40], str(db_val)[:40])
+            # If DB also has no value, keep whatever frontend sent (may be empty)
+
+        # Also scan for orphan docs and clean them up
         all_docs = list(db.collection("newsletter_draft").stream())
-        orphan_ids = []
-        # Read the current DB state before overwriting
-        db_chart = {}
         for d in all_docs:
             d_data = d.to_dict() or {}
-            d_id   = d.id
-            is_primary = (d_id == DRAFT_DOC_ID or d_data.get("doc_id") == DRAFT_DOC_ID)
-            # Collect chart fields — last writer wins (orphan overwrites primary
-            # because chart endpoint writes to primary via merge=True, so primary
-            # always has the freshest chart after the chart endpoint runs)
-            for field in _CHART_FIELDS:
-                if d_data.get(field):
-                    db_chart[field] = d_data[field]
-            for field in _RESTORE_FIELDS:
-                if not doc.get(field) and d_data.get(field):
-                    doc[field] = d_data[field]
+            is_primary = (d.id == DRAFT_DOC_ID or d_data.get("doc_id") == DRAFT_DOC_ID)
             if not is_primary:
-                orphan_ids.append(d_id)
-
-        # Unconditionally overwrite chart fields from DB
-        for field, value in db_chart.items():
-            old_val = doc.get(field, "")
-            doc[field] = value
-            if old_val != value:
-                log.info("save_draft: updated %s from DB (was: %s...)",
-                         field, str(old_val)[:40])
+                # Check if orphan has fresher chart data (created by merge=True upsert)
+                for field in _CHART_FIELDS:
+                    if d_data.get(field) and not doc.get(field):
+                        doc[field] = d_data[field]
+                        log.info("save_draft: picked up %s from orphan %s", field, d.id)
+                orphan_ids.append(d.id)
     except Exception as e:
-        log.warning("save_draft: could not scan newsletter_draft collection: %s", e)
-        orphan_ids = []
+        log.warning("save_draft: could not read draft from MongoDB: %s", e)
 
     doc.update({
         "saved_at":  _now(),
@@ -1463,8 +1464,9 @@ def send_custom_newsletter(draft: NewsletterDraft, payload: dict = Depends(requi
             "cover_article":     draft.cover_article_title,
             "failed_emails":     failed_emails,
         })
-        # Delete draft after send (no old newsletters stored)
-        db.collection("newsletter_draft").document(DRAFT_DOC_ID).delete()
+        # Do NOT delete the draft — keep it so admins can re-send or test
+        # after sending.  The draft will be overwritten on the next save.
+        log.info("send_custom: draft preserved for re-use / test sends")
     except Exception as e:
         log.warning("Post-send cleanup error: %s", e)
 
@@ -1668,23 +1670,17 @@ def send_test_email(body: TestEmailBody, payload: dict = Depends(require_mod)):
     the current saved draft from MongoDB.  Falls back to the old digest only
     if neither is available.
     """
-    # Always load the full saved draft from MongoDB — this is the authoritative
-    # source for chart fields (filename, png_b64, image_url) which are never
-    # carried by the frontend.  Merge any extra fields from the request body
-    # on top so manual overrides still work.
+    # Always load direct from MongoDB using .get() for the freshest state.
+    # Never use .stream() — it can return stale data.
     draft_dict = {}
     try:
-        all_docs = list(db.collection("newsletter_draft").stream())
-        # Find the primary doc first
-        for d in all_docs:
-            d_data = d.to_dict() or {}
-            if d.id == DRAFT_DOC_ID or d_data.get("doc_id") == DRAFT_DOC_ID:
-                draft_dict = d_data
-                log.info("send_test: loaded primary draft from MongoDB doc %s", d.id)
-                break
-        # If not found, use first doc
-        if not draft_dict and all_docs:
-            draft_dict = all_docs[0].to_dict() or {}
+        fresh = db.collection("newsletter_draft").document(DRAFT_DOC_ID).get()
+        if fresh.exists:
+            draft_dict = fresh.to_dict() or {}
+            log.info("send_test: loaded fresh draft from MongoDB (filename=%s)",
+                     draft_dict.get("cover_chart_filename", "—"))
+        else:
+            log.warning("send_test: no draft found at doc_id=%s", DRAFT_DOC_ID)
     except Exception as e:
         log.warning("send_test: could not load draft from MongoDB: %s", e)
 
@@ -1820,7 +1816,7 @@ def _build_old_digest_html(articles: list[dict], recipient_name: str = "") -> st
         </td></tr>
         <tr><td style="padding:20px;text-align:center;">
           <p style="font-size:12px;color:#9ca3af;">
-            <a href="{unsubscribe}" style="color:#9ca3af;text-decoration:underline;">Unsubscribe</a>
+            <a href="{unsubscribe}" style="color:#9ca3af;text-decoration:none;">Unsubscribe</a>
           </p>
         </td></tr>
       </table>
