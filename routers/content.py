@@ -128,13 +128,18 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _delete_file(url_path: str) -> bool:
+def _delete_file(url_path: str, resource_type: str = "image") -> bool:
     """
-    Delete an image from Cloudinary given its public URL or Cloudinary public_id.
+    Delete a file from Cloudinary given its public URL or Cloudinary public_id.
 
     - Skips empty strings silently.
     - For Cloudinary URLs (https://res.cloudinary.com/...), extracts the public_id
-      and calls the Cloudinary destroy API.
+      AND auto-detects resource_type from the URL path:
+        /image/upload/  → "image"   (JPEG, PNG, WebP, GIF, snapshot)
+        /raw/upload/    → "raw"     (GLB, GLTF, OBJ, FBX, STL, any binary)
+        /video/upload/  → "video"
+      This is critical — calling destroy() with the wrong resource_type always
+      returns {'result': 'not found'} even when the asset exists.
     - Returns True if deleted successfully, False otherwise.
     - Never raises — failures are logged as warnings.
     """
@@ -143,8 +148,16 @@ def _delete_file(url_path: str) -> bool:
 
     try:
         # Extract the public_id from a Cloudinary URL.
-        # URL format: https://res.cloudinary.com/<cloud>/image/upload/v<ver>/<public_id>.<ext>
+        # URL format: https://res.cloudinary.com/<cloud>/<type>/upload/v<ver>/<public_id>.<ext>
         if "res.cloudinary.com" in url_path:
+            # Auto-detect resource_type from the URL segment before /upload/
+            if "/raw/upload/" in url_path:
+                resource_type = "raw"
+            elif "/video/upload/" in url_path:
+                resource_type = "video"
+            else:
+                resource_type = "image"
+
             # Strip everything up to and including "/upload/"
             after_upload = url_path.split("/upload/")[-1]
             # Drop the version segment if present (e.g. "v1234567890/")
@@ -156,9 +169,9 @@ def _delete_file(url_path: str) -> bool:
             # Treat the value as a raw public_id (e.g. "steami/explainers/quantum-dog")
             public_id = os.path.splitext(url_path.lstrip("/"))[0]
 
-        result = cloudinary.uploader.destroy(public_id)
+        result = cloudinary.uploader.destroy(public_id, resource_type=resource_type)
         if result.get("result") == "ok":
-            log.info("_delete_file: Cloudinary deleted public_id=%s", public_id)
+            log.info("_delete_file: Cloudinary deleted public_id=%s (resource_type=%s)", public_id, resource_type)
             return True
         else:
             log.warning("_delete_file: Cloudinary could not delete public_id=%s result=%s", public_id, result)
@@ -1935,20 +1948,25 @@ async def upload_simulation_snapshot(
       -d '{"image_data":"data:image/png;base64,iVBORw0KG..."}'
     """
     doc_ref = db.collection("simulations").document(simulation_id)
-    if not doc_ref.get().exists:
+    doc     = doc_ref.get()
+    if not doc.exists:
         raise HTTPException(404, detail="Simulation not found")
 
-    # Delete old snapshot from Cloudinary
-    old_url = doc_ref.get().to_dict().get("snapshot_url", "")
-    if old_url:
-        _delete_file(old_url)
+    # ① Read old URL BEFORE uploading so we can clean it up afterwards
+    old_url = doc.to_dict().get("snapshot_url", "")
 
+    # ② Upload new snapshot to Cloudinary
     snapshot_url = _upload_snapshot_to_cloudinary(body.image_data, simulation_id)
 
+    # ③ Persist the new URL to DB first — so we never lose it if cleanup fails
     try:
         doc_ref.update({"snapshot_url": snapshot_url, "updated_at": _now()})
     except Exception as e:
         raise HTTPException(500, detail=f"Uploaded to Cloudinary but DB update failed: {e}")
+
+    # ④ Only now delete the old snapshot — safe because new URL is already saved
+    if old_url:
+        _delete_file(old_url)
 
     log.info("Simulation snapshot uploaded: %s → %s by %s", simulation_id, snapshot_url, get_uid(payload))
     return {"updated": True, "id": simulation_id, "snapshot_url": snapshot_url}
@@ -1974,25 +1992,32 @@ async def upload_simulation_glb(
       -F "file=@/path/to/bloch.glb"
     """
     doc_ref = db.collection("simulations").document(simulation_id)
-    if not doc_ref.get().exists:
+    doc     = doc_ref.get()
+    if not doc.exists:
         raise HTTPException(404, detail="Simulation not found")
+
+    # ① Read old URL BEFORE uploading — avoids a second DB round-trip and
+    #   ensures we always have the old URL even if the upload is slow
+    old_url = doc.to_dict().get("glb_url", "")
 
     ext = os.path.splitext(file.filename or "")[-1].lower()
     if ext not in ALLOWED_3D_EXT:
         raise HTTPException(400, detail=f"Unsupported 3-D file type '{ext}'. Allowed: {ALLOWED_3D_EXT}")
 
-    data = await file.read()
+    data    = await file.read()
+    # ② Upload new GLB to Cloudinary
     glb_url = _upload_glb_to_cloudinary(data, simulation_id, file.filename or f"model{ext}")
 
-    # Delete old GLB from Cloudinary
-    old_url = doc_ref.get().to_dict().get("glb_url", "")
-    if old_url:
-        _delete_file(old_url)
-
+    # ③ Persist the new URL to DB first — so we never lose it if cleanup fails
     try:
         doc_ref.update({"glb_url": glb_url, "updated_at": _now()})
     except Exception as e:
         raise HTTPException(500, detail=f"Uploaded to Cloudinary but DB update failed: {e}")
+
+    # ④ Only now delete the old GLB — safe because new URL is already saved.
+    #   _delete_file auto-detects resource_type="raw" from the /raw/upload/ URL segment.
+    if old_url:
+        _delete_file(old_url)
 
     log.info("Simulation GLB uploaded: %s → %s by %s", simulation_id, glb_url, get_uid(payload))
     return {"updated": True, "id": simulation_id, "glb_url": glb_url}
