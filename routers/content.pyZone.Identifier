@@ -1,4 +1,4 @@
 [ZoneTransfer]
 ZoneId=3
-ReferrerUrl=https://claude.ai/chat/b356acc1-05d5-4730-9988-b71ebb07134a
-HostUrl=https://claude.ai/api/organizations/30a367bd-1417-4986-9cbc-bf9b16b2539d/conversations/b356acc1-05d5-4730-9988-b71ebb07134a/wiggle/download-file?path=%2Fmnt%2Fuser-data%2Foutputs%2Fcontent.py
+ReferrerUrl=https://claude.ai/chat/bfcd24b4-e8ed-4422-ba97-4053b98033aa
+HostUrl=https://claude.ai/api/organizations/a7ab74f7-e12e-47e1-9e68-8447eaccc4d0/conversations/bfcd24b4-e8ed-4422-ba97-4053b98033aa/wiggle/download-file?path=%2Fmnt%2Fuser-data%2Foutputs%2Fcontent.py

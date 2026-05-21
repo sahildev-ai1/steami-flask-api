@@ -1,6 +1,6 @@
 """
-routers/content.py  —  Explainers, Research Articles & Blog Posts  v9
-======================================================================
+routers/content.py  —  Explainers, Research Articles, Blog Posts & Live Intelligence Network  v10
+==================================================================================================
 Images are stored on disk and served via FastAPI StaticFiles.
 Frontend accesses them at:  http://localhost:5000/images/explainers/quantum-dog.jpg
                              http://localhost:5000/images/research/physics.jpg
@@ -55,6 +55,15 @@ ENDPOINTS:
     PUT    /api/blog/{id}                                 — JSON update (mod/admin)
     DELETE /api/blog/{id}                                 — delete (admin)
     POST   /api/blog/{id}/cover-image                     — upload/replace cover image (mod/admin)
+
+  Live Intelligence Network  (HomePage — "Intelligence Archive" section)
+    POST   /api/intelligence/nodes                        — create node (mod/admin)
+    GET    /api/intelligence/nodes                        — list nodes, filter by domain/sentiment/tag (public)
+    GET    /api/intelligence/nodes/{id}                   — get one node (public)
+    PUT    /api/intelligence/nodes/{id}                   — update node (mod/admin)
+    DELETE /api/intelligence/nodes/{id}                   — delete node (admin)
+    GET    /api/cms/intelligence                          — slim CMS list (mod/admin)
+    GET    /api/cms/intelligence/{id}                     — full CMS doc (mod/admin)
 
   CMS — edit helpers (mod/admin)
     GET    /api/cms/explainers                            — list slim for CMS table
@@ -2078,3 +2087,373 @@ def cms_get_simulation(
         "created_at": s.get("created_at", ""),
         "updated_at": s.get("updated_at", ""),
     }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LIVE INTELLIGENCE NETWORK
+# ══════════════════════════════════════════════════════════════════════════════
+# Powers the "Intelligence Archive" section on the HomePage.
+# A "node" represents one intelligence item — typically mapped 1:1 with an
+# AI-enriched news insight (article_id, title, source, ai_insight block).
+#
+# Access rules (mirrors all other content types):
+#   GET  /api/intelligence/nodes       — public (no token)
+#   GET  /api/intelligence/nodes/{id}  — public (no token)
+#   POST /api/intelligence/nodes       — mod / admin only
+#   PUT  /api/intelligence/nodes/{id}  — mod / admin only
+#   DELETE /api/intelligence/nodes/{id}— admin only
+#
+# Firestore collection:  intelligence_nodes
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pydantic models
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AiInsightBlock(BaseModel):
+    """Nested AI-generated metadata block — all fields optional."""
+    summary:           Optional[str]   = None
+    key_points:        Optional[list]  = None   # list[str]
+    sentiment:         Optional[str]   = None   # e.g. "positive"
+    sentiment_label:   Optional[str]   = None   # "good_news" | "bad_news" | "neutral_news"
+    emoji:             Optional[str]   = None
+    confidence:        Optional[float] = None   # 0.0 – 1.0
+    tags:              Optional[list]  = None   # list[str]
+    domain:            Optional[str]   = None   # e.g. "QUANTUM PHYSICS"
+    reading_time_min:  Optional[int]   = None
+    article_url:       Optional[str]   = None
+
+
+class CreateIntelligenceNodeBody(BaseModel):
+    """
+    JSON body for POST /api/intelligence/nodes.
+
+    Required: id, article_id, title
+    Optional: all other fields
+    """
+    id:               str
+    article_id:       str
+    title:            str
+    topic:            Optional[str]  = None
+    source:           Optional[str]  = None
+    article_url:      Optional[str]  = None
+    matched_domains:  Optional[list] = None  # list[str]
+    ai_insight:       Optional[AiInsightBlock] = None
+
+
+class UpdateIntelligenceNodeBody(BaseModel):
+    """All fields optional — PATCH semantics via PUT."""
+    article_id:       Optional[str]             = None
+    title:            Optional[str]             = None
+    topic:            Optional[str]             = None
+    source:           Optional[str]             = None
+    article_url:      Optional[str]             = None
+    matched_domains:  Optional[list]            = None
+    ai_insight:       Optional[AiInsightBlock]  = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Formatter
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fmt_intelligence_node(doc: dict) -> dict:
+    """Return a clean intelligence-node dict safe to send to the frontend."""
+    ai = doc.get("ai_insight") or {}
+    return {
+        "id":              doc.get("id"),
+        "article_id":      doc.get("article_id"),
+        "title":           doc.get("title"),
+        "topic":           doc.get("topic"),
+        "source":          doc.get("source"),
+        "article_url":     doc.get("article_url"),
+        "matched_domains": doc.get("matched_domains", []),
+        "ai_insight": {
+            "summary":          ai.get("summary"),
+            "key_points":       ai.get("key_points", []),
+            "sentiment":        ai.get("sentiment"),
+            "sentiment_label":  ai.get("sentiment_label"),
+            "emoji":            ai.get("emoji"),
+            "confidence":       ai.get("confidence"),
+            "tags":             ai.get("tags", []),
+            "domain":           ai.get("domain"),
+            "reading_time_min": ai.get("reading_time_min"),
+            "article_url":      ai.get("article_url"),
+        },
+        "created_at": doc.get("created_at", ""),
+        "updated_at": doc.get("updated_at", ""),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CREATE
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/intelligence/nodes", status_code=201, tags=["Live Intelligence Network"])
+def create_intelligence_node(
+    body:    CreateIntelligenceNodeBody,
+    payload: dict = Depends(require_mod),
+):
+    """
+    POST /api/intelligence/nodes
+    MOD / ADMIN — create a new Live Intelligence Network node.
+
+    The node represents one AI-enriched intelligence item displayed on the
+    HomePage "Intelligence Archive" section.
+
+    Body (JSON):
+      {
+        "id":         "node-001",          ← unique string ID (required)
+        "article_id": "art-uuid-001",      ← source article identifier (required)
+        "title":      "Quantum leap in…",  ← display title (required)
+        "topic":      "QUANTUM PHYSICS",
+        "source":     "Nature",
+        "article_url":"https://...",
+        "matched_domains": ["PHYSICS","AI"],
+        "ai_insight": {
+          "summary":         "Short AI summary…",
+          "key_points":      ["Point 1", "Point 2"],
+          "sentiment":       "positive",
+          "sentiment_label": "good_news",
+          "emoji":           "⚛️",
+          "confidence":      0.92,
+          "tags":            ["quantum","computing"],
+          "domain":          "QUANTUM PHYSICS",
+          "reading_time_min": 4,
+          "article_url":     "https://..."
+        }
+      }
+
+    curl -X POST http://127.0.0.1:5000/api/intelligence/nodes \\
+      -H "Authorization: Bearer <mod_token>" \\
+      -H "Content-Type: application/json" \\
+      -d '{"id":"node-001","article_id":"art-001","title":"Quantum leap…"}'
+    """
+    ai_dict = body.ai_insight.model_dump() if body.ai_insight else {}
+    doc = {
+        "id":             body.id,
+        "article_id":     body.article_id,
+        "title":          body.title,
+        "topic":          body.topic,
+        "source":         body.source,
+        "article_url":    body.article_url,
+        "matched_domains": body.matched_domains or [],
+        "ai_insight":     ai_dict,
+        "created_at":     _now(),
+        "updated_at":     _now(),
+    }
+    try:
+        db.collection("intelligence_nodes").document(body.id).set(doc, merge=True)
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+    log.info("Intelligence node created: %s by %s", body.id, get_uid(payload))
+    return _fmt_intelligence_node(doc)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LIST  (public)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/intelligence/nodes", tags=["Live Intelligence Network"])
+def list_intelligence_nodes(
+    domain:    str = Query("", description="Filter by ai_insight.domain (case-insensitive)"),
+    sentiment: str = Query("", description="Filter by sentiment_label: good_news | bad_news | neutral_news"),
+    tag:       str = Query("", description="Filter by tag inside ai_insight.tags (case-insensitive)"),
+    limit:     int = Query(100, ge=1, le=500, description="Max results to return"),
+):
+    """
+    GET /api/intelligence/nodes
+    PUBLIC — list all Live Intelligence Network nodes.
+
+    Supports optional client-side-style filtering via query params:
+      ?domain=QUANTUM PHYSICS
+      ?sentiment=good_news
+      ?tag=quantum
+
+    Response:
+      { "insights": [ { id, article_id, title, topic, source, ai_insight, … } ], "total": N }
+
+    The response key is `insights` so the existing frontend code that reads
+    `data.insights` continues to work without changes.
+
+    curl http://127.0.0.1:5000/api/intelligence/nodes
+    curl "http://127.0.0.1:5000/api/intelligence/nodes?domain=PHYSICS&limit=20"
+    """
+    try:
+        q    = db.collection("intelligence_nodes").order_by("created_at", direction="DESCENDING")
+        docs = q.limit(limit).stream()
+        nodes = []
+        for d in docs:
+            node = d.to_dict()
+            ai = node.get("ai_insight") or {}
+
+            # Domain filter
+            if domain:
+                node_domain = (ai.get("domain") or node.get("topic") or "").lower()
+                if domain.lower() not in node_domain:
+                    continue
+
+            # Sentiment filter
+            if sentiment:
+                if ai.get("sentiment_label", "").lower() != sentiment.strip().lower():
+                    continue
+
+            # Tag filter
+            if tag:
+                node_tags = [t.lower() for t in (ai.get("tags") or [])]
+                if tag.strip().lower() not in node_tags:
+                    continue
+
+            nodes.append(_fmt_intelligence_node(node))
+    except Exception as e:
+        log.error("list_intelligence_nodes: %s", e)
+        raise HTTPException(500, detail=str(e))
+
+    return {"insights": nodes, "total": len(nodes)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GET ONE  (public)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/intelligence/nodes/{node_id}", tags=["Live Intelligence Network"])
+def get_intelligence_node(node_id: str):
+    """
+    GET /api/intelligence/nodes/{id}
+    PUBLIC — retrieve a single Live Intelligence Network node by ID.
+
+    curl http://127.0.0.1:5000/api/intelligence/nodes/node-001
+    """
+    doc = db.collection("intelligence_nodes").document(node_id).get()
+    if not doc.exists:
+        raise HTTPException(404, detail="Intelligence node not found")
+    return _fmt_intelligence_node(doc.to_dict())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UPDATE  (mod / admin)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.put("/intelligence/nodes/{node_id}", tags=["Live Intelligence Network"])
+def update_intelligence_node(
+    node_id: str,
+    body:    UpdateIntelligenceNodeBody,
+    payload: dict = Depends(require_mod),
+):
+    """
+    PUT /api/intelligence/nodes/{id}
+    MOD / ADMIN — update any fields of an intelligence node (PATCH semantics).
+    Only supplied non-null fields are written.
+
+    To update the nested ai_insight block, supply a partial or full
+    AiInsightBlock object — it replaces the entire ai_insight map.
+
+    curl -X PUT http://127.0.0.1:5000/api/intelligence/nodes/node-001 \\
+      -H "Authorization: Bearer <mod_token>" \\
+      -H "Content-Type: application/json" \\
+      -d '{"title":"Updated title","ai_insight":{"sentiment_label":"neutral_news"}}'
+    """
+    doc_ref = db.collection("intelligence_nodes").document(node_id)
+    if not doc_ref.get().exists:
+        raise HTTPException(404, detail="Intelligence node not found")
+
+    updates: dict = {}
+    data = body.model_dump()
+    for k, v in data.items():
+        if v is None:
+            continue
+        if k == "ai_insight" and isinstance(v, dict):
+            # Replace the entire ai_insight sub-document
+            updates["ai_insight"] = v
+        else:
+            updates[k] = v
+    updates["updated_at"] = _now()
+
+    try:
+        doc_ref.update(updates)
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+    log.info("Intelligence node updated: %s by %s", node_id, get_uid(payload))
+    return {"updated": True, "id": node_id}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DELETE  (admin only)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.delete("/intelligence/nodes/{node_id}", tags=["Live Intelligence Network"])
+def delete_intelligence_node(
+    node_id: str,
+    payload: dict = Depends(require_admin),
+):
+    """
+    DELETE /api/intelligence/nodes/{id}
+    ADMIN ONLY — permanently remove an intelligence node.
+
+    curl -X DELETE http://127.0.0.1:5000/api/intelligence/nodes/node-001 \\
+      -H "Authorization: Bearer <admin_token>"
+    """
+    doc_ref = db.collection("intelligence_nodes").document(node_id)
+    if not doc_ref.get().exists:
+        raise HTTPException(404, detail="Intelligence node not found")
+    doc_ref.delete()
+    log.info("Intelligence node deleted: %s by %s", node_id, get_uid(payload))
+    return {"deleted": True, "id": node_id}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CMS HELPERS  (mod / admin)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/cms/intelligence", tags=["CMS"])
+def cms_list_intelligence(payload: dict = Depends(require_mod)):
+    """
+    GET /api/cms/intelligence
+    MOD / ADMIN — slim list of all intelligence nodes for the CMS table.
+
+    Returns: id, article_id, title, topic, source, sentiment_label, domain, updated_at
+
+    curl -H "Authorization: Bearer <mod_token>" \\
+      http://127.0.0.1:5000/api/cms/intelligence
+    """
+    try:
+        docs = (
+            db.collection("intelligence_nodes")
+            .order_by("created_at", direction="DESCENDING")
+            .stream()
+        )
+        rows = []
+        for d in docs:
+            node = d.to_dict()
+            ai   = node.get("ai_insight") or {}
+            rows.append({
+                "id":              node.get("id"),
+                "article_id":      node.get("article_id"),
+                "title":           node.get("title"),
+                "topic":           node.get("topic"),
+                "source":          node.get("source"),
+                "sentiment_label": ai.get("sentiment_label"),
+                "domain":          ai.get("domain"),
+                "updated_at":      node.get("updated_at", ""),
+            })
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+    return {"nodes": rows, "total": len(rows)}
+
+
+@router.get("/cms/intelligence/{node_id}", tags=["CMS"])
+def cms_get_intelligence_node(
+    node_id: str,
+    payload: dict = Depends(require_mod),
+):
+    """
+    GET /api/cms/intelligence/{id}
+    MOD / ADMIN — full intelligence node document, ready to pre-populate an edit form.
+
+    curl -H "Authorization: Bearer <mod_token>" \\
+      http://127.0.0.1:5000/api/cms/intelligence/node-001
+    """
+    doc = db.collection("intelligence_nodes").document(node_id).get()
+    if not doc.exists:
+        raise HTTPException(404, detail="Intelligence node not found")
+    return _fmt_intelligence_node(doc.to_dict())
