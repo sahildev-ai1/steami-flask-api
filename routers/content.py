@@ -2139,6 +2139,12 @@ class CreateIntelligenceNodeBody(BaseModel):
     article_url:      Optional[str]  = None
     matched_domains:  Optional[list] = None  # list[str]
     ai_insight:       Optional[AiInsightBlock] = None
+    # Simplified ticker schema fields
+    heading:          Optional[str]  = None
+    value:            Optional[str]  = None
+    color:            Optional[str]  = None   # e.g. "cyan", "green"
+    direction:        Optional[str]  = None   # e.g. "↑", "↓", "→"
+    emoji:            Optional[str]  = None   # e.g. "⚛️"
 
 
 class UpdateIntelligenceNodeBody(BaseModel):
@@ -2150,6 +2156,11 @@ class UpdateIntelligenceNodeBody(BaseModel):
     article_url:      Optional[str]             = None
     matched_domains:  Optional[list]            = None
     ai_insight:       Optional[AiInsightBlock]  = None
+    heading:          Optional[str]             = None
+    value:            Optional[str]             = None
+    color:            Optional[str]             = None
+    direction:        Optional[str]             = None
+    emoji:            Optional[str]             = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2179,6 +2190,11 @@ def _fmt_intelligence_node(doc: dict) -> dict:
             "reading_time_min": ai.get("reading_time_min"),
             "article_url":      ai.get("article_url"),
         },
+        "heading":    doc.get("heading"),
+        "value":      doc.get("value"),
+        "color":      doc.get("color"),
+        "direction":  doc.get("direction"),
+        "emoji":      doc.get("emoji"),
         "created_at": doc.get("created_at", ""),
         "updated_at": doc.get("updated_at", ""),
     }
@@ -2238,6 +2254,11 @@ def create_intelligence_node(
         "article_url":    body.article_url,
         "matched_domains": body.matched_domains or [],
         "ai_insight":     ai_dict,
+        "heading":        body.heading,
+        "value":          body.value,
+        "color":          body.color,
+        "direction":      body.direction,
+        "emoji":          body.emoji,
         "created_at":     _now(),
         "updated_at":     _now(),
     }
@@ -2434,6 +2455,11 @@ def cms_list_intelligence(payload: dict = Depends(require_mod)):
                 "source":          node.get("source"),
                 "sentiment_label": ai.get("sentiment_label"),
                 "domain":          ai.get("domain"),
+                "heading":         node.get("heading"),
+                "value":           node.get("value"),
+                "color":           node.get("color"),
+                "direction":       node.get("direction"),
+                "emoji":           node.get("emoji"),
                 "updated_at":      node.get("updated_at", ""),
             })
     except Exception as e:
