@@ -6,6 +6,7 @@ Mount in main.py:
 """
 
 import os
+import pwd
 import time
 import socket
 import datetime
@@ -14,7 +15,7 @@ import subprocess
 from typing import List, Dict, Any
 
 import psutil
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
 router = APIRouter(prefix="/api/syswatch", tags=["SysWatch"])
@@ -28,6 +29,7 @@ def bytes_to_human(n: int) -> str:
         n /= 1024
     return f"{n:.1f} PB"
 
+
 def uptime_human() -> str:
     boot = psutil.boot_time()
     delta = int(time.time() - boot)
@@ -39,6 +41,24 @@ def uptime_human() -> str:
     if h: parts.append(f"{h}h")
     if m: parts.append(f"{m}m")
     return " ".join(parts) or "< 1m"
+
+
+def safe_username() -> str:
+    """
+    Get the current username without touching the controlling terminal.
+    os.getlogin() uses an ioctl on /dev/tty and crashes in Docker / CI
+    environments with OSError [Errno 25]. This reads from /etc/passwd
+    instead, which always works.
+    """
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (KeyError, AttributeError):
+        # uid not in /etc/passwd (rare in containers) — fall back to env vars
+        return (
+            os.environ.get("USER")
+            or os.environ.get("LOGNAME")
+            or "user"
+        )
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
@@ -133,7 +153,7 @@ def get_disk():
                 "total": bytes_to_human(usage.total),
                 "free": bytes_to_human(usage.free),
             })
-        except PermissionError:
+        except (PermissionError, OSError):
             pass
     io = psutil.disk_io_counters()
     return {
@@ -154,8 +174,9 @@ def get_network():
 
     for name, stat in stats.items():
         addr_list = addrs.get(name, [])
-        ipv4 = next((a.address for a in addr_list
-                     if a.family == socket.AF_INET), "—")
+        ipv4 = next(
+            (a.address for a in addr_list if a.family == socket.AF_INET), "—"
+        )
         io = io_per.get(name)
         ifaces.append({
             "name": name,
@@ -173,7 +194,7 @@ def get_network():
 
 
 @router.get("/processes")
-def get_processes(limit: int = 12):
+def get_processes(limit: int = Query(default=12, ge=1, le=200)):
     """Top processes by CPU usage."""
     procs = []
     for proc in psutil.process_iter(
@@ -203,19 +224,23 @@ def get_processes(limit: int = 12):
 def get_users():
     users = []
     for u in psutil.users():
-        login_time = datetime.datetime.fromtimestamp(u.started)
-        users.append({
-            "name": u.name,
-            "terminal": u.terminal or "—",
-            "host": u.host or "local",
-            "started": login_time.strftime("%H:%M"),
-            "started_full": login_time.strftime("%Y-%m-%d %H:%M"),
-        })
+        try:
+            login_time = datetime.datetime.fromtimestamp(u.started)
+            users.append({
+                "name": u.name,
+                "terminal": u.terminal or "—",
+                "host": u.host or "local",
+                "started": login_time.strftime("%H:%M"),
+                "started_full": login_time.strftime("%Y-%m-%d %H:%M"),
+            })
+        except (OSError, ValueError, OverflowError):
+            # Malformed timestamp in edge-case containers
+            pass
     return {"users": users, "count": len(users)}
 
 
 @router.get("/logs")
-def get_logs(lines: int = 30):
+def get_logs(lines: int = Query(default=30, ge=1, le=500)):
     """
     Reads from /var/log/syslog (Linux) or system log.
     Falls back to a synthetic log if not accessible.
@@ -246,19 +271,21 @@ def get_logs(lines: int = 30):
             except Exception:
                 continue
 
-    # Synthetic fallback (when running without syslog access)
+    # ── Synthetic fallback (no syslog access — e.g. Docker) ──────────────────
+    # safe_username() reads /etc/passwd via pwd.getpwuid — no TTY needed.
     now = datetime.datetime.now()
+    username = safe_username()
     synthetic = [
-        ("OK",    "cron[1204]: health-check.sh — all services running"),
-        ("INFO",  f"sshd[998]: Accepted key for {os.getlogin()} from 127.0.0.1"),
-        ("WARN",  "kernel: Memory usage crossed 65% threshold"),
-        ("OK",    "nginx[1024]: 200 OK — 214 requests served"),
-        ("INFO",  "systemd[1]: Starting periodic filesystem check"),
-        ("OK",    "backup[3310]: /home snapshot completed — 2.4 GB"),
-        ("INFO",  "cron[1204]: Triggered log-rotate.sh"),
-        ("WARN",  "disk[44]: Read latency spike on /dev/sda — 320ms"),
-        ("OK",    "postgres[2201]: Checkpoint completed — WAL size 128 MB"),
-        ("INFO",  "sshd[998]: New session opened for researcher"),
+        ("OK",   "cron[1204]: health-check.sh — all services running"),
+        ("INFO", f"sshd[998]: Accepted key for {username} from 127.0.0.1"),
+        ("WARN", "kernel: Memory usage crossed 65% threshold"),
+        ("OK",   "nginx[1024]: 200 OK — 214 requests served"),
+        ("INFO", "systemd[1]: Starting periodic filesystem check"),
+        ("OK",   "backup[3310]: /home snapshot completed — 2.4 GB"),
+        ("INFO", "cron[1204]: Triggered log-rotate.sh"),
+        ("WARN", "disk[44]: Read latency spike on /dev/sda — 320ms"),
+        ("OK",   "postgres[2201]: Checkpoint completed — WAL size 128 MB"),
+        ("INFO", "sshd[998]: New session opened for researcher"),
     ]
     for i, (level, msg) in enumerate(synthetic):
         t = (now - datetime.timedelta(minutes=i * 4)).strftime("%b %d %H:%M:%S")

@@ -1,0 +1,4 @@
+[ZoneTransfer]
+ZoneId=3
+ReferrerUrl=https://claude.ai/chat/0a74d8a2-a418-4988-bb7a-17a8d240680d
+HostUrl=https://claude.ai/api/organizations/f716582f-de63-42dc-8791-65da01ba7a15/conversations/0a74d8a2-a418-4988-bb7a-17a8d240680d/wiggle/download-file?path=%2Fmnt%2Fuser-data%2Foutputs%2Fsyswatch.py
