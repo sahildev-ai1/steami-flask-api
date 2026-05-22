@@ -312,6 +312,14 @@ def _fmt_article(art: dict) -> dict:
         "quotes":        art.get("quotes", []),
         "keyFindings":   art.get("keyFindings", []),
         "relatedTopics": art.get("relatedTopics", []),
+        # ── References: source list shown at the bottom of the article ──────
+        # Each item: {title, url?, author?, type?}
+        # type options: "paper" | "article" | "book" | "website" | "dataset"
+        "references":    art.get("references", []),
+        # ── Citations: inline numbered citations used inside the article body ─
+        # Each item: {id (e.g. "1"), text, source_title, source_url?, accessed_date?}
+        # Use [1], [2] markers in the content paragraphs that map to these ids
+        "citations":     art.get("citations", []),
     }
 
 
@@ -371,6 +379,10 @@ class CreateResearchArticleBody(BaseModel):
     quotes:        list = []
     keyFindings:   list = []
     relatedTopics: list = []
+    # Source list shown at the bottom — each item: {title, url?, author?, type?}
+    references:    list = []
+    # Inline numbered citations — each item: {id, text, source_title, source_url?, accessed_date?}
+    citations:     list = []
 
 
 class UpdateResearchArticleBody(BaseModel):
@@ -385,6 +397,8 @@ class UpdateResearchArticleBody(BaseModel):
     quotes:        Optional[list] = None
     keyFindings:   Optional[list] = None
     relatedTopics: Optional[list] = None
+    references:    Optional[list] = None
+    citations:     Optional[list] = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -841,6 +855,8 @@ async def create_research_with_image(
     quotes:        str        = Form("[]", description='JSON array of quote strings'),
     keyFindings:   str        = Form("[]", description='JSON array of key finding strings'),
     relatedTopics: str        = Form("[]", description='JSON array of topic strings'),
+    references:    str        = Form("[]", description='JSON array of reference objects [{title, url?, author?, type?}]'),
+    citations:     str        = Form("[]", description='JSON array of citation objects [{id, text, source_title, source_url?, accessed_date?}]'),
     # ── Auth ──────────────────────────────────────────────────────────────
     payload:       dict       = Depends(require_mod),
 ):
@@ -885,6 +901,8 @@ async def create_research_with_image(
         quotes_list        = json.loads(quotes)
         keyFindings_list   = json.loads(keyFindings)
         relatedTopics_list = json.loads(relatedTopics)
+        references_list    = json.loads(references)
+        citations_list     = json.loads(citations)
     except json.JSONDecodeError as e:
         raise HTTPException(400, detail=f"Invalid JSON in array field: {e}")
 
@@ -909,6 +927,8 @@ async def create_research_with_image(
         "quotes":        quotes_list,
         "keyFindings":   keyFindings_list,
         "relatedTopics": relatedTopics_list,
+        "references":    references_list,
+        "citations":     citations_list,
         "created_at":    _now(),
         "updated_at":    _now(),
     }
@@ -1164,6 +1184,10 @@ class CreateBlogPostBody(BaseModel):
     type:         str        = "article"   # "explainer" | "article" | "simulation"
     simulationUrl: str       = ""
     content:      str        = ""          # Markdown string
+    # Source list shown at the bottom — each item: {title, url?, author?, type?}
+    references:   list       = []
+    # Inline numbered citations — each item: {id, text, source_title, source_url?, accessed_date?}
+    citations:    list       = []
 
 
 class UpdateBlogPostBody(BaseModel):
@@ -1182,6 +1206,8 @@ class UpdateBlogPostBody(BaseModel):
     type:          Optional[str]        = None
     simulationUrl: Optional[str]        = None
     content:       Optional[str]        = None
+    references:    Optional[list]       = None
+    citations:     Optional[list]       = None
 
 
 def _fmt_blog(post: dict) -> dict:
@@ -1202,6 +1228,12 @@ def _fmt_blog(post: dict) -> dict:
         "type":          post.get("type", "article"),
         "simulationUrl": post.get("simulationUrl", ""),
         "content":       post.get("content", ""),
+        # ── References: source list shown at the bottom ───────────────────
+        # Each item: {title, url?, author?, type?}
+        "references":    post.get("references", []),
+        # ── Citations: inline numbered citations used inside the content ──
+        # Each item: {id, text, source_title, source_url?, accessed_date?}
+        "citations":     post.get("citations", []),
     }
 
 
@@ -1645,6 +1677,8 @@ class CreateSimulationBody(BaseModel):
     snapshot_url:    str              = ""   # Cloudinary CDN URL for the preview image
     glb_url:         str              = ""   # Cloudinary CDN URL for the .glb file (if any)
     tags:            list             = []
+    # Source list shown below the simulation — each item: {title, url?, author?, type?}
+    references:      list             = []
 
 
 class UpdateSimulationBody(BaseModel):
@@ -1660,6 +1694,7 @@ class UpdateSimulationBody(BaseModel):
     snapshot_url:    Optional[str]  = None
     glb_url:         Optional[str]  = None
     tags:            Optional[list] = None
+    references:      Optional[list] = None
 
 
 class SnapshotUploadBody(BaseModel):
@@ -1687,6 +1722,8 @@ def _fmt_simulation(s: dict) -> dict:
         "snapshot_url":    s.get("snapshot_url", ""),
         "glb_url":         s.get("glb_url", ""),
         "tags":            s.get("tags", []),
+        # Source list shown below the simulation — each item: {title, url?, author?, type?}
+        "references":      s.get("references", []),
     }
 
 
