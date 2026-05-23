@@ -159,6 +159,7 @@ from routers.profile_router import router as profile_router
 from routers.notifications import router as notifications_router
 from daily_cleanup import start_cleanup_scheduler, cleanup_router
 from routers.syswatch import router as syswatch_router
+from visitor_tracker import add_visitor_tracking 
 
 
 # ── Logging ────────────────────────────────────────────────────────────────
@@ -218,6 +219,7 @@ app.add_middleware(
 
 # ── DDoS protection ────────────────────────────────────────────────────────
 add_ddos_protection(app)
+visitors_router = add_visitor_tracking(app)
 
 # ── Static files ───────────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
@@ -254,6 +256,7 @@ app.include_router(insight_router, prefix="/api/articles", tags=["Insights"])
 app.include_router(profile_router, prefix="/api/profile", tags=["Profile"])
 app.include_router(cleanup_router, prefix="/api/admin",   tags=["Admin"])
 app.include_router(syswatch_router)
+app.include_router(visitors_router, prefix="/api/visitors", tags=["Visitors"]) 
 
 # content.router handles multiple tag groups — registered without a top-level tag
 # so each route's own tags= kwarg controls the Swagger UI grouping:

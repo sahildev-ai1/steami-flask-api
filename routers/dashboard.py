@@ -457,17 +457,22 @@ def _build_subject_scores(events: list[dict], user_interests: list[str]) -> list
 
 class PopupEventBody(BaseModel):
     """
-    Sent by the frontend every time a popup is opened.
-    popup_title is optional but helps the dashboard display nicely.
-    read_duration_seconds is optionally sent when the popup is CLOSED
-    (the frontend can track how long it was open).
-    device_type helps segment analytics (mobile vs desktop).
+    Sent by the frontend when a popup is OPENED.
+    user_name / user_role are resolved server-side from the auth token.
     """
-    popup_type:           str
-    popup_id:             str
-    popup_title:          str  = ""
-    read_duration_seconds: Optional[int] = None   # seconds popup was open
-    device_type:          str  = "unknown"         # mobile | desktop | tablet | unknown
+    popup_type:  str
+    popup_id:    str
+    popup_title: str = ""
+    device_type: str = "unknown"   # mobile | desktop | tablet | unknown
+
+
+class DurationPatchBody(BaseModel):
+    """
+    Sent by the frontend when a popup is CLOSED.
+    PATCHes the existing open-event document with the read duration
+    so there is exactly ONE row per open/close cycle — no duplicate rows.
+    """
+    read_duration_seconds: int
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -486,21 +491,20 @@ def log_popup_event(
     """
     POST /api/dashboard/event
 
-    Enhanced v2: after logging the basic event fields the endpoint
-    fetches the content from our own collections, extracts STEM keywords,
-    and resolves the canonical subject — all stored on the event document.
-    This enrichment powers the recommendation system downstream.
+    Logs a popup-open event. Returns the full enriched event document
+    including the auto-assigned event_id — the frontend stores this id
+    and sends it to PATCH /event/{id}/duration when the popup closes.
 
     Body:
     {
-      "popup_type":            "explainer",
-      "popup_id":              "quantum-dog",
-      "popup_title":           "The Quantum Dog: Schrödinger's Pet Paradox",
-      "read_duration_seconds": 120,
-      "device_type":           "desktop"
+      "popup_type":  "explainer",
+      "popup_id":    "quantum-dog",
+      "popup_title": "The Quantum Dog: Schrödinger's Pet Paradox",
+      "device_type": "desktop"
     }
 
-    Response includes the full enriched event document.
+    NOTE: read_duration_seconds is NOT accepted here any more.
+    Send it via PATCH /api/dashboard/event/{id}/duration on close.
     """
     if body.popup_type not in VALID_POPUP_TYPES:
         raise HTTPException(
@@ -515,16 +519,40 @@ def log_popup_event(
     event_id = str(uuid.uuid4())
     now      = datetime.now(timezone.utc)
 
+    # ── Resolve user name + role from the users collection ───────────────────
+    user_name = "Unknown"
+    user_role = "user"
+    try:
+        user_doc = db.collection("users").document(uid).get()
+        if user_doc.exists:
+            u = user_doc.to_dict()
+            user_name = (
+                u.get("full_name")
+                or u.get("display_name")
+                or u.get("name")
+                or u.get("email", "Unknown")
+            )
+            user_role = u.get("role", "user") or "user"
+    except Exception as e:
+        log.warning("log_popup_event: user lookup failed uid=%s: %s", uid, e)
+
+    # Normalise role to one of: admin | mod | user
+    _ROLE_MAP = {"moderator": "mod", "administrator": "admin"}
+    user_role = _ROLE_MAP.get(user_role.lower(), user_role.lower())
+    if user_role not in ("admin", "mod", "user"):
+        user_role = "user"
+
+    # ── Resolve device type — fall back to "desktop" not "unknown" ────────────
+    device_type = body.device_type if body.device_type in ("mobile", "tablet", "desktop") else "desktop"
+
     # ── Enrich: fetch content from our own API ────────────────────────────────
     content_data = _fetch_content(body.popup_type, body.popup_id.strip())
 
     # ── Extract keywords ──────────────────────────────────────────────────────
-    # Combine popup_title + fetched content text for richer keyword signal
     combined_text = f"{body.popup_title} {content_data['text']}"
     keywords = _extract_keywords(combined_text)
 
     # ── Resolve subject ───────────────────────────────────────────────────────
-    # Priority: field from content doc → popup_title words → None
     subject = (
         _normalise_subject(content_data["field"])
         or _normalise_subject(body.popup_title)
@@ -532,29 +560,33 @@ def log_popup_event(
 
     event = {
         # Core identity
-        "id":          event_id,
-        "uid":         uid,
+        "id":  event_id,
+        "uid": uid,
 
-        # Popup metadata (sent by frontend)
+        # ── NEW: user identity columns ─────────────────────────────────────────
+        "user_name": user_name,   # full name, email fallback, or "Unknown"
+        "user_role": user_role,   # admin | mod | user
+
+        # Popup metadata
         "popup_type":  body.popup_type,
         "popup_id":    body.popup_id.strip(),
         "popup_title": body.popup_title.strip() or content_data["title"],
 
         # Timestamps
-        "opened_at":   now.isoformat(),
-        "date":        now.strftime("%Y-%m-%d"),
-        "hour":        now.hour,
-        "week":        now.isocalendar()[1],    # ISO week number (1–53)
-        "month":       now.strftime("%Y-%m"),   # for monthly rollups
+        "opened_at": now.isoformat(),
+        "date":      now.strftime("%Y-%m-%d"),
+        "hour":      now.hour,
+        "week":      now.isocalendar()[1],
+        "month":     now.strftime("%Y-%m"),
 
-        # ── Enrichment fields (new in v2) ─────────────────────────────────────
-        "subject":          subject,            # canonical STEAMI subject or None
-        "keywords":         keywords,           # list[str] — STEM keyword tags
-        "content_snippet":  content_data["snippet"],  # first 280 chars of content
+        # Enrichment
+        "subject":         subject,
+        "keywords":        keywords,
+        "content_snippet": content_data["snippet"],
 
-        # ── Engagement signals (for recommendation weighting) ─────────────────
-        "read_duration_seconds": body.read_duration_seconds,  # int or None
-        "device_type":           body.device_type,
+        # Engagement — duration starts null, filled in by PATCH on close
+        "read_duration_seconds": None,
+        "device_type":           device_type,
     }
 
     try:
@@ -564,10 +596,64 @@ def log_popup_event(
         raise HTTPException(500, detail=str(e))
 
     log.info(
-        "popup event: uid=%s type=%s id=%s subject=%s keywords=%s",
-        uid, body.popup_type, body.popup_id, subject, keywords,
+        "popup event: uid=%s type=%s id=%s subject=%s user=%s role=%s",
+        uid, body.popup_type, body.popup_id, subject, user_name, user_role,
     )
     return event
+
+
+@router.patch(
+    "/event/{event_id}/duration",
+    summary = "Record read duration when a popup closes — requires auth",
+)
+def patch_event_duration(
+    event_id: str,
+    body:     DurationPatchBody,
+    payload:  dict = Depends(require_auth),
+):
+    """
+    PATCH /api/dashboard/event/{event_id}/duration
+
+    Called by the frontend when a popup is closed. Updates the existing
+    open-event document with read_duration_seconds so there is exactly ONE
+    row per open/close cycle — no duplicate rows in the CSV export.
+
+    Body: { "read_duration_seconds": 142 }
+
+    Rules:
+    - Only the owner (uid match) or an admin can patch an event.
+    - Duration must be >= 2 seconds (ignore accidental fast closes).
+    - Duration capped at 7200 seconds (2 hours) to filter outliers.
+    """
+    if body.read_duration_seconds < 2:
+        return {"ok": True, "skipped": "duration too short"}
+
+    duration = min(body.read_duration_seconds, 7200)
+    uid = get_uid(payload)
+
+    try:
+        doc_ref = db.collection("popup_events").document(event_id)
+        doc     = doc_ref.get()
+        if not doc.exists:
+            raise HTTPException(404, detail="Event not found")
+
+        ev = doc.to_dict()
+        # Only allow owner or admin to patch
+        if ev.get("uid") != uid:
+            user_doc = db.collection("users").document(uid).get()
+            role = user_doc.to_dict().get("role", "user") if user_doc.exists else "user"
+            if role not in ("admin", "mod", "moderator"):
+                raise HTTPException(403, detail="Not authorised to patch this event")
+
+        doc_ref.update({"read_duration_seconds": duration})
+        log.info("duration patched: event=%s uid=%s duration=%d", event_id, uid, duration)
+        return {"ok": True, "event_id": event_id, "read_duration_seconds": duration}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("patch_event_duration failed event=%s: %s", event_id, e)
+        raise HTTPException(500, detail=str(e))
 
 
 @router.get(
@@ -942,6 +1028,8 @@ def admin_events(
 _CSV_COLUMNS = [
     "id",
     "uid",
+    "user_name",               # full name or "Unknown" for unauthenticated
+    "user_role",               # admin | mod | user
     "opened_at",
     "date",
     "hour",
@@ -951,7 +1039,7 @@ _CSV_COLUMNS = [
     "popup_id",
     "popup_title",
     "subject",
-    "keywords",          # pipe-separated list: "quantum mechanics|black holes"
+    "keywords",                # pipe-separated list: "quantum mechanics|black holes"
     "content_snippet",
     "read_duration_seconds",
     "device_type",
