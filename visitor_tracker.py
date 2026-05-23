@@ -9,7 +9,7 @@ HOW IT WORKS:
   - A Starlette middleware intercepts every request AFTER DDoS protection.
   - It extracts the real client IP (same logic as ddos_protection.py).
   - It optionally decodes the JWT to get user name & role.
-  - It upserts a document in the "visitors" MongoDB collection keyed on IP.
+  - It upserts a document in the "visitors" collection keyed on IP.
   - Only ONE document per unique IP — updates name/last_seen on repeat visits.
   - Admin-only endpoints:
       GET    /api/visitors        — list all unique visitors (paginated)
@@ -18,8 +18,7 @@ HOW IT WORKS:
 
 COLLECTION SCHEMA (visitors):
   {
-    "_id":         "<IP address>",   # unique key = IP
-    "ip":          "1.2.3.4",
+    "ip":          "1.2.3.4",        # document ID = IP address
     "name":        "Sahil Tiwari",   # or "Unknown"
     "uid":         "abc123",         # user ID, or null
     "role":        "user",           # or null
@@ -180,50 +179,59 @@ class VisitorTrackingMiddleware(BaseHTTPMiddleware):
 
 async def _upsert_visitor(ip: str, user: dict) -> None:
     """
-    Upsert the visitor record in MongoDB.
-    One document per unique IP. On repeated visits:
-      - last_seen and visit_count are always updated.
-      - If the user is now logged in, name/uid/role are upgraded.
-      - A known name is never overwritten by "Unknown".
+    Upsert the visitor record.
+    Uses db.collection("visitors") — same pattern as the rest of STEAMI.
+    Document ID = IP address, so there is exactly one record per unique IP.
+
+    Logic:
+      - last_seen and visit_count always updated.
+      - If logged in → name/uid/role always upgraded.
+      - If guest → name set to "Unknown" only on first insert,
+        never overwrites a real name from a previous logged-in visit.
     """
     try:
-        from mongodb_client import db  # late import avoids circular dependency
+        from mongodb_client import db  # late import avoids circular dependency at startup
 
         now = _now()
 
-        # Fields written ONLY on first insert
-        set_on_insert: dict = {
-            "ip":         ip,
-            "first_seen": now,
-        }
+        # Check if this IP already has a record
+        existing_doc = db.collection("visitors").document(ip).get()
 
-        # Fields always updated on every visit
-        set_always: dict = {"last_seen": now}
+        if existing_doc.exists:
+            existing = existing_doc.to_dict()
 
-        if user["is_logged_in"]:
-            # Upgrade identity whenever we have a real user
-            set_always["name"]         = user["name"]
-            set_always["uid"]          = user["uid"]
-            set_always["role"]         = user["role"]
-            set_always["is_logged_in"] = True
+            # Build update payload
+            updates: dict = {
+                "last_seen":   now,
+                "visit_count": existing.get("visit_count", 0) + 1,
+            }
+
+            # Only upgrade identity if logged in
+            # (never downgrade a known name back to "Unknown")
+            if user["is_logged_in"]:
+                updates["name"]         = user["name"]
+                updates["uid"]          = user["uid"]
+                updates["role"]         = user["role"]
+                updates["is_logged_in"] = True
+
+            db.collection("visitors").document(ip).update(updates)
+
         else:
-            # Only set Unknown on first insert — never overwrite a real name
-            set_on_insert["name"]         = "Unknown"
-            set_on_insert["uid"]          = None
-            set_on_insert["role"]         = None
-            set_on_insert["is_logged_in"] = False
-
-        db.db["visitors"].update_one(
-            {"_id": ip},
-            {
-                "$set":         set_always,
-                "$setOnInsert": set_on_insert,
-                "$inc":         {"visit_count": 1},
-            },
-            upsert=True,
-        )
+            # First visit — create the full document
+            doc: dict = {
+                "ip":          ip,
+                "name":        user["name"],        # "Unknown" or real name
+                "uid":         user["uid"],
+                "role":        user["role"],
+                "is_logged_in": user["is_logged_in"],
+                "first_seen":  now,
+                "last_seen":   now,
+                "visit_count": 1,
+            }
+            db.collection("visitors").document(ip).set(doc)
 
     except Exception as e:
+        # Non-fatal — visitor tracking must never crash the app
         log.debug("visitor_tracker: upsert failed for %s: %s", ip, e)
 
 
@@ -235,7 +243,7 @@ def _build_router() -> APIRouter:
     """
     Build and return the admin router with live auth dependencies.
     Called once from add_visitor_tracking() during app startup.
-    Deferred to avoid circular imports between visitor_tracker ↔ auth.
+    Deferred import avoids circular imports between visitor_tracker ↔ auth.
     """
     from auth import require_admin
 
@@ -246,39 +254,39 @@ def _build_router() -> APIRouter:
     def list_visitors(
         limit:     int            = Query(100, ge=1, le=1000, description="Max records"),
         skip:      int            = Query(0,   ge=0,          description="Pagination offset"),
-        logged_in: Optional[bool] = Query(None,               description="true=logged-in, false=guest, omit=all"),
+        logged_in: Optional[bool] = Query(None, description="true=logged-in only, false=guest only, omit=all"),
         _auth:     dict           = Depends(require_admin),
     ):
         """
         Returns all unique IP visitor records sorted by last_seen (newest first).
-        Supports pagination and an optional logged_in boolean filter.
+        Supports pagination (skip/limit) and an optional logged_in boolean filter.
         ADMIN ONLY.
         """
         from mongodb_client import db
 
         try:
-            filt: dict = {}
-            if logged_in is True:
-                filt["is_logged_in"] = True
-            elif logged_in is False:
-                filt["is_logged_in"] = False
+            # Fetch all visitor docs
+            all_docs = db.collection("visitors").stream_all()
+            visitors = [d.to_dict() for d in all_docs]
 
-            cursor = (
-                db.db["visitors"]
-                .find(filt, {"_id": 0})
-                .sort("last_seen", -1)
-                .skip(skip)
-                .limit(limit)
-            )
-            visitors = list(cursor)
-            total    = db.db["visitors"].count_documents(filt)
+            # Apply logged_in filter if requested
+            if logged_in is True:
+                visitors = [v for v in visitors if v.get("is_logged_in") is True]
+            elif logged_in is False:
+                visitors = [v for v in visitors if not v.get("is_logged_in")]
+
+            # Sort by last_seen descending
+            visitors.sort(key=lambda v: v.get("last_seen", ""), reverse=True)
+
+            total    = len(visitors)
+            paginated = visitors[skip: skip + limit]
 
             return {
                 "total":    total,
-                "returned": len(visitors),
+                "returned": len(paginated),
                 "skip":     skip,
                 "limit":    limit,
-                "visitors": visitors,
+                "visitors": paginated,
             }
         except Exception as e:
             log.error("list_visitors: %s", e)
@@ -296,21 +304,32 @@ def _build_router() -> APIRouter:
         from mongodb_client import db
 
         try:
-            col = db.db["visitors"]
+            all_docs = db.collection("visitors").stream_all()
+            visitors = [d.to_dict() for d in all_docs]
 
-            total     = col.count_documents({})
-            logged_in = col.count_documents({"is_logged_in": True})
-            unknown   = col.count_documents({"is_logged_in": False})
+            total     = len(visitors)
+            logged_in = sum(1 for v in visitors if v.get("is_logged_in"))
+            unknown   = total - logged_in
 
-            latest_doc   = col.find_one({}, sort=[("last_seen", -1)])
-            latest_visit = latest_doc["last_seen"] if latest_doc else None
-
-            top_visitors = list(
-                col.find(
-                    {},
-                    {"_id": 0, "ip": 1, "name": 1, "visit_count": 1, "last_seen": 1},
-                ).sort("visit_count", -1).limit(5)
+            # Most recent visit
+            sorted_by_time = sorted(
+                visitors, key=lambda v: v.get("last_seen", ""), reverse=True
             )
+            latest_visit = sorted_by_time[0]["last_seen"] if sorted_by_time else None
+
+            # Top 5 by visit_count
+            top_visitors = sorted(
+                visitors, key=lambda v: v.get("visit_count", 0), reverse=True
+            )[:5]
+            top_visitors = [
+                {
+                    "ip":          v.get("ip"),
+                    "name":        v.get("name"),
+                    "visit_count": v.get("visit_count", 0),
+                    "last_seen":   v.get("last_seen"),
+                }
+                for v in top_visitors
+            ]
 
             return {
                 "total_unique_ips": total,
@@ -333,9 +352,10 @@ def _build_router() -> APIRouter:
         from mongodb_client import db
 
         try:
-            result = db.db["visitors"].delete_one({"ip": ip_addr})
-            if result.deleted_count == 0:
+            doc = db.collection("visitors").document(ip_addr).get()
+            if not doc.exists:
                 raise HTTPException(404, detail=f"Visitor {ip_addr} not found")
+            db.collection("visitors").document(ip_addr).delete()
             log.info("visitor_tracker: deleted record for %s", ip_addr)
             return {"deleted": True, "ip": ip_addr}
         except HTTPException:
@@ -353,7 +373,7 @@ def _build_router() -> APIRouter:
 
 def add_visitor_tracking(app) -> APIRouter:
     """
-    Attach the VisitorTrackingMiddleware to the FastAPI app and return the
+    Attach VisitorTrackingMiddleware to the FastAPI app and return the
     admin router ready to be registered.
 
     Call in main.py AFTER add_ddos_protection(app):
