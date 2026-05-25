@@ -1,12 +1,13 @@
 """
-routers/dashboard.py  —  Activity Dashboard API  (v2 — Enriched)
-=================================================================
+routers/dashboard.py  —  Activity Dashboard API  (v3 — Anonymous Tracking)
+============================================================================
 Tracks every time a user opens a popup in the STEAMI app.
 This data powers the admin dashboard, user activity view, and the
 upcoming recommendation system.
 
-HOW IT WORKS (v2):
+HOW IT WORKS (v3):
   1. Frontend calls POST /api/dashboard/event with popup_type + popup_id.
+     Auth is NOW OPTIONAL — logged-out visitors are tracked as anonymous guests.
   2. The API fetches the full content of that item from our own collections
      (explainers / research_articles / ai_insights / articles / simulations).
   3. Keywords are extracted from the content using TF-IDF-style term scoring
@@ -17,25 +18,40 @@ HOW IT WORKS (v2):
   6. An admin-only endpoint generates a CSV export of all enriched events —
      ready to feed into a recommendation pipeline.
 
+ANONYMOUS / GUEST TRACKING:
+  - Unauthenticated requests are accepted; no token required.
+  - If the request includes a valid Bearer token the event is attributed to
+    that authenticated user as before.
+  - If NO token is present the caller must supply a stable `guest_id` in the
+    request body (a UUID generated and persisted by the frontend in
+    localStorage / a cookie).  This lets us track returning anonymous visitors
+    across sessions without requiring login.
+  - Anonymous events are stored with uid = "guest:<guest_id>" and
+    user_role = "guest".  They are visible in the admin event log and CSV
+    export.  They are excluded from /dashboard/me (which is auth-only).
+
 POPUP TYPES tracked:
   research_article | ai_insight | explainer | simulation
 
 ENDPOINTS (unchanged):
-  POST /api/dashboard/event              — log a popup open (requires auth)
+  POST /api/dashboard/event              — log a popup open (auth OPTIONAL — guests allowed)
   GET  /api/dashboard/me                 — own activity summary (requires auth)
   GET  /api/dashboard/subject-intelligence — per-subject engagement scores (requires auth)
   GET  /api/dashboard/admin              — platform-wide stats (admin only)
   GET  /api/dashboard/admin/events       — raw event log (admin only)
 
 ENDPOINTS (new):
+  PATCH /api/dashboard/event/{id}/duration — record read duration (auth optional for guests)
   GET  /api/dashboard/admin/export-csv   — full enriched event CSV (admin only)
   GET  /api/dashboard/admin/user-profiles — per-user interest profile (admin only)
   GET  /api/dashboard/admin/content-heatmap — content × subject engagement matrix (admin only)
 
 MongoDB collection: `popup_events`
-Fields (v2): id, uid, popup_type, popup_id, popup_title, opened_at, date, hour,
+Fields (v3): id, uid, user_name, user_role, popup_type, popup_id, popup_title,
+             opened_at, date, hour, week, month,
              subject, keywords (list[str]), content_snippet (str),
-             read_duration_seconds (int | null), device_type (str)
+             read_duration_seconds (int | null), device_type (str),
+             is_guest (bool)   ← NEW in v3
 """
 
 import csv
@@ -47,7 +63,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -458,12 +474,24 @@ def _build_subject_scores(events: list[dict], user_interests: list[str]) -> list
 class PopupEventBody(BaseModel):
     """
     Sent by the frontend when a popup is OPENED.
+
+    Auth is optional (v3). Behaviour:
+      - If a valid Bearer token is present  → event is attributed to that user.
+      - If NO token is present              → supply guest_id (a UUID the
+        frontend generates once and stores in localStorage / a cookie) so
+        the same anonymous visitor can be identified across page loads.
+        If guest_id is omitted too, a one-shot random UUID is used — the
+        event is still logged but cannot be correlated with future events.
+
     user_name / user_role are resolved server-side from the auth token.
     """
     popup_type:  str
     popup_id:    str
     popup_title: str = ""
     device_type: str = "unknown"   # mobile | desktop | tablet | unknown
+    # Optional: stable guest identifier supplied by the frontend for
+    # unauthenticated visitors (stored in localStorage as steami_guest_id).
+    guest_id:    str = ""
 
 
 class DurationPatchBody(BaseModel):
@@ -476,17 +504,43 @@ class DurationPatchBody(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# OPTIONAL AUTH HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _optional_auth(request: Request) -> dict | None:
+    """
+    Try to decode a Bearer token from the Authorization header.
+    Returns the decoded JWT payload dict if valid, or None if absent/invalid.
+
+    This lets a single endpoint serve both authenticated users and anonymous
+    guests without raising a 401 when no token is present.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header[len("Bearer "):].strip()
+    if not token:
+        return None
+    try:
+        # Reuse the same JWT verification logic already in auth.py
+        from auth import decode_token   # import locally to avoid circular deps
+        return decode_token(token)
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post(
     "/event",
     status_code = 201,
-    summary     = "Log popup open event — requires auth",
+    summary     = "Log popup open event — auth optional (guests allowed)",
 )
-def log_popup_event(
+async def log_popup_event(
     body:    PopupEventBody,
-    payload: dict = Depends(require_auth),
+    request: Request,
 ):
     """
     POST /api/dashboard/event
@@ -495,15 +549,25 @@ def log_popup_event(
     including the auto-assigned event_id — the frontend stores this id
     and sends it to PATCH /event/{id}/duration when the popup closes.
 
+    Authentication is OPTIONAL (v3):
+      • Authenticated users  — send a valid Bearer token as usual.
+        The event is attributed to that user (uid, name, role).
+      • Anonymous / guest    — omit the token and include a stable
+        guest_id UUID in the request body (generated once by the frontend
+        and persisted in localStorage as steami_guest_id).
+        The event uid is set to "guest:<guest_id>" and user_role to "guest".
+        If guest_id is also omitted, a random one-shot UUID is used.
+
     Body:
     {
       "popup_type":  "explainer",
       "popup_id":    "quantum-dog",
       "popup_title": "The Quantum Dog: Schrödinger's Pet Paradox",
-      "device_type": "desktop"
+      "device_type": "desktop",
+      "guest_id":    ""   // optional — only needed when not logged in
     }
 
-    NOTE: read_duration_seconds is NOT accepted here any more.
+    NOTE: read_duration_seconds is NOT accepted here.
     Send it via PATCH /api/dashboard/event/{id}/duration on close.
     """
     if body.popup_type not in VALID_POPUP_TYPES:
@@ -515,32 +579,42 @@ def log_popup_event(
     if not body.popup_id.strip():
         raise HTTPException(400, detail="popup_id is required.")
 
-    uid      = get_uid(payload)
-    event_id = str(uuid.uuid4())
-    now      = datetime.now(timezone.utc)
+    # ── Resolve identity: authenticated user or anonymous guest ──────────────
+    payload   = await _optional_auth(request)
+    is_guest  = payload is None
+    event_id  = str(uuid.uuid4())
+    now       = datetime.now(timezone.utc)
 
-    # ── Resolve user name + role from the users collection ───────────────────
-    user_name = "Unknown"
-    user_role = "user"
-    try:
-        user_doc = db.collection("users").document(uid).get()
-        if user_doc.exists:
-            u = user_doc.to_dict()
-            user_name = (
-                u.get("full_name")
-                or u.get("display_name")
-                or u.get("name")
-                or u.get("email", "Unknown")
-            )
-            user_role = u.get("role", "user") or "user"
-    except Exception as e:
-        log.warning("log_popup_event: user lookup failed uid=%s: %s", uid, e)
-
-    # Normalise role to one of: admin | mod | user
-    _ROLE_MAP = {"moderator": "mod", "administrator": "admin"}
-    user_role = _ROLE_MAP.get(user_role.lower(), user_role.lower())
-    if user_role not in ("admin", "mod", "user"):
+    if is_guest:
+        # Use the caller-supplied guest_id, or mint a one-shot UUID
+        raw_guest_id = body.guest_id.strip() or str(uuid.uuid4())
+        uid       = f"guest:{raw_guest_id}"
+        user_name = "Guest"
+        user_role = "guest"
+    else:
+        uid = get_uid(payload)
+        # ── Resolve user name + role from the users collection ────────────────
+        user_name = "Unknown"
         user_role = "user"
+        try:
+            user_doc = db.collection("users").document(uid).get()
+            if user_doc.exists:
+                u = user_doc.to_dict()
+                user_name = (
+                    u.get("full_name")
+                    or u.get("display_name")
+                    or u.get("name")
+                    or u.get("email", "Unknown")
+                )
+                user_role = u.get("role", "user") or "user"
+        except Exception as e:
+            log.warning("log_popup_event: user lookup failed uid=%s: %s", uid, e)
+
+        # Normalise role to one of: admin | mod | user
+        _ROLE_MAP = {"moderator": "mod", "administrator": "admin"}
+        user_role = _ROLE_MAP.get(user_role.lower(), user_role.lower())
+        if user_role not in ("admin", "mod", "user"):
+            user_role = "user"
 
     # ── Resolve device type — fall back to "desktop" not "unknown" ────────────
     device_type = body.device_type if body.device_type in ("mobile", "tablet", "desktop") else "desktop"
@@ -560,12 +634,13 @@ def log_popup_event(
 
     event = {
         # Core identity
-        "id":  event_id,
-        "uid": uid,
+        "id":       event_id,
+        "uid":      uid,
+        "is_guest": is_guest,   # ★ v3 — True for anonymous visitors
 
-        # ── NEW: user identity columns ─────────────────────────────────────────
-        "user_name": user_name,   # full name, email fallback, or "Unknown"
-        "user_role": user_role,   # admin | mod | user
+        # User identity columns
+        "user_name": user_name,   # full name, email fallback, "Guest", or "Unknown"
+        "user_role": user_role,   # admin | mod | user | guest
 
         # Popup metadata
         "popup_type":  body.popup_type,
@@ -596,20 +671,20 @@ def log_popup_event(
         raise HTTPException(500, detail=str(e))
 
     log.info(
-        "popup event: uid=%s type=%s id=%s subject=%s user=%s role=%s",
-        uid, body.popup_type, body.popup_id, subject, user_name, user_role,
+        "popup event: uid=%s type=%s id=%s subject=%s user=%s role=%s guest=%s",
+        uid, body.popup_type, body.popup_id, subject, user_name, user_role, is_guest,
     )
     return event
 
 
 @router.patch(
     "/event/{event_id}/duration",
-    summary = "Record read duration when a popup closes — requires auth",
+    summary = "Record read duration when a popup closes — auth optional (guests allowed)",
 )
-def patch_event_duration(
+async def patch_event_duration(
     event_id: str,
     body:     DurationPatchBody,
-    payload:  dict = Depends(require_auth),
+    request:  Request,
 ):
     """
     PATCH /api/dashboard/event/{event_id}/duration
@@ -620,6 +695,13 @@ def patch_event_duration(
 
     Body: { "read_duration_seconds": 142 }
 
+    Authentication is OPTIONAL (v3) — mirrors POST /event:
+      • Authenticated users  — verified by Bearer token; uid must match.
+      • Guest users          — event uid must start with "guest:"; the
+        caller proves ownership by supplying the same guest_id that was
+        used when logging the open event (passed in the body as guest_id,
+        or we fall back to comparing the full uid string).
+
     Rules:
     - Only the owner (uid match) or an admin can patch an event.
     - Duration must be >= 2 seconds (ignore accidental fast closes).
@@ -629,7 +711,10 @@ def patch_event_duration(
         return {"ok": True, "skipped": "duration too short"}
 
     duration = min(body.read_duration_seconds, 7200)
-    uid = get_uid(payload)
+
+    # ── Resolve caller identity ───────────────────────────────────────────────
+    payload  = await _optional_auth(request)
+    is_guest = payload is None
 
     try:
         doc_ref = db.collection("popup_events").document(event_id)
@@ -637,16 +722,30 @@ def patch_event_duration(
         if not doc.exists:
             raise HTTPException(404, detail="Event not found")
 
-        ev = doc.to_dict()
-        # Only allow owner or admin to patch
-        if ev.get("uid") != uid:
-            user_doc = db.collection("users").document(uid).get()
-            role = user_doc.to_dict().get("role", "user") if user_doc.exists else "user"
-            if role not in ("admin", "mod", "moderator"):
+        ev         = doc.to_dict()
+        stored_uid = ev.get("uid", "")
+
+        if is_guest:
+            # Guest ownership check: the stored uid must start with "guest:"
+            # and the raw guest_id portion must match what the caller supplies
+            # via the X-Guest-Id header (or fall back to checking the full uid).
+            caller_guest_id = request.headers.get("X-Guest-Id", "").strip()
+            expected_uid    = f"guest:{caller_guest_id}" if caller_guest_id else None
+            if not stored_uid.startswith("guest:"):
                 raise HTTPException(403, detail="Not authorised to patch this event")
+            if expected_uid and stored_uid != expected_uid:
+                raise HTTPException(403, detail="Guest ID does not match event owner")
+        else:
+            uid = get_uid(payload)
+            if stored_uid != uid:
+                # Allow admins / mods to patch any event
+                user_doc = db.collection("users").document(uid).get()
+                role = user_doc.to_dict().get("role", "user") if user_doc.exists else "user"
+                if role not in ("admin", "mod", "moderator"):
+                    raise HTTPException(403, detail="Not authorised to patch this event")
 
         doc_ref.update({"read_duration_seconds": duration})
-        log.info("duration patched: event=%s uid=%s duration=%d", event_id, uid, duration)
+        log.info("duration patched: event=%s duration=%d guest=%s", event_id, duration, is_guest)
         return {"ok": True, "event_id": event_id, "read_duration_seconds": duration}
 
     except HTTPException:
@@ -914,18 +1013,22 @@ def admin_dashboard(payload: dict = Depends(require_admin)):
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
-    unique_users: set[str]       = set()
-    by_type:      dict[str, int] = {t: 0 for t in VALID_POPUP_TYPES}
-    by_date:      dict[str, int] = defaultdict(int)
-    by_subject:   dict[str, int] = defaultdict(int)
+    unique_users:  set[str]       = set()
+    unique_guests: set[str]       = set()
+    by_type:       dict[str, int] = {t: 0 for t in VALID_POPUP_TYPES}
+    by_date:       dict[str, int] = defaultdict(int)
+    by_subject:    dict[str, int] = defaultdict(int)
     keyword_counts: dict[str, int] = defaultdict(int)
-    item_counts:  dict[str, dict] = {}
+    item_counts:   dict[str, dict] = {}
     device_counts: dict[str, int] = defaultdict(int)
 
     for ev in events:
         uid = ev.get("uid", "")
         if uid:
-            unique_users.add(uid)
+            if ev.get("is_guest") or uid.startswith("guest:"):
+                unique_guests.add(uid)
+            else:
+                unique_users.add(uid)
 
         t = ev.get("popup_type", "")
         if t in by_type:
@@ -965,14 +1068,16 @@ def admin_dashboard(payload: dict = Depends(require_admin)):
     )[:20]
 
     return {
-        "total_events":   len(events),
-        "unique_users":   len(unique_users),
-        "by_type":        by_type,
-        "by_date":        dict(sorted(by_date.items(), reverse=True)[:30]),
-        "by_subject":     dict(sorted(by_subject.items(), key=lambda x: x[1], reverse=True)),
-        "top_items":      top_items,
-        "top_keywords":   top_keywords,           # ★ new
-        "device_counts":  dict(device_counts),    # ★ new
+        "total_events":    len(events),
+        "unique_users":    len(unique_users),    # authenticated users only
+        "unique_guests":   len(unique_guests),   # ★ v3 — anonymous visitors
+        "total_visitors":  len(unique_users) + len(unique_guests),  # ★ v3
+        "by_type":         by_type,
+        "by_date":         dict(sorted(by_date.items(), reverse=True)[:30]),
+        "by_subject":      dict(sorted(by_subject.items(), key=lambda x: x[1], reverse=True)),
+        "top_items":       top_items,
+        "top_keywords":    top_keywords,
+        "device_counts":   dict(device_counts),
     }
 
 
@@ -1028,8 +1133,9 @@ def admin_events(
 _CSV_COLUMNS = [
     "id",
     "uid",
-    "user_name",               # full name or "Unknown" for unauthenticated
-    "user_role",               # admin | mod | user
+    "is_guest",                # ★ v3 — True for anonymous visitors
+    "user_name",               # full name, "Guest" for anonymous, or "Unknown"
+    "user_role",               # admin | mod | user | guest
     "opened_at",
     "date",
     "hour",
@@ -1201,6 +1307,8 @@ def admin_user_profiles(
         if uid not in user_data:
             user_data[uid] = {
                 "uid":             uid,
+                "is_guest":        ev.get("is_guest") or uid.startswith("guest:"),  # ★ v3
+                "user_name":       ev.get("user_name", "Guest" if uid.startswith("guest:") else "Unknown"),
                 "total_events":    0,
                 "subject_counts":  defaultdict(int),
                 "keyword_counts":  defaultdict(int),
@@ -1247,6 +1355,8 @@ def admin_user_profiles(
 
         profiles.append({
             "uid":                uid,
+            "is_guest":           u.get("is_guest", False),   # ★ v3
+            "user_name":          u.get("user_name", "Unknown"),  # ★ v3
             "total_events":       u["total_events"],
             "top_subject":        top_subject,
             "subject_counts":     subject_counts,
