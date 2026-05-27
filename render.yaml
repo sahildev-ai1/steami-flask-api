@@ -1,0 +1,75 @@
+# render.yaml — Infrastructure as Code for Render
+# Deploy all three services from one repo push.
+# Docs: https://render.com/docs/blueprint-spec
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── 1. FastAPI Web Service (existing) ───────────────────────────────────────
+  - type: web
+    name: steami-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile          # your original Dockerfile
+    plan: starter                         # change to "standard" if needed
+    envVars:
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: steami-redis
+          property: connectionString
+      # ── Copy all your existing env vars here ──
+      - key: MAILRELAY_API_KEY
+        sync: false                       # set manually in Render dashboard
+      - key: MAILRELAY_ACCOUNT
+        sync: false
+      - key: MAILRELAY_SENDER_EMAIL
+        sync: false
+      - key: MAILRELAY_SENDER_NAME
+        sync: false
+      - key: SITE_URL
+        sync: false
+      - key: SITE_NAME
+        sync: false
+      - key: API_BASE_URL
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+
+  # ── 2. Celery Background Worker (NEW) ───────────────────────────────────────
+  - type: worker
+    name: steami-celery-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile.worker   # the new worker Dockerfile
+    plan: starter
+    envVars:
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: steami-redis
+          property: connectionString
+      # Same env vars as web service (worker needs DB + MailRelay access)
+      - key: MAILRELAY_API_KEY
+        sync: false
+      - key: MAILRELAY_ACCOUNT
+        sync: false
+      - key: MAILRELAY_SENDER_EMAIL
+        sync: false
+      - key: MAILRELAY_SENDER_NAME
+        sync: false
+      - key: SITE_URL
+        sync: false
+      - key: SITE_NAME
+        sync: false
+      - key: API_BASE_URL
+        sync: false
+      - key: MONGO_URI
+        sync: false
+
+  # ── 3. Redis (NEW) ───────────────────────────────────────────────────────────
+databases:
+  - type: redis
+    name: steami-redis
+    plan: free                            # 25 MB — plenty for a task queue
+    ipAllowList: []                       # only internal Render network access

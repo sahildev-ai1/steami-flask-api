@@ -98,3 +98,8 @@ watchfiles==1.1.1
 wcwidth==0.6.0
 webencodings==0.5.1
 websockets==16.0
+
+# ── Celery + Redis (added for newsletter automation) ──────────────────────────
+celery==5.4.0
+redis==5.2.1
+supervisor==4.2.5

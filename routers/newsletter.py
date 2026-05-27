@@ -24,7 +24,7 @@ CHART GENERATION:
   4. Return chart URL + AI-written explanation text
 
 ENV VARS (all existing + new):
-  BREVO_API_KEY, BREVO_SENDER_EMAIL, BREVO_SENDER_NAME, SITE_URL, SITE_NAME
+  MAILRELAY_API_KEY, MAILRELAY_ACCOUNT, MAILRELAY_SENDER_EMAIL, MAILRELAY_SENDER_NAME, SITE_URL, SITE_NAME
   OLLAMA_API_KEY  — for chart generation (reuses ollama_agent config)
   OLLAMA_HOST     — optional local ollama host
   OLLAMA_MODEL    — default gemma4:31b-cloud
@@ -60,13 +60,14 @@ CHART_STORE_DIR = CHART_IMAGE_DIR
 log = logging.getLogger(__name__)
 router = APIRouter()
 
-# ── Brevo config ──────────────────────────────────────────────────────────────
-BREVO_API_KEY      = os.getenv("BREVO_API_KEY", "")
-BREVO_SENDER_EMAIL = os.getenv("BREVO_SENDER_EMAIL", "hello@steami.com")
-BREVO_SENDER_NAME  = os.getenv("BREVO_SENDER_NAME", "STEAMI Newsletter")
-BREVO_API_BASE     = "https://api.brevo.com/v3"
-SITE_URL           = os.getenv("SITE_URL",  "https://steami.com")
-SITE_NAME          = os.getenv("SITE_NAME", "STEAMI")
+# ── MailRelay config ──────────────────────────────────────────────────────────
+MAILRELAY_API_KEY      = os.getenv("MAILRELAY_API_KEY", "")
+MAILRELAY_ACCOUNT      = os.getenv("MAILRELAY_ACCOUNT", "")   # e.g. "mycompany" from mycompany.ipzmarketing.com
+MAILRELAY_SENDER_EMAIL = os.getenv("MAILRELAY_SENDER_EMAIL", "hello@steami.com")
+MAILRELAY_SENDER_NAME  = os.getenv("MAILRELAY_SENDER_NAME", "STEAMI Newsletter")
+MAILRELAY_API_BASE     = f"https://{MAILRELAY_ACCOUNT}.ipzmarketing.com/api/v1" if MAILRELAY_ACCOUNT else ""
+SITE_URL               = os.getenv("SITE_URL",  "https://steami.com")
+SITE_NAME              = os.getenv("SITE_NAME", "STEAMI")
 # Base URL of this FastAPI backend — used to resolve relative image paths in emails.
 # e.g. https://steami-flask-api.onrender.com
 API_BASE_URL       = os.getenv("API_BASE_URL", "").rstrip("/")
@@ -171,46 +172,51 @@ def _now() -> str:
 def _today_str() -> str:
     return datetime.now(timezone.utc).strftime("%B %d, %Y")
 
-def _brevo_headers() -> dict:
-    if not BREVO_API_KEY:
+def _mailrelay_headers() -> dict:
+    if not MAILRELAY_API_KEY:
         raise HTTPException(503, detail=(
-            "Brevo API key not configured. "
-            "Set BREVO_API_KEY in your .env → https://app.brevo.com"
+            "MailRelay API key not configured. "
+            "Set MAILRELAY_API_KEY in your .env → https://mailrelay.com/en/"
+        ))
+    if not MAILRELAY_ACCOUNT:
+        raise HTTPException(503, detail=(
+            "MailRelay account name not configured. "
+            "Set MAILRELAY_ACCOUNT in your .env (e.g. 'mycompany' from mycompany.ipzmarketing.com)"
         ))
     return {
         "accept":       "application/json",
         "content-type": "application/json",
-        "api-key":      BREVO_API_KEY,
+        "x-auth-token": MAILRELAY_API_KEY,
     }
 
-def _send_one_via_brevo(to_email: str, to_name: str, subject: str, html_body: str) -> bool:
+def _send_one_via_mailrelay(to_email: str, to_name: str, subject: str, html_body: str) -> bool:
     payload = {
-        "sender": {"name": BREVO_SENDER_NAME, "email": BREVO_SENDER_EMAIL},
-        "to":     [{"email": to_email, "name": to_name or to_email}],
-        "subject": subject,
-        "htmlContent": html_body,
+        "from":      {"email": MAILRELAY_SENDER_EMAIL, "name": MAILRELAY_SENDER_NAME},
+        "to":        [{"email": to_email, "name": to_name or to_email}],
+        "subject":   subject,
+        "html_part": html_body,
     }
     try:
-        resp = http.post(f"{BREVO_API_BASE}/smtp/email",
-                         headers=_brevo_headers(), json=payload, timeout=30)
+        resp = http.post(f"{MAILRELAY_API_BASE}/send_emails",
+                         headers=_mailrelay_headers(), json=payload, timeout=30)
         if resp.status_code in (200, 201):
-            log.info("Brevo sent to %s", to_email)
+            log.info("MailRelay sent to %s", to_email)
             return True
-        log.error("Brevo failed %s: HTTP %d — %s", to_email, resp.status_code, resp.text[:300])
+        log.error("MailRelay failed %s: HTTP %d — %s", to_email, resp.status_code, resp.text[:300])
         return False
     except Exception as e:
-        log.error("Brevo exception %s: %s", to_email, e)
+        log.error("MailRelay exception %s: %s", to_email, e)
         return False
 
-def _brevo_sync_contact(email: str, name: str = ""):
-    """Create/update contact in Brevo (best-effort)."""
-    if not BREVO_API_KEY:
+def _mailrelay_sync_subscriber(email: str, name: str = ""):
+    """Create/update subscriber in MailRelay (best-effort)."""
+    if not MAILRELAY_API_KEY or not MAILRELAY_ACCOUNT:
         return
     try:
         http.post(
-            f"{BREVO_API_BASE}/contacts",
-            headers=_brevo_headers(),
-            json={"email": email, "attributes": {"FIRSTNAME": name}, "updateEnabled": True},
+            f"{MAILRELAY_API_BASE}/subscribers",
+            headers=_mailrelay_headers(),
+            json={"status": "active", "email": email, "name": name},
             timeout=10,
         )
     except Exception:
@@ -1443,7 +1449,7 @@ def send_custom_newsletter(draft: NewsletterDraft, payload: dict = Depends(requi
         name      = sub.get("name", "")
         html_body = _build_custom_html(draft_dict, signal_articles, recipient_name=name)
 
-        if _send_one_via_brevo(email, name, subject, html_body):
+        if _send_one_via_mailrelay(email, name, subject, html_body):
             sent += 1
         else:
             failed += 1
@@ -1527,7 +1533,7 @@ def subscribe(body: SubscribeBody):
         db.collection("newsletter_subscribers").document(existing[0].id).update({
             "subscribed": True, "updated_at": _now(), "name": name or doc.get("name", ""),
         })
-        _brevo_sync_contact(email, name)
+        _mailrelay_sync_subscriber(email, name)
         return f"Resubscribed: {email}"
 
     sub_id = str(uuid.uuid4())
@@ -1537,7 +1543,7 @@ def subscribe(body: SubscribeBody):
         "subscribed": True, "source": "web_modal",
         "created_at": _now(), "is_active": True,
     })
-    _brevo_sync_contact(email, name)
+    _mailrelay_sync_subscriber(email, name)
     log.info("newsletter subscribe: %s", email)
     return f"Subscribed: {email}"
 
@@ -1562,13 +1568,13 @@ def unsubscribe(body: UnsubscribeBody):
     db.collection("newsletter_subscribers").document(docs[0].id).update({
         "subscribed": False, "is_active": False, "unsubscribed_at": _now(),
     })
-    # Unsubscribe from Brevo list too (best-effort)
-    if BREVO_API_KEY:
+    # Unsubscribe from MailRelay too (best-effort)
+    if MAILRELAY_API_KEY and MAILRELAY_ACCOUNT:
         try:
-            http.put(
-                f"{BREVO_API_BASE}/contacts/{email}",
-                headers=_brevo_headers(),
-                json={"emailBlacklisted": True},
+            http.post(
+                f"{MAILRELAY_API_BASE}/subscribers",
+                headers=_mailrelay_headers(),
+                json={"status": "unsubscribed", "email": email},
                 timeout=10,
             )
         except Exception:
@@ -1619,7 +1625,7 @@ def send_daily_digest(
 
     for sub in subscribers:
         html_body = _build_old_digest_html(articles, recipient_name=sub.get("name", ""))
-        if _send_one_via_brevo(sub["email"], sub.get("name", ""), subject, html_body):
+        if _send_one_via_mailrelay(sub["email"], sub.get("name", ""), subject, html_body):
             sent += 1
         else:
             failed += 1
@@ -1708,7 +1714,7 @@ def send_test_email(body: TestEmailBody, payload: dict = Depends(require_mod)):
         articles  = [d.to_dict() for d in docs]
         html_body = _build_old_digest_html(articles)
 
-    success = _send_one_via_brevo(body.to_email, "", subject, html_body)
+    success = _send_one_via_mailrelay(body.to_email, "", subject, html_body)
     return {"sent": 1 if success else 0, "failed": 0 if success else 1,
             "to_email": body.to_email, "success": success}
 
@@ -1735,7 +1741,7 @@ def ai_agent_subscribe(body: AiSubscribeBody):
             db.collection("newsletter_subscribers").document(existing_list[0].id).update({
                 "subscribed": True, "source": source, "updated_at": _now(),
             })
-            _brevo_sync_contact(email, name)
+            _mailrelay_sync_subscriber(email, name)
         return {"subscribed": True, "email": email, "already_existed": True,
                 "message": f"This email is already subscribed to {SITE_NAME}."}
 
@@ -1745,7 +1751,7 @@ def ai_agent_subscribe(body: AiSubscribeBody):
         "subscribed": True, "source": source,
         "metadata": body.metadata or {}, "created_at": _now(),
     })
-    _brevo_sync_contact(email, name)
+    _mailrelay_sync_subscriber(email, name)
     return {"subscribed": True, "email": email, "already_existed": False,
             "message": f"Successfully subscribed to {SITE_NAME} daily newsletter."}
 
