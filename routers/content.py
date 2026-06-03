@@ -1409,6 +1409,33 @@ def delete_blog_post(
     return {"deleted": True, "id": post_id, "image_deleted": deleted_file}
 
 
+@router.post("/blog/content-image", tags=["Blog"])
+async def upload_blog_content_image(
+    image:   UploadFile = File(..., description="Inline image inserted into blog rich-text body"),
+    payload: dict       = Depends(require_mod),
+):
+    """
+    POST /api/blog/content-image  (multipart/form-data)
+    MOD/ADMIN — upload an inline image that has been inserted into the
+    RichTextEditor body (NOT a cover image).  Returns a permanent Cloudinary
+    CDN URL that the editor swaps in for the temporary blob: URL immediately
+    after the user picks an image file.
+
+    File field name:  image
+    Response:         { "url": "https://res.cloudinary.com/..." }
+
+    curl -X POST http://127.0.0.1:5000/api/blog/content-image \\
+      -H "Authorization: Bearer <mod_token>" \\
+      -F "image=@/path/to/photo.jpg"
+    """
+    import uuid as _cuuid
+    ext      = os.path.splitext(image.filename or "")[-1].lower() or ".jpg"
+    filename = f"content_{_cuuid.uuid4().hex[:12]}{ext}"
+    img_url  = _save_file(image, "blog", filename)
+    log.info("Blog content image uploaded: %s by %s", img_url, get_uid(payload))
+    return {"url": img_url}
+
+
 @router.post("/blog/{post_id}/cover-image", tags=["Blog"])
 async def upload_blog_cover_image(
     post_id: str,
