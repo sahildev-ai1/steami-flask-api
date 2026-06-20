@@ -23,21 +23,34 @@ DUMMY ACCOUNTS (seeded on startup):
   user@steami.dev    /  User@steami123    — role: user
 
 ALL ENDPOINTS:
-  POST   /api/auth/seed                 public — seed dummy accounts
-  POST   /api/auth/signup               public — register (auto-subscribes newsletter)
-  POST   /api/auth/login                public — login → token + user + role
-  GET    /api/auth/me                   auth   — own profile
-  POST   /api/auth/interests            auth   — save topic interests
-  GET    /api/auth/interests            auth   — get own interests
-  GET    /api/auth/users                admin  — list all users
-  PUT    /api/auth/users/{uid}/role     admin  — change role
-  DELETE /api/auth/users/{uid}          admin  — delete user
+  POST   /api/auth/seed                     public — seed dummy accounts
+  POST   /api/auth/signup                   public — register (auto-subscribes newsletter)
+  POST   /api/auth/login                    public — login → token + user + role
+  GET    /api/auth/me                       auth   — own profile
+  POST   /api/auth/interests                auth   — save topic interests
+  GET    /api/auth/interests                auth   — get own interests
+  GET    /api/auth/users                    admin  — list all users
+  PUT    /api/auth/users/{uid}/role         admin  — change role
+  DELETE /api/auth/users/{uid}              admin  — delete user
+  POST   /api/auth/forgot-password          public — request a 6-digit reset code by email
+  POST   /api/auth/forgot-password/verify   public — verify the code → short-lived reset_token
+  POST   /api/auth/forgot-password/reset    public — set a new password using the reset_token
+
+PASSWORD RESET FLOW (added — was previously frontend-only/simulated):
+  1. POST /forgot-password        { email }                            → generic "sent" message
+  2. POST /forgot-password/verify { email, code }                      → { reset_token }
+  3. POST /forgot-password/reset  { email, reset_token, new_password } → { reset: true }
+  Codes are 6 digits, expire in 10 minutes, max 5 attempts. The reset_token issued after
+  verification expires in 15 minutes and is single-use. Records live in the
+  `password_resets` collection. The endpoint never reveals whether an email is registered.
 """
 
 import uuid
 import logging
 import os
-from datetime import datetime, timezone
+import random
+import secrets
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Depends
@@ -683,3 +696,220 @@ def admin_toggle_subscription(uid: str, payload: dict = Depends(require_admin)):
     message = "Subscribed to daily email digest" if new_value else "Unsubscribed from daily email digest"
     log.info("admin_toggle_subscription: uid=%s %s→%s by admin=%s", uid, current, new_value, get_uid(payload))
     return {"updated": True, "uid": uid, "subscribe_email": new_value, "message": message}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FORGOT PASSWORD — request code / verify code / set new password
+#
+# Replaces the old frontend-only "simulate API call" mock. Three steps:
+#   1. POST /forgot-password         — email a 6-digit code, store it
+#   2. POST /forgot-password/verify  — check the code, issue a reset_token
+#   3. POST /forgot-password/reset   — consume the reset_token, set new password
+#
+# Records live in the `password_resets` collection (one doc per request).
+# Codes expire in RESET_CODE_TTL_MINUTES; the post-verification reset_token
+# expires in RESET_TOKEN_TTL_MINUTES and can only be used once.
+# ─────────────────────────────────────────────────────────────────────────────
+
+RESET_CODE_TTL_MINUTES  = 10
+RESET_TOKEN_TTL_MINUTES = 15
+MAX_RESET_ATTEMPTS      = 5
+
+
+class ForgotPasswordBody(BaseModel):
+    email: str
+
+
+class VerifyResetCodeBody(BaseModel):
+    email: str
+    code:  str
+
+
+class ResetPasswordBody(BaseModel):
+    email:        str
+    reset_token:  str
+    new_password: str
+
+
+def _gen_reset_code() -> str:
+    return f"{random.randint(0, 999999):06d}"
+
+
+def _minutes_from_now(minutes: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+
+
+def _is_expired(iso_ts: str) -> bool:
+    if not iso_ts:
+        return True
+    try:
+        expires = datetime.fromisoformat(iso_ts)
+    except Exception:
+        return True
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) > expires
+
+
+def _latest_reset_record(email: str) -> Optional[dict]:
+    """Most recent password_resets doc for this email, or None."""
+    docs = list(
+        db.collection("password_resets")
+          .where("email", "==", email)
+          .order_by("created_at", direction="DESCENDING")
+          .limit(1)
+          .stream()
+    )
+    return docs[0].to_dict() if docs else None
+
+
+@router.post("/forgot-password", summary="Request a password reset code — public")
+def forgot_password(body: ForgotPasswordBody):
+    """
+    POST /api/auth/forgot-password
+    Body: { "email": "user@example.com" }
+
+    If an account exists for this email, emails a 6-digit verification code
+    (valid for 10 minutes) and stores it in `password_resets`. Always returns
+    the same generic message — whether or not the email is registered — so
+    this endpoint can't be used to enumerate accounts.
+    """
+    email = body.email.lower().strip()
+    if "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(400, detail="Invalid email address.")
+
+    generic_response = {"message": "If that email is registered, a verification code has been sent."}
+
+    user = _find_by_email(email)
+    if not user:
+        log.info("forgot_password: no account for %s (responding generically)", email)
+        return generic_response
+
+    code     = _gen_reset_code()
+    reset_id = str(uuid.uuid4())
+
+    try:
+        db.collection("password_resets").document(reset_id).set({
+            "id":          reset_id,
+            "email":       email,
+            "code":        code,
+            "attempts":    0,
+            "verified":    False,
+            "used":        False,
+            "reset_token": "",
+            "expires_at":  _minutes_from_now(RESET_CODE_TTL_MINUTES),
+            "created_at":  _now(),
+        })
+    except Exception as e:
+        log.error("forgot_password: failed to store code for %s: %s", email, e)
+        raise HTTPException(500, detail="Could not start password reset. Please try again.")
+
+    try:
+        from routers.newsletter import _send_one_via_mailrelay
+        html_body = (
+            f"<p>Your STEAMI password reset code is:</p>"
+            f"<h2 style=\"letter-spacing:4px;font-family:monospace\">{code}</h2>"
+            f"<p>This code expires in {RESET_CODE_TTL_MINUTES} minutes. "
+            f"If you didn't request this, you can safely ignore this email.</p>"
+        )
+        sent = _send_one_via_mailrelay(
+            email, user.get("full_name", ""), "Your STEAMI password reset code", html_body
+        )
+        if not sent:
+            log.warning("forgot_password: email dispatch failed for %s (code stored regardless)", email)
+    except Exception as e:
+        log.error("forgot_password: email dispatch error for %s: %s", email, e)
+
+    log.info("forgot_password: code issued for %s", email)
+    return generic_response
+
+
+@router.post("/forgot-password/verify", summary="Verify a password reset code — public")
+def verify_reset_code(body: VerifyResetCodeBody):
+    """
+    POST /api/auth/forgot-password/verify
+    Body: { "email": "...", "code": "123456" }
+
+    On success, returns a short-lived reset_token (15 min, single-use) that
+    must be passed to POST /api/auth/forgot-password/reset to actually change
+    the password.
+    """
+    email = body.email.lower().strip()
+    code  = body.code.strip()
+
+    record = _latest_reset_record(email)
+    if not record:
+        raise HTTPException(400, detail="Invalid or expired code.")
+    if record.get("used"):
+        raise HTTPException(400, detail="This code has already been used. Request a new one.")
+    if _is_expired(record.get("expires_at", "")):
+        raise HTTPException(400, detail="This code has expired. Request a new one.")
+    if record.get("attempts", 0) >= MAX_RESET_ATTEMPTS:
+        raise HTTPException(429, detail="Too many incorrect attempts. Request a new code.")
+
+    if record.get("code") != code:
+        try:
+            db.collection("password_resets").document(record["id"]).update({
+                "attempts": record.get("attempts", 0) + 1,
+            })
+        except Exception as e:
+            log.error("verify_reset_code: failed to bump attempts for %s: %s", email, e)
+        raise HTTPException(400, detail="Invalid or expired code.")
+
+    reset_token = secrets.token_urlsafe(32)
+    try:
+        db.collection("password_resets").document(record["id"]).update({
+            "verified":    True,
+            "reset_token": reset_token,
+            "expires_at":  _minutes_from_now(RESET_TOKEN_TTL_MINUTES),
+        })
+    except Exception as e:
+        log.error("verify_reset_code: failed to save verification for %s: %s", email, e)
+        raise HTTPException(500, detail="Could not verify code. Please try again.")
+
+    log.info("verify_reset_code: verified for %s", email)
+    return {"verified": True, "reset_token": reset_token}
+
+
+@router.post("/forgot-password/reset", summary="Set a new password using a verified reset token — public")
+def reset_password(body: ResetPasswordBody):
+    """
+    POST /api/auth/forgot-password/reset
+    Body: { "email": "...", "reset_token": "...", "new_password": "..." }
+
+    Completes the password reset. The reset_token must match the one issued
+    by POST /api/auth/forgot-password/verify and must not be expired or
+    already used.
+    """
+    email = body.email.lower().strip()
+    if len(body.new_password) < 8:
+        raise HTTPException(400, detail="Password must be at least 8 characters.")
+
+    record = _latest_reset_record(email)
+    if not record:
+        raise HTTPException(400, detail="Reset session not found. Please start over.")
+    if record.get("used"):
+        raise HTTPException(400, detail="This reset session was already used. Please start over.")
+    if not record.get("verified"):
+        raise HTTPException(400, detail="Code not verified yet.")
+    if not body.reset_token or record.get("reset_token") != body.reset_token:
+        raise HTTPException(400, detail="Invalid reset session. Please start over.")
+    if _is_expired(record.get("expires_at", "")):
+        raise HTTPException(400, detail="Reset session expired. Please start over.")
+
+    user = _find_by_email(email)
+    if not user:
+        raise HTTPException(404, detail="Account not found.")
+
+    try:
+        db.collection("users").document(user["id"]).update({
+            "password_hash": hash_password(body.new_password),
+            "updated_at":    _now(),
+        })
+        db.collection("password_resets").document(record["id"]).update({"used": True})
+    except Exception as e:
+        log.error("reset_password: failed for %s: %s", email, e)
+        raise HTTPException(500, detail="Could not update password. Please try again.")
+
+    log.info("reset_password: password updated for %s", email)
+    return {"reset": True}
