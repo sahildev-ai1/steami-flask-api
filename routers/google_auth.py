@@ -23,6 +23,7 @@ PATCH /api/auth/profile  lets users fill in:
   - avatar_url     (custom avatar — defaults to Google photo)
 """
 
+import os
 import uuid
 import logging
 import requests as _requests
