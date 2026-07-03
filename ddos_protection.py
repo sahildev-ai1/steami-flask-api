@@ -41,6 +41,7 @@ import time
 import threading
 import logging
 import re
+import requests
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -82,6 +83,33 @@ PERMANENT_BANS: set[str]  = {ip.strip() for ip in _banned_env.split(",") if ip.s
 
 # How often to run the cleanup sweep (remove stale entries from memory)
 CLEANUP_INTERVAL: int     = 300   # every 5 minutes
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CAPTCHA (Google reCAPTCHA v2/v3) — spam signup prevention
+# ─────────────────────────────────────────────────────────────────────────────
+# If RECAPTCHA_SECRET_KEY isn't set, verify_captcha() always returns True so
+# local/dev environments keep working without extra setup — set the env var
+# in production to actually enforce it on signup.
+RECAPTCHA_SECRET_KEY: str  = os.environ.get("RECAPTCHA_SECRET_KEY", "")
+RECAPTCHA_VERIFY_URL: str  = "https://www.google.com/recaptcha/api/siteverify"
+RECAPTCHA_MIN_SCORE: float = float(os.environ.get("RECAPTCHA_MIN_SCORE", "0.5"))  # v3 only
+CAPTCHA_ENABLED: bool      = bool(RECAPTCHA_SECRET_KEY)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DISPOSABLE / SPAM EMAIL DOMAIN BLOCKLIST
+# ─────────────────────────────────────────────────────────────────────────────
+# Common throwaway-email providers used to farm free accounts. Not exhaustive —
+# extend via the DISPOSABLE_EMAIL_DOMAINS env var (comma-separated) without a
+# code change/redeploy.
+DISPOSABLE_EMAIL_DOMAINS: set[str] = {
+    "mailinator.com", "guerrillamail.com", "guerrillamail.info", "10minutemail.com",
+    "10minutemail.net", "tempmail.com", "temp-mail.org", "throwawaymail.com",
+    "yopmail.com", "trashmail.com", "getnada.com", "sharklasers.com",
+    "dispostable.com", "fakeinbox.com", "maildrop.cc", "mintemail.com",
+    "mailnesia.com", "mohmal.com", "moakt.com", "emailondeck.com",
+    "spamgourmet.com", "tempinbox.com", "discard.email", "burnermail.io",
+    "tempr.email", "mailcatch.com", "inboxbear.com", "mytemp.email",
+} | {d.strip().lower() for d in os.environ.get("DISPOSABLE_EMAIL_DOMAINS", "").split(",") if d.strip()}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -180,6 +208,55 @@ _stats = {
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+
+def verify_captcha(token: str, remote_ip: str = "") -> bool:
+    """
+    Verify a Google reCAPTCHA (v2 checkbox or v3 score-based) response token.
+
+    Returns True if:
+      - CAPTCHA enforcement is disabled (no RECAPTCHA_SECRET_KEY set — dev/local), OR
+      - the token is valid and (for v3) the score is >= RECAPTCHA_MIN_SCORE.
+
+    Returns False if the token is missing/invalid/expired, or the score is too low.
+    Never raises — a verification-service outage fails closed (returns False)
+    so it can't be used to silently disable spam protection in production.
+    """
+    if not CAPTCHA_ENABLED:
+        return True
+    if not token:
+        return False
+
+    try:
+        resp = requests.post(
+            RECAPTCHA_VERIFY_URL,
+            data={"secret": RECAPTCHA_SECRET_KEY, "response": token, "remoteip": remote_ip},
+            timeout=8,
+        )
+        result = resp.json()
+    except Exception as e:
+        log.warning("verify_captcha: siteverify request failed — %s", e)
+        return False
+
+    if not result.get("success"):
+        log.info("verify_captcha: failed — errors=%s", result.get("error-codes"))
+        return False
+
+    # v3 returns a 0.0–1.0 score; v2 checkbox responses omit "score" entirely.
+    score = result.get("score")
+    if score is not None and score < RECAPTCHA_MIN_SCORE:
+        log.info("verify_captcha: score %.2f below threshold %.2f", score, RECAPTCHA_MIN_SCORE)
+        return False
+
+    return True
+
+
+def is_disposable_email(email: str) -> bool:
+    """Return True if the email's domain is a known disposable/throwaway provider."""
+    if "@" not in email:
+        return False
+    domain = email.rsplit("@", 1)[-1].strip().lower()
+    return domain in DISPOSABLE_EMAIL_DOMAINS
+
 
 def _get_client_ip(request: Request) -> str:
     """

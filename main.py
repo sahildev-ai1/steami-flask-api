@@ -7,9 +7,17 @@ Docs:  http://127.0.0.1:5000/docs
   ── Daily Cleanup (auto + manual) ────────────────────────────────────────────
   - Runs once on startup (30 s delay) then every 24 h automatically.
   - Deletes articles, feed_articles, ai_insights, insight_queue entries
-    that are older than EXPIRY_DAYS (25 days).
+    older than 15 days — see daily_cleanup.py (ARTICLE_EXPIRY_DAYS / FEED_EXPIRY_DAYS).
+    NOTE: the EXPIRY_DAYS=25 constant below is unrelated/legacy — it only
+    logs an "expired_found" count in /api/articles/refresh and does not
+    delete anything. Actual deletion is governed entirely by daily_cleanup.py.
   - POST /api/admin/cleanup        — trigger immediately (admin)
   - GET  /api/admin/cleanup/status — scheduler / in-progress status (admin)
+
+  ── Content Refresh (auto + manual) ──────────────────────────────────────────
+  - Runs once on startup (60 s delay) then every 12 h automatically, fetching
+    new articles so content doesn't go stale between manual refreshes.
+  - POST /api/articles/refresh remains available for on-demand refreshes.
 
 CHANGES IN v11:
   ── Blog Posts ────────────────────────────────────────────────────────────────
@@ -158,6 +166,7 @@ from routers.insight_router import router as insight_router
 from routers.profile_router import router as profile_router
 from routers.notifications import router as notifications_router
 from daily_cleanup import start_cleanup_scheduler, cleanup_router
+from insight_validation import router as insight_validation_router
 from routers.syswatch import router as syswatch_router
 from visitor_tracker import add_visitor_tracking 
 
@@ -170,7 +179,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-EXPIRY_DAYS = 25
+EXPIRY_DAYS = 25   # NOTE: legacy/unused for deletion — only feeds the "expired_found"
+                    # count logged in /api/articles/refresh. Real deletion happens in
+                    # daily_cleanup.py on a 15-day window. Kept as-is to avoid changing
+                    # response shape; safe to remove once nothing depends on expired_found.
 SITE_NAME   = os.getenv("SITE_NAME", "STEAMI")
 SITE_URL    = os.getenv("SITE_URL",  "https://steami.com")
 
@@ -239,7 +251,9 @@ def on_startup():
     result = seed_dummy_accounts()
     log.info("Accounts seeded=%s skipped=%s", result["created"], result["skipped"])
     start_cleanup_scheduler()
-    log.info("Daily cleanup scheduler started — expires articles/feed older than %d days", EXPIRY_DAYS)
+    log.info("Daily cleanup scheduler started — expires articles/feed older than 15 days (see daily_cleanup.py)")
+    start_content_refresh_scheduler()
+    log.info("Content refresh scheduler started — auto-fetches new articles every %dh", AUTO_REFRESH_INTERVAL_S // 3600)
 
 
 # ── Routers ────────────────────────────────────────────────────────────────
@@ -255,6 +269,11 @@ app.include_router(notifications_router, prefix="/api/notifications", tags=["Not
 app.include_router(insight_router, prefix="/api/articles", tags=["Insights"])
 app.include_router(profile_router, prefix="/api/profile", tags=["Profile"])
 app.include_router(cleanup_router, prefix="/api/admin",   tags=["Admin"])
+# NOTE: mounted at /api/classification, NOT /api/insights — the existing
+# GET /api/insights/{article_id} route (insight_router) would otherwise
+# swallow requests to /api/insights/methodology and /api/insights/validation-stats,
+# since both are single path segments matching that {article_id} pattern.
+app.include_router(insight_validation_router, prefix="/api/classification", tags=["Insight Validation"])
 app.include_router(syswatch_router)
 app.include_router(visitors_router, prefix="/api/visitors", tags=["Visitors"]) 
 
@@ -453,6 +472,69 @@ def _start_insight_thread(article_ids: list, source_table: str = "articles") -> 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# AUTOMATIC CONTENT REFRESH SCHEDULER
+# ══════════════════════════════════════════════════════════════════════════════
+# Previously, /api/articles/refresh only ran when a mod/admin manually
+# triggered it, while daily_cleanup.py automatically deletes anything older
+# than 15 days on a fixed 24h schedule regardless of whether new content had
+# been fetched to replace it. That asymmetry is what caused News/Explainers
+# to sometimes show stale or thinning content — deletion was automatic,
+# ingestion was not. This daemon thread closes that gap by calling the same
+# refresh logic on a recurring schedule, mirroring the daily_cleanup.py
+# pattern already used in this codebase (in-process thread, no extra
+# infra/cost — consistent with why Celery+Redis was dropped for newsletters).
+
+AUTO_REFRESH_INTERVAL_S = 12 * 60 * 60   # every 12 hours
+AUTO_REFRESH_TARGET     = 20             # articles per automatic pass (lighter than manual max)
+
+_refresh_scheduler_started = False
+_refresh_scheduler_lock    = threading.Lock()
+
+
+def _content_refresh_loop() -> None:
+    """Daemon thread: runs a refresh pass on startup, then every AUTO_REFRESH_INTERVAL_S."""
+    log.info("content_refresh_scheduler: thread started — interval=%dh",
+              AUTO_REFRESH_INTERVAL_S // 3600)
+
+    # Let the app finish booting (and let daily_cleanup's own 30s delay pass) first
+    time.sleep(60)
+
+    while True:
+        try:
+            result = _run_article_refresh(ALL_DOMAINS, AUTO_REFRESH_TARGET)
+            log.info("content_refresh_scheduler: pass complete — new_saved=%s queued=%s",
+                      result.get("new_saved"), result.get("queued"))
+        except Exception as e:
+            log.error("content_refresh_scheduler: unhandled error — %s", e)
+
+        log.info("content_refresh_scheduler: sleeping %dh until next run",
+                  AUTO_REFRESH_INTERVAL_S // 3600)
+        time.sleep(AUTO_REFRESH_INTERVAL_S)
+
+
+def start_content_refresh_scheduler() -> None:
+    """
+    Start the automatic content-refresh daemon thread.
+    Safe to call multiple times — only one thread is ever started.
+    Call this inside your @app.on_event("startup") handler.
+    """
+    global _refresh_scheduler_started
+    with _refresh_scheduler_lock:
+        if _refresh_scheduler_started:
+            log.info("content_refresh_scheduler: already started — ignoring duplicate call")
+            return
+        _refresh_scheduler_started = True
+
+    t = threading.Thread(
+        target=_content_refresh_loop,
+        daemon=True,
+        name="content-refresh-scheduler",
+    )
+    t.start()
+    log.info("content_refresh_scheduler: daemon thread launched")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -535,10 +617,25 @@ def refresh_articles(
 
     Response includes insight_thread=true when background generation starts.
     Poll GET /api/articles/insights/status to track progress.
+
+    NOTE: This same logic also runs automatically every AUTO_REFRESH_INTERVAL_S
+    via the background scheduler started in on_startup() — see
+    _run_article_refresh() / start_content_refresh_scheduler() below. This
+    endpoint remains available for manual/on-demand refreshes.
     """
     active_domains = [d for d in body.domains if d in DOMAIN_KEYWORDS] or ALL_DOMAINS
     target         = min(max(1, body.target), MAX_FETCH_LIMIT)
-    cutoff         = datetime.now(timezone.utc) - timedelta(days=EXPIRY_DAYS)
+    return _run_article_refresh(active_domains, target)
+
+
+def _run_article_refresh(active_domains: list, target: int) -> dict:
+    """
+    Core refresh logic — shared by the POST /api/articles/refresh endpoint
+    and the automatic background scheduler (_content_refresh_loop).
+
+    Fetches fresh articles, saves only new ones, queues insight generation.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=EXPIRY_DAYS)
 
     # Load existing URLs + identify expired articles
     try:

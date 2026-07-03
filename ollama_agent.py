@@ -81,7 +81,17 @@ Return this exact JSON structure (fill in ALL values):
   "sentiment": "positive",
   "sentiment_label": "good_news",
   "emoji": "🚀",
-  "confidence": 0.85,
+  "confidence_factors": {{
+    "source_clarity": 0.85,
+    "claim_specificity": 0.8,
+    "domain_consensus": 0.9,
+    "note": "One short plain-English sentence (max 20 words) explaining the score."
+  }},
+  "risk_assessment": {{
+    "sentiment_score": -0.6,
+    "risk_level": "medium",
+    "rationale": "One short plain-English sentence (max 20 words) explaining the risk_level."
+  }},
   "tags": ["tag1", "tag2", "tag3", "tag4"],
   "domain": "{domain}",
   "reading_time_min": 4,
@@ -110,7 +120,33 @@ emoji — a single emoji character that best captures the article's tone AND dom
     Mathematics            → 📐 ♾️ 🎯 (positive) / 📊 (neutral) / ❌ (negative)
     Economics / Finance    → 📈 💰 🏦 (positive) / 💹 (neutral) / 📉 (negative)
     General Technology     → ✨ 💡 🔬 (positive) / 🔧 (neutral) / ⚠️ (negative)
-  Pick the single most fitting emoji — one character only, no combinations."""
+  Pick the single most fitting emoji — one character only, no combinations.
+
+confidence_factors — rate each 0.0 to 1.0, based only on THIS article's text:
+  source_clarity     — how detailed, specific, and unambiguous is the article's own
+                        reporting (0 = thin/vague, 1 = rich, detailed, precise).
+  claim_specificity  — how concrete and checkable are the central claims
+                        (0 = vague speculation, 1 = specific, falsifiable claims with numbers/methods).
+  domain_consensus    — how well the claim aligns with well-established science versus a
+                        contested or frontier finding (0 = speculative/contested,
+                        1 = well-established consensus).
+  note — one short, plain-English sentence (max 20 words) a reader could use to judge
+         the score themselves, e.g. "Based on a peer-reviewed study with specific,
+         measurable results." Do not just restate the numbers.
+
+risk_assessment — always fill in, independent of confidence_factors:
+  sentiment_score — continuous score from -1.0 (very negative/alarming) to +1.0
+                    (very positive), 0.0 = neutral. Should agree in direction with
+                    `sentiment` but capture magnitude, e.g. a mild setback might be
+                    -0.2 while a severe one is -0.9.
+  risk_level — pick exactly one of: "low", "medium", "high" — real-world severity
+               or scope, independent of sentiment category:
+    low    = minor setback, limited scope, no urgent action needed
+    medium = notable concern, moderate scope or uncertainty
+    high   = severe, urgent, wide-reaching, or safety-critical
+  rationale — one short plain-English sentence (max 20 words) explaining the
+              risk_level, e.g. "Limited to a small lab trial with no public
+              health impact yet." Do not just restate the label."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1012,6 +1048,93 @@ def generate_ai_insight(article: dict) -> dict:
     return _validate_insight(obj, title, article_url, domain)
 
 
+def _clamp01(value, default: float) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(1.0, v))
+
+
+# Weights used to derive the overall confidence score from named factors.
+# Kept in one place so the frontend "Why this score?" explainer and the
+# backend math always agree on what each factor contributes.
+CONFIDENCE_WEIGHTS = {
+    "source_clarity":    0.35,
+    "claim_specificity": 0.35,
+    "domain_consensus":  0.30,
+}
+
+
+def _build_confidence(raw_factors) -> dict:
+    """
+    Validate/clamp the three named confidence factors, derive the overall
+    `confidence` score as their weighted average (not an unexplained LLM
+    guess), and attach the weights + note so the frontend can show a full
+    "Why this score?" breakdown.
+    """
+    raw_factors = raw_factors if isinstance(raw_factors, dict) else {}
+
+    factors = {
+        "source_clarity":    _clamp01(raw_factors.get("source_clarity"),    0.6),
+        "claim_specificity": _clamp01(raw_factors.get("claim_specificity"), 0.6),
+        "domain_consensus":  _clamp01(raw_factors.get("domain_consensus"),  0.6),
+    }
+
+    overall = sum(factors[k] * w for k, w in CONFIDENCE_WEIGHTS.items())
+    overall = round(max(0.0, min(1.0, overall)), 2)
+
+    note = raw_factors.get("note")
+    if not isinstance(note, str) or not note.strip():
+        note = "Derived from source clarity, claim specificity, and domain consensus."
+
+    return {
+        "confidence": overall,
+        "confidence_factors": {
+            **factors,
+            "weights": CONFIDENCE_WEIGHTS,
+            "note": note.strip()[:200],
+        },
+    }
+
+
+_DEFAULT_RISK_BY_SENTIMENT = {
+    "negative": ("medium", -0.5),
+    "neutral":  ("low",     0.0),
+    "positive": ("low",     0.5),
+}
+
+
+def _build_risk_assessment(raw_risk: dict, sentiment: str) -> dict:
+    """
+    Validate/clamp sentiment_score + risk_level, falling back to sensible
+    sentiment-derived defaults when the LLM omits or malforms the block.
+    Powers the bad-news "risk classification" surfaced in the frontend.
+    """
+    raw_risk = raw_risk if isinstance(raw_risk, dict) else {}
+    default_level, default_score = _DEFAULT_RISK_BY_SENTIMENT.get(sentiment, ("low", 0.0))
+
+    try:
+        score = float(raw_risk.get("sentiment_score", default_score))
+        score = max(-1.0, min(1.0, score))
+    except (TypeError, ValueError):
+        score = default_score
+
+    level = raw_risk.get("risk_level")
+    if level not in ("low", "medium", "high"):
+        level = default_level
+
+    rationale = raw_risk.get("rationale")
+    if not isinstance(rationale, str) or not rationale.strip():
+        rationale = f"Auto-derived from sentiment ({sentiment}); no rationale provided by the model."
+
+    return {
+        "sentiment_score": round(score, 2),
+        "risk_level":      level,
+        "risk_rationale":  rationale.strip()[:200],
+    }
+
+
 def _validate_insight(obj: dict, title: str, article_url: str, domain: str) -> dict:
     """Clean and validate insight output — unchanged from v1."""
     sentiment = obj.get("sentiment", "neutral")
@@ -1034,11 +1157,14 @@ def _validate_insight(obj: dict, title: str, article_url: str, domain: str) -> d
     if not isinstance(obj.get("tags"), list):
         obj["tags"] = []
 
-    try:
-        obj["confidence"] = float(obj.get("confidence", 0.7))
-        obj["confidence"] = max(0.0, min(1.0, obj["confidence"]))
-    except (TypeError, ValueError):
-        obj["confidence"] = 0.7
+    conf_result = _build_confidence(obj.get("confidence_factors"))
+    obj["confidence"]         = conf_result["confidence"]
+    obj["confidence_factors"] = conf_result["confidence_factors"]
+
+    risk_result = _build_risk_assessment(obj.get("risk_assessment"), sentiment)
+    obj["sentiment_score"] = risk_result["sentiment_score"]
+    obj["risk_level"]      = risk_result["risk_level"]
+    obj["risk_rationale"]  = risk_result["risk_rationale"]
 
     try:
         obj["reading_time_min"] = int(obj.get("reading_time_min", 3))
@@ -1070,6 +1196,19 @@ def _extract(text: str, title: str, article_url: str, domain: str) -> dict:
         if not m: return []
         return re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1))
 
+    def get_nested_num(parent_key, child_key, default):
+        # Looks for "child_key": <num> anywhere after the parent object's opening brace
+        m = re.search(rf'"{parent_key}"\s*:\s*\{{.*?\}}', text, re.DOTALL)
+        block = m.group(0) if m else ""
+        m2 = re.search(rf'"{child_key}"\s*:\s*([\d.]+)', block)
+        return float(m2.group(1)) if m2 else default
+
+    def get_nested_str(parent_key, child_key):
+        m = re.search(rf'"{parent_key}"\s*:\s*\{{.*?\}}', text, re.DOTALL)
+        block = m.group(0) if m else ""
+        m2 = re.search(rf'"{child_key}"\s*:\s*"((?:[^"\\]|\\.)*)"', block)
+        return m2.group(1) if m2 else None
+
     summary   = get_str("summary")
     sentiment = get_str("sentiment") or "neutral"
     art_url   = get_str("article_url") or article_url
@@ -1083,6 +1222,19 @@ def _extract(text: str, title: str, article_url: str, domain: str) -> dict:
     sentiment = sentiment if sentiment in ("positive", "neutral", "negative") else "neutral"
     emoji     = raw_emoji if raw_emoji and len(raw_emoji) <= 8 else _fallback_emoji(sentiment, dom)
 
+    conf_result = _build_confidence({
+        "source_clarity":    get_nested_num("confidence_factors", "source_clarity", 0.6),
+        "claim_specificity": get_nested_num("confidence_factors", "claim_specificity", 0.6),
+        "domain_consensus":  get_nested_num("confidence_factors", "domain_consensus", 0.6),
+        "note":              get_nested_str("confidence_factors", "note"),
+    })
+
+    risk_result = _build_risk_assessment({
+        "sentiment_score": get_nested_num("risk_assessment", "sentiment_score", 0.0),
+        "risk_level":      get_nested_str("risk_assessment", "risk_level"),
+        "rationale":       get_nested_str("risk_assessment", "rationale"),
+    }, sentiment)
+
     return {
         "summary":          summary,
         "key_points":       key_points or [
@@ -1093,7 +1245,11 @@ def _extract(text: str, title: str, article_url: str, domain: str) -> dict:
         "sentiment":        sentiment,
         "sentiment_label":  _sentiment_to_label(sentiment),
         "emoji":            emoji,
-        "confidence":       get_num("confidence", 0.6),
+        "confidence":            conf_result["confidence"],
+        "confidence_factors":    conf_result["confidence_factors"],
+        "sentiment_score":       risk_result["sentiment_score"],
+        "risk_level":            risk_result["risk_level"],
+        "risk_rationale":        risk_result["risk_rationale"],
         "tags":             tags,
         "domain":           dom,
         "reading_time_min": int(get_num("reading_time_min", 3)),
@@ -1172,6 +1328,16 @@ def _mock_insight(title: str, article_url: str = "", domain: str = "Technology")
         "sentiment_label":  "neutral_news",
         "emoji":            _fallback_emoji("neutral", domain),
         "confidence":       0.5,
+        "confidence_factors": {
+            "source_clarity":    0.5,
+            "claim_specificity": 0.5,
+            "domain_consensus":  0.5,
+            "weights":           CONFIDENCE_WEIGHTS,
+            "note":              "Mock insight — set OLLAMA_API_KEY for real scoring.",
+        },
+        "sentiment_score":  0.0,
+        "risk_level":       "low",
+        "risk_rationale":   "Mock insight — set OLLAMA_API_KEY for real risk scoring.",
         "tags":             ["steami", "demo", domain.lower().replace("/", "-")],
         "domain":           domain,
         "reading_time_min": 3,

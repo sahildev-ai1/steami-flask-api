@@ -287,6 +287,9 @@ def _fmt_explainer(ex: dict) -> dict:
         "badgeColor":      ex.get("badgeColor"),
         "readTime":        ex.get("readTime"),
         "author":          ex.get("author", ""),
+        # Publish date — derived from created_at so existing explainers get a
+        # sensible date automatically with no data migration required.
+        "date":            ex.get("date") or ex.get("created_at", ""),
         "image":           ex.get("image", ""),
         "content":         ex.get("content", []),
         "keyInsights":     ex.get("keyInsights", []),
@@ -2174,18 +2177,36 @@ def cms_get_simulation(
 # Pydantic models
 # ─────────────────────────────────────────────────────────────────────────────
 
+class ConfidenceFactors(BaseModel):
+    """
+    Breakdown behind an ai_insight's `confidence` score. `confidence` itself
+    is a weighted average of these three factors (see ollama_agent.py
+    CONFIDENCE_WEIGHTS) — not an unexplained model guess. Powers the
+    "Why this score?" explainer in the frontend.
+    """
+    source_clarity:    Optional[float] = None   # 0.0 – 1.0
+    claim_specificity: Optional[float] = None   # 0.0 – 1.0
+    domain_consensus:  Optional[float] = None   # 0.0 – 1.0
+    weights:            Optional[dict]  = None   # e.g. {"source_clarity": 0.35, ...}
+    note:               Optional[str]   = None   # short plain-English explanation
+
+
 class AiInsightBlock(BaseModel):
     """Nested AI-generated metadata block — all fields optional."""
-    summary:           Optional[str]   = None
-    key_points:        Optional[list]  = None   # list[str]
-    sentiment:         Optional[str]   = None   # e.g. "positive"
-    sentiment_label:   Optional[str]   = None   # "good_news" | "bad_news" | "neutral_news"
-    emoji:             Optional[str]   = None
-    confidence:        Optional[float] = None   # 0.0 – 1.0
-    tags:              Optional[list]  = None   # list[str]
-    domain:            Optional[str]   = None   # e.g. "QUANTUM PHYSICS"
-    reading_time_min:  Optional[int]   = None
-    article_url:       Optional[str]   = None
+    summary:            Optional[str]   = None
+    key_points:         Optional[list]  = None   # list[str]
+    sentiment:          Optional[str]   = None   # e.g. "positive"
+    sentiment_label:    Optional[str]   = None   # "good_news" | "bad_news" | "neutral_news"
+    sentiment_score:    Optional[float] = None   # -1.0 (very negative) – +1.0 (very positive)
+    risk_level:         Optional[str]   = None   # "low" | "medium" | "high" — severity/scope, independent of sentiment
+    risk_rationale:     Optional[str]   = None   # short plain-English reason for risk_level
+    emoji:              Optional[str]   = None
+    confidence:         Optional[float] = None   # 0.0 – 1.0 — weighted average of confidence_factors
+    confidence_factors: Optional[ConfidenceFactors] = None
+    tags:               Optional[list]  = None   # list[str]
+    domain:             Optional[str]   = None   # e.g. "QUANTUM PHYSICS"
+    reading_time_min:   Optional[int]   = None
+    article_url:        Optional[str]   = None
 
 
 class CreateIntelligenceNodeBody(BaseModel):
@@ -2243,16 +2264,20 @@ def _fmt_intelligence_node(doc: dict) -> dict:
         "article_url":     doc.get("article_url"),
         "matched_domains": doc.get("matched_domains", []),
         "ai_insight": {
-            "summary":          ai.get("summary"),
-            "key_points":       ai.get("key_points", []),
-            "sentiment":        ai.get("sentiment"),
-            "sentiment_label":  ai.get("sentiment_label"),
-            "emoji":            ai.get("emoji"),
-            "confidence":       ai.get("confidence"),
-            "tags":             ai.get("tags", []),
-            "domain":           ai.get("domain"),
-            "reading_time_min": ai.get("reading_time_min"),
-            "article_url":      ai.get("article_url"),
+            "summary":             ai.get("summary"),
+            "key_points":          ai.get("key_points", []),
+            "sentiment":           ai.get("sentiment"),
+            "sentiment_label":     ai.get("sentiment_label"),
+            "sentiment_score":     ai.get("sentiment_score"),
+            "risk_level":          ai.get("risk_level"),
+            "risk_rationale":      ai.get("risk_rationale"),
+            "emoji":               ai.get("emoji"),
+            "confidence":          ai.get("confidence"),
+            "confidence_factors":  ai.get("confidence_factors"),
+            "tags":                ai.get("tags", []),
+            "domain":              ai.get("domain"),
+            "reading_time_min":    ai.get("reading_time_min"),
+            "article_url":         ai.get("article_url"),
         },
         "heading":    doc.get("heading"),
         "value":      doc.get("value"),
@@ -2295,7 +2320,12 @@ def create_intelligence_node(
           "sentiment":       "positive",
           "sentiment_label": "good_news",
           "emoji":           "⚛️",
-          "confidence":      0.92,
+          "confidence":      0.87,
+          "confidence_factors": {
+            "source_clarity": 0.9, "claim_specificity": 0.85, "domain_consensus": 0.85,
+            "weights": {"source_clarity": 0.35, "claim_specificity": 0.35, "domain_consensus": 0.30},
+            "note": "Based on a peer-reviewed study with specific, measurable results."
+          },
           "tags":            ["quantum","computing"],
           "domain":          "QUANTUM PHYSICS",
           "reading_time_min": 4,

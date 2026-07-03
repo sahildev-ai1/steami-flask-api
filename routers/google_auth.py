@@ -39,6 +39,29 @@ router = APIRouter()
 
 GOOGLE_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
 
+# ── Microsoft (Azure AD, "common" multi-tenant endpoint) ───────────────────
+# Uses the same authorization-code exchange pattern as GitHub/LinkedIn below
+# (no MSAL.js dependency needed on the frontend — just a redirect + code).
+MICROSOFT_CLIENT_ID     = os.environ.get("MICROSOFT_CLIENT_ID", "")
+MICROSOFT_CLIENT_SECRET = os.environ.get("MICROSOFT_CLIENT_SECRET", "")
+MICROSOFT_REDIRECT_URI  = os.environ.get("MICROSOFT_REDIRECT_URI", "")
+MICROSOFT_TOKEN_URL     = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+MS_GRAPH_ME_URL         = "https://graph.microsoft.com/v1.0/me"
+
+# ── GitHub ───────────────────────────────────────────────────────────────────
+GITHUB_CLIENT_ID     = os.environ.get("GITHUB_CLIENT_ID", "")
+GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", "")
+GITHUB_TOKEN_URL     = "https://github.com/login/oauth/access_token"
+GITHUB_USER_URL      = "https://api.github.com/user"
+GITHUB_EMAILS_URL    = "https://api.github.com/user/emails"
+
+# ── LinkedIn (OpenID Connect) ───────────────────────────────────────────────
+LINKEDIN_CLIENT_ID     = os.environ.get("LINKEDIN_CLIENT_ID", "")
+LINKEDIN_CLIENT_SECRET = os.environ.get("LINKEDIN_CLIENT_SECRET", "")
+LINKEDIN_REDIRECT_URI  = os.environ.get("LINKEDIN_REDIRECT_URI", "")
+LINKEDIN_TOKEN_URL     = "https://www.linkedin.com/oauth/v2/accessToken"
+LINKEDIN_USERINFO_URL  = "https://api.linkedin.com/v2/userinfo"
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -72,18 +95,189 @@ def _verify_google_token(id_token: str) -> dict:
         raise HTTPException(401, detail=f"Could not verify Google token: {e}")
 
 
-def _get_or_create_google_user(google_payload: dict) -> dict:
-    """
-    Look up user by Google email. Create if not found.
-    Returns the full user document.
-    """
-    email = google_payload["email"].lower().strip()
-    google_uid = google_payload.get("sub", "")          # Google's unique user ID
-    name = google_payload.get("name", "")
-    picture = google_payload.get("picture", "")
-    email_verified = google_payload.get("email_verified", "false") == "true"
+def _exchange_microsoft_code(code: str) -> str:
+    """Exchange a Microsoft OAuth `code` for an access_token."""
+    if not (MICROSOFT_CLIENT_ID and MICROSOFT_CLIENT_SECRET and MICROSOFT_REDIRECT_URI):
+        raise HTTPException(500, detail="Microsoft sign-in is not configured on the server.")
+    try:
+        resp = _requests.post(
+            MICROSOFT_TOKEN_URL,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type":    "authorization_code",
+                "code":          code,
+                "redirect_uri":  MICROSOFT_REDIRECT_URI,
+                "client_id":     MICROSOFT_CLIENT_ID,
+                "client_secret": MICROSOFT_CLIENT_SECRET,
+                "scope":         "User.Read openid email profile",
+            },
+            timeout=10,
+        )
+        data = resp.json()
+        token = data.get("access_token")
+        if not token:
+            raise HTTPException(401, detail=f"Microsoft code exchange failed: {data.get('error_description', 'unknown error')}")
+        return token
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("Microsoft code exchange failed: %s", e)
+        raise HTTPException(401, detail=f"Could not exchange Microsoft code: {e}")
 
-    # ── Check if user already exists by email ──────────────────────────────
+
+def _fetch_microsoft_profile(access_token: str) -> dict:
+    """Fetch a Microsoft/Azure AD profile from Graph using an access_token."""
+    try:
+        resp = _requests.get(
+            MS_GRAPH_ME_URL,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            raise HTTPException(401, detail="Invalid Microsoft access token")
+        data = resp.json()
+        email = data.get("mail") or data.get("userPrincipalName")
+        if not email:
+            raise HTTPException(401, detail="Microsoft profile missing email")
+        return {
+            "email":    email,
+            "sub":      data.get("id", ""),
+            "name":     data.get("displayName", ""),
+            "picture":  "",  # Graph photo requires a separate binary call — skip for now
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("Microsoft token verification failed: %s", e)
+        raise HTTPException(401, detail=f"Could not verify Microsoft token: {e}")
+
+
+def _exchange_github_code(code: str) -> str:
+    """Exchange a GitHub OAuth `code` for an access_token."""
+    if not (GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET):
+        raise HTTPException(500, detail="GitHub sign-in is not configured on the server.")
+    try:
+        resp = _requests.post(
+            GITHUB_TOKEN_URL,
+            headers={"Accept": "application/json"},
+            data={
+                "client_id":     GITHUB_CLIENT_ID,
+                "client_secret": GITHUB_CLIENT_SECRET,
+                "code":          code,
+            },
+            timeout=10,
+        )
+        data = resp.json()
+        token = data.get("access_token")
+        if not token:
+            raise HTTPException(401, detail=f"GitHub code exchange failed: {data.get('error_description', 'unknown error')}")
+        return token
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("GitHub code exchange failed: %s", e)
+        raise HTTPException(401, detail=f"Could not exchange GitHub code: {e}")
+
+
+def _fetch_github_profile(access_token: str) -> dict:
+    """Fetch profile + verified primary email from GitHub using an access_token."""
+    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/vnd.github+json"}
+    try:
+        user_resp = _requests.get(GITHUB_USER_URL, headers=headers, timeout=10)
+        if user_resp.status_code != 200:
+            raise HTTPException(401, detail="Invalid GitHub access token")
+        user = user_resp.json()
+
+        email = user.get("email")
+        if not email:
+            # Primary email is often private — fetch it explicitly.
+            emails_resp = _requests.get(GITHUB_EMAILS_URL, headers=headers, timeout=10)
+            if emails_resp.status_code == 200:
+                for e in emails_resp.json():
+                    if e.get("primary") and e.get("verified"):
+                        email = e.get("email")
+                        break
+        if not email:
+            raise HTTPException(401, detail="GitHub account has no verified public email. Please make an email public or verify one.")
+
+        return {
+            "email":   email,
+            "sub":     str(user.get("id", "")),
+            "name":    user.get("name") or user.get("login", ""),
+            "picture": user.get("avatar_url", ""),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("GitHub profile fetch failed: %s", e)
+        raise HTTPException(401, detail=f"Could not fetch GitHub profile: {e}")
+
+
+def _exchange_linkedin_code(code: str) -> str:
+    """Exchange a LinkedIn OAuth `code` for an access_token."""
+    if not (LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET and LINKEDIN_REDIRECT_URI):
+        raise HTTPException(500, detail="LinkedIn sign-in is not configured on the server.")
+    try:
+        resp = _requests.post(
+            LINKEDIN_TOKEN_URL,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type":    "authorization_code",
+                "code":          code,
+                "redirect_uri":  LINKEDIN_REDIRECT_URI,
+                "client_id":     LINKEDIN_CLIENT_ID,
+                "client_secret": LINKEDIN_CLIENT_SECRET,
+            },
+            timeout=10,
+        )
+        data = resp.json()
+        token = data.get("access_token")
+        if not token:
+            raise HTTPException(401, detail=f"LinkedIn code exchange failed: {data.get('error_description', 'unknown error')}")
+        return token
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("LinkedIn code exchange failed: %s", e)
+        raise HTTPException(401, detail=f"Could not exchange LinkedIn code: {e}")
+
+
+def _fetch_linkedin_profile(access_token: str) -> dict:
+    """Fetch profile via LinkedIn's OpenID Connect /userinfo endpoint."""
+    try:
+        resp = _requests.get(
+            LINKEDIN_USERINFO_URL,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            raise HTTPException(401, detail="Invalid LinkedIn access token")
+        data = resp.json()
+        email = data.get("email")
+        if not email:
+            raise HTTPException(401, detail="LinkedIn profile missing email")
+        return {
+            "email":   email,
+            "sub":     data.get("sub", ""),
+            "name":    data.get("name", ""),
+            "picture": data.get("picture", ""),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("LinkedIn profile fetch failed: %s", e)
+        raise HTTPException(401, detail=f"Could not fetch LinkedIn profile: {e}")
+
+
+def _get_or_create_oauth_user(provider: str, email: str, provider_uid: str, name: str, picture: str, email_verified: bool = True) -> dict:
+    """
+    Provider-agnostic version of _get_or_create_google_user — looks up a user
+    by email, creates one if it doesn't exist. Used by Google, Microsoft,
+    GitHub, and LinkedIn sign-in so each provider only needs to fetch its own
+    profile info and hand it off here.
+    """
+    email = email.lower().strip()
+
     try:
         existing_docs = (
             db.collection("users")
@@ -97,62 +291,71 @@ def _get_or_create_google_user(google_payload: dict) -> dict:
 
     if existing:
         user_doc = existing[0].to_dict()
-        uid = user_doc["uid"]
+        uid = user_doc["uid"] if "uid" in user_doc else user_doc.get("id")
 
-        # Update Google fields in case they changed (name, picture)
         try:
             db.collection("users").document(uid).update({
-                "google_uid":      google_uid,
-                "google_picture":  picture,
-                "email_verified":  email_verified,
-                "last_login":      _now_iso(),
-                "auth_provider":   "google",
+                f"{provider}_uid":  provider_uid,
+                "last_login":       _now_iso(),
+                "auth_provider":    provider,
+                "email_verified":   user_doc.get("email_verified", False) or email_verified,
             })
         except Exception as e:
-            log.warning("Failed to update google fields for %s: %s", uid, e)
+            log.warning("Failed to update %s fields for %s: %s", provider, uid, e)
 
-        user_doc.update({
-            "google_uid":     google_uid,
-            "google_picture": picture,
-            "last_login":     _now_iso(),
-        })
+        user_doc.update({f"{provider}_uid": provider_uid, "last_login": _now_iso()})
         return user_doc
 
     # ── New user — create account ──────────────────────────────────────────
     uid = str(uuid.uuid4())
     new_user = {
-        "uid":            uid,
-        "email":          email,
-        "display_name":   name,
-        "avatar_url":     picture,
-        "google_uid":     google_uid,
-        "google_picture": picture,
-        "email_verified": email_verified,
-        "auth_provider":  "google",
-        "role":           "user",
-        "profession":     "",
-        "bio":            "",
-        "interests":      [],
-        "subscribed_newsletter": True,   # opt-in by default on Google signup
-        "created_at":     _now_iso(),
-        "last_login":     _now_iso(),
+        "uid":                  uid,
+        "id":                   uid,   # auth_router.py's user docs key off "id"; keep both in sync
+        "email":                email,
+        "full_name":            name,
+        "display_name":         name,
+        "avatar_url":           picture,
+        f"{provider}_uid":      provider_uid,
+        "email_verified":       email_verified,
+        "auth_provider":        provider,
+        "role":                 "user",
+        "profession":           "",
+        "bio":                  "",
+        "interests":            [],
+        "subscribe_email":      True,
+        "subscribed_newsletter": True,   # opt-in by default on OAuth signup
+        "created_at":           _now_iso(),
+        "last_login":           _now_iso(),
     }
     try:
         db.collection("users").document(uid).set(new_user)
-        # Also add to newsletter subscribers
         db.collection("newsletter_subscribers").document(uid).set({
             "uid":        uid,
             "email":      email,
             "name":       name,
             "subscribed": True,
-            "source":     "google_signup",
+            "source":     f"{provider}_signup",
             "created_at": _now_iso(),
         })
     except Exception as e:
         raise HTTPException(500, detail=f"Failed to create user: {e}")
 
-    log.info("New Google user created: uid=%s email=%s", uid, email)
+    log.info("New %s user created: uid=%s email=%s", provider, uid, email)
     return new_user
+
+
+def _get_or_create_google_user(google_payload: dict) -> dict:
+    """
+    Look up user by Google email. Create if not found.
+    Returns the full user document.
+    """
+    email = google_payload["email"].lower().strip()
+    google_uid = google_payload.get("sub", "")          # Google's unique user ID
+    name = google_payload.get("name", "")
+    picture = google_payload.get("picture", "")
+    email_verified = google_payload.get("email_verified", "false") == "true"
+
+    return _get_or_create_oauth_user("google", email, google_uid, name, picture, email_verified)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -162,6 +365,21 @@ def _get_or_create_google_user(google_payload: dict) -> dict:
 class GoogleSignInBody(BaseModel):
     """Body for POST /api/auth/google"""
     id_token: str
+
+
+class MicrosoftSignInBody(BaseModel):
+    """Body for POST /api/auth/microsoft — the `code` from Microsoft's OAuth redirect"""
+    code: str
+
+
+class GithubSignInBody(BaseModel):
+    """Body for POST /api/auth/github — the `code` from GitHub's OAuth redirect"""
+    code: str
+
+
+class LinkedinSignInBody(BaseModel):
+    """Body for POST /api/auth/linkedin — the `code` from LinkedIn's OAuth redirect"""
+    code: str
 
 
 class PatchProfileBody(BaseModel):
@@ -250,6 +468,118 @@ def google_sign_in(body: GoogleSignInBody):
         "interests":    user.get("interests", []),
         "is_new_user":  is_new,
     }
+
+
+def _oauth_response(user: dict, is_new: bool) -> dict:
+    """Shared response shape for every OAuth provider — same as POST /api/auth/login."""
+    token = create_jwt(user_id=user["uid"], role=user.get("role", "user"))
+    return {
+        "token":        token,
+        "uid":          user["uid"],
+        "email":        user["email"],
+        "display_name": user.get("display_name", ""),
+        "role":         user.get("role", "user"),
+        "avatar_url":   user.get("avatar_url", ""),
+        "profession":   user.get("profession", ""),
+        "interests":    user.get("interests", []),
+        "is_new_user":  is_new,
+    }
+
+
+def _is_new_email(email: str) -> bool:
+    return not bool(
+        list(db.collection("users").where("email", "==", email.lower()).limit(1).stream())
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POST /api/auth/microsoft  — Sign in or sign up with Microsoft (Azure AD)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post(
+    "/microsoft",
+    summary="Sign in or sign up with a Microsoft access token — PUBLIC",
+    tags=["Auth"],
+)
+def microsoft_sign_in(body: MicrosoftSignInBody):
+    """
+    **Public endpoint.** Sign in or create an account using Microsoft (Azure AD) OAuth.
+
+    The frontend redirects to Microsoft's authorize URL, Microsoft redirects
+    back with a `code` query param, and the frontend POSTs that code here.
+    The backend exchanges it server-side for an access_token (requires
+    MICROSOFT_CLIENT_ID / MICROSOFT_CLIENT_SECRET / MICROSOFT_REDIRECT_URI
+    env vars) and reads the profile from Microsoft Graph.
+
+    Body: `{ "code": "<code-from-microsoft-redirect>" }`
+    Response: same shape as POST /api/auth/login.
+    """
+    access_token = _exchange_microsoft_code(body.code)
+    profile = _fetch_microsoft_profile(access_token)
+    is_new = _is_new_email(profile["email"])
+    user = _get_or_create_oauth_user("microsoft", profile["email"], profile["sub"], profile["name"], profile["picture"])
+    log.info("microsoft_sign_in: uid=%s email=%s new=%s", user["uid"], user["email"], is_new)
+    return _oauth_response(user, is_new)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POST /api/auth/github  — Sign in or sign up with GitHub
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post(
+    "/github",
+    summary="Sign in or sign up with a GitHub OAuth code — PUBLIC",
+    tags=["Auth"],
+)
+def github_sign_in(body: GithubSignInBody):
+    """
+    **Public endpoint.** Sign in or create an account using GitHub OAuth.
+
+    The frontend redirects to GitHub's authorize URL, GitHub redirects back
+    with a `code` query param, and the frontend POSTs that code here. The
+    backend exchanges it server-side for an access_token (requires
+    GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET env vars) and fetches the
+    verified primary email.
+
+    Body: `{ "code": "<code-from-github-redirect>" }`
+    Response: same shape as POST /api/auth/login.
+    """
+    access_token = _exchange_github_code(body.code)
+    profile = _fetch_github_profile(access_token)
+    is_new = _is_new_email(profile["email"])
+    user = _get_or_create_oauth_user("github", profile["email"], profile["sub"], profile["name"], profile["picture"])
+    log.info("github_sign_in: uid=%s email=%s new=%s", user["uid"], user["email"], is_new)
+    return _oauth_response(user, is_new)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POST /api/auth/linkedin  — Sign in or sign up with LinkedIn
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post(
+    "/linkedin",
+    summary="Sign in or sign up with a LinkedIn OAuth code — PUBLIC",
+    tags=["Auth"],
+)
+def linkedin_sign_in(body: LinkedinSignInBody):
+    """
+    **Public endpoint.** Sign in or create an account using LinkedIn OpenID Connect.
+
+    The frontend redirects to LinkedIn's authorize URL (scopes: `openid profile
+    email`), LinkedIn redirects back with a `code`, and the frontend POSTs
+    that code here. The backend exchanges it for an access_token (requires
+    LINKEDIN_CLIENT_ID / LINKEDIN_CLIENT_SECRET / LINKEDIN_REDIRECT_URI env
+    vars) and reads the profile from LinkedIn's /userinfo endpoint.
+
+    Body: `{ "code": "<code-from-linkedin-redirect>" }`
+    Response: same shape as POST /api/auth/login.
+    """
+    access_token = _exchange_linkedin_code(body.code)
+    profile = _fetch_linkedin_profile(access_token)
+    is_new = _is_new_email(profile["email"])
+    user = _get_or_create_oauth_user("linkedin", profile["email"], profile["sub"], profile["name"], profile["picture"])
+    log.info("linkedin_sign_in: uid=%s email=%s new=%s", user["uid"], user["email"], is_new)
+    return _oauth_response(user, is_new)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

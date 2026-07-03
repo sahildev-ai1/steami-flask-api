@@ -49,11 +49,12 @@ import uuid
 import logging
 import os
 import random
+import re
 import secrets
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
 
 from mongodb_client import db
@@ -61,6 +62,7 @@ from auth import (
     hash_password, verify_password, create_token,
     require_auth, require_admin, get_uid, ROLES,
 )
+from ddos_protection import verify_captcha, is_disposable_email, _get_client_ip
 
 log    = logging.getLogger(__name__)
 router = APIRouter()
@@ -71,6 +73,10 @@ router = APIRouter()
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
+
+# RFC-5322-ish email format check — good enough to reject "asdf", "a@b", "a@@b.com"
+# without the false-positive risk of a fully-compliant RFC regex.
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
 VALID_PROFESSIONS: list[str] = [
     "student",
@@ -257,6 +263,7 @@ def _safe(user: dict) -> dict:
         "interests":       user.get("interests", []),
         "subscribe_email": user.get("subscribe_email", False),
         "is_active":       user.get("is_active", True),
+        "email_verified":  user.get("email_verified", False),
         "created_at": user.get("created_at"),
     }
 
@@ -271,6 +278,7 @@ class SignupBody(BaseModel):
     password:        str
     profession:      str  = "student"
     subscribe_email: bool = True   # opt-in by default; user can uncheck
+    captcha_token:   str  = ""     # Google reCAPTCHA response token — required if CAPTCHA_ENABLED
 
 
 class LoginBody(BaseModel):
@@ -311,7 +319,7 @@ def seed_accounts():
 
 
 @router.post("/signup", status_code=201, summary="Register — public")
-def signup(body: SignupBody):
+def signup(body: SignupBody, request: Request):
     """
     POST /api/auth/signup
     Register a new user. New users always start with role = "user".
@@ -320,7 +328,20 @@ def signup(body: SignupBody):
     POST /api/newsletter/subscribe. The `subscribe_email` field can be
     set to false to skip the subscription (defaults to true).
 
-    Body: { full_name, email, password, profession, subscribe_email }
+    Validation (previously this only checked for "@" and "." in the domain):
+      - email must match a real email format (EMAIL_RE)
+      - email domain must not be a known disposable/throwaway provider
+      - captcha_token must pass Google reCAPTCHA verification when
+        RECAPTCHA_SECRET_KEY is configured (no-op in dev if it isn't set)
+
+    New accounts start with email_verified=False. A 6-digit verification
+    code is emailed immediately — see POST /verify-email and
+    POST /verify-email/resend. Accounts remain usable before verification
+    (we don't want to lock people out of a product they just signed up for),
+    but email_verified is available on the user object so the frontend can
+    show a "verify your email" banner / gate sensitive actions if desired.
+
+    Body: { full_name, email, password, profession, subscribe_email, captcha_token }
 
     Response: { token, user, role }
 
@@ -328,8 +349,10 @@ def signup(body: SignupBody):
     """
     email = body.email.lower().strip()
 
-    if "@" not in email or "." not in email.split("@")[-1]:
-        raise HTTPException(400, detail="Invalid email address.")
+    if not EMAIL_RE.match(email):
+        raise HTTPException(400, detail="Please enter a valid email address.")
+    if is_disposable_email(email):
+        raise HTTPException(400, detail="Disposable/temporary email addresses are not allowed. Please use a permanent email address.")
     if len(body.password) < 6:
         raise HTTPException(400, detail="Password must be at least 6 characters.")
     if body.profession not in VALID_PROFESSIONS:
@@ -337,6 +360,8 @@ def signup(body: SignupBody):
             400,
             detail=f"Invalid profession. Choose from: {', '.join(VALID_PROFESSIONS)}"
         )
+    if not verify_captcha(body.captcha_token, _get_client_ip(request)):
+        raise HTTPException(400, detail="CAPTCHA verification failed. Please try again.")
     if _find_by_email(email):
         raise HTTPException(409, detail="An account with this email already exists.")
 
@@ -351,6 +376,7 @@ def signup(body: SignupBody):
         "interests":     [],
         "is_active":         True,
         "subscribe_email":    body.subscribe_email,
+        "email_verified":     False,
         "created_at":        _now(),
         "updated_at":        _now(),
     }
@@ -367,6 +393,13 @@ def signup(body: SignupBody):
     # The user's subscribe_email flag controls whether they *receive* emails;
     # the newsletter collection tracks their subscription status.
     _newsletter_subscribe(email, body.full_name.strip())
+
+    # ── Send email verification code (best-effort — signup still succeeds
+    #    even if the email dispatch fails; user can hit /verify-email/resend) ──
+    try:
+        _send_verification_code(email, body.full_name.strip())
+    except Exception as e:
+        log.warning("signup: verification email dispatch failed for %s: %s", email, e)
 
     token = create_token(user_id, "user")
     log.info("signup: %s (%s) profession=%s newsletter=%s",
@@ -913,3 +946,152 @@ def reset_password(body: ResetPasswordBody):
 
     log.info("reset_password: password updated for %s", email)
     return {"reset": True}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EMAIL VERIFICATION — 6-digit code sent on signup, mirrors the
+# forgot-password flow above. Records live in `email_verifications`
+# (one doc per outstanding code, keyed by most-recent-wins on lookup).
+# Accounts are usable immediately after signup (email_verified=False) —
+# this doesn't lock anyone out, it just gives the frontend a signal to
+# show a "verify your email" banner and lets us weed out fake addresses
+# used only to spam-create accounts.
+# ─────────────────────────────────────────────────────────────────────────────
+
+EMAIL_VERIFICATION_TTL_MINUTES = 15
+MAX_VERIFICATION_ATTEMPTS      = 5
+VERIFICATION_RESEND_COOLDOWN_S = 60
+
+
+class VerifyEmailBody(BaseModel):
+    email: str
+    code:  str
+
+
+class ResendVerificationBody(BaseModel):
+    email: str
+
+
+def _gen_verification_code() -> str:
+    return f"{random.randint(0, 999999):06d}"
+
+
+def _latest_verification_record(email: str) -> Optional[dict]:
+    docs = list(
+        db.collection("email_verifications")
+          .where("email", "==", email)
+          .order_by("created_at", direction="DESCENDING")
+          .limit(1)
+          .stream()
+    )
+    return docs[0].to_dict() if docs else None
+
+
+def _send_verification_code(email: str, full_name: str = "") -> None:
+    """Generate + store + email a fresh 6-digit verification code. Raises on hard failure."""
+    code = _gen_verification_code()
+    record_id = str(uuid.uuid4())
+
+    db.collection("email_verifications").document(record_id).set({
+        "id":          record_id,
+        "email":       email,
+        "code":        code,
+        "attempts":    0,
+        "verified":    False,
+        "expires_at":  _minutes_from_now(EMAIL_VERIFICATION_TTL_MINUTES),
+        "created_at":  _now(),
+    })
+
+    from routers.newsletter import _send_one_via_mailrelay
+    html_body = (
+        f"<p>Welcome to STEAMI! Your email verification code is:</p>"
+        f"<h2 style=\"letter-spacing:4px;font-family:monospace\">{code}</h2>"
+        f"<p>This code expires in {EMAIL_VERIFICATION_TTL_MINUTES} minutes. "
+        f"If you didn't create a STEAMI account, you can safely ignore this email.</p>"
+    )
+    sent = _send_one_via_mailrelay(email, full_name, "Verify your STEAMI email address", html_body)
+    if not sent:
+        log.warning("_send_verification_code: email dispatch failed for %s (code stored regardless)", email)
+
+
+@router.post("/verify-email", summary="Verify email with a 6-digit code — public")
+def verify_email(body: VerifyEmailBody):
+    """
+    POST /api/auth/verify-email
+    Body: { "email": "user@example.com", "code": "123456" }
+
+    Marks the account's `email_verified` flag True if the code matches and
+    hasn't expired or exceeded MAX_VERIFICATION_ATTEMPTS.
+    """
+    email = body.email.lower().strip()
+    record = _latest_verification_record(email)
+
+    if not record:
+        raise HTTPException(400, detail="No verification code found. Please request a new one.")
+    if record.get("verified"):
+        return {"verified": True, "message": "Email already verified."}
+    if _is_expired(record.get("expires_at", "")):
+        raise HTTPException(400, detail="Verification code expired. Please request a new one.")
+    if record.get("attempts", 0) >= MAX_VERIFICATION_ATTEMPTS:
+        raise HTTPException(429, detail="Too many attempts. Please request a new code.")
+
+    if body.code.strip() != record.get("code"):
+        try:
+            db.collection("email_verifications").document(record["id"]).update(
+                {"attempts": record.get("attempts", 0) + 1}
+            )
+        except Exception:
+            pass
+        raise HTTPException(400, detail="Incorrect verification code.")
+
+    user = _find_by_email(email)
+    if not user:
+        raise HTTPException(404, detail="Account not found.")
+
+    try:
+        db.collection("users").document(user["id"]).update(
+            {"email_verified": True, "updated_at": _now()}
+        )
+        db.collection("email_verifications").document(record["id"]).update({"verified": True})
+    except Exception as e:
+        log.error("verify_email: update failed for %s: %s", email, e)
+        raise HTTPException(500, detail="Could not verify email. Please try again.")
+
+    log.info("verify_email: %s verified", email)
+    return {"verified": True, "message": "Email verified successfully."}
+
+
+@router.post("/verify-email/resend", summary="Resend the email verification code — public")
+def resend_verification(body: ResendVerificationBody):
+    """
+    POST /api/auth/verify-email/resend
+    Body: { "email": "user@example.com" }
+
+    Always returns a generic message (doesn't reveal whether the account
+    exists or is already verified) to avoid account enumeration.
+    """
+    email = body.email.lower().strip()
+    generic_response = {"message": "If that account needs verification, a new code has been sent."}
+
+    user = _find_by_email(email)
+    if not user or user.get("email_verified"):
+        return generic_response
+
+    # Basic resend cooldown to prevent using this as an email-bombing vector
+    record = _latest_verification_record(email)
+    if record and record.get("created_at"):
+        try:
+            created = datetime.fromisoformat(record["created_at"])
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            elapsed = (datetime.now(timezone.utc) - created).total_seconds()
+            if elapsed < VERIFICATION_RESEND_COOLDOWN_S:
+                return generic_response  # silently no-op within the cooldown window
+        except Exception:
+            pass
+
+    try:
+        _send_verification_code(email, user.get("full_name", ""))
+    except Exception as e:
+        log.warning("resend_verification: dispatch failed for %s: %s", email, e)
+
+    return generic_response
